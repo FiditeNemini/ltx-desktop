@@ -231,7 +231,7 @@
 
 .stepActionsRow {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--spacing-sm);
   min-width: 0;
 }
@@ -249,6 +249,13 @@
   width: 100%;
 }
 
+.riskStrip {
+  margin: 0;
+  color: var(--semantic-fg-warning-primary-enabled);
+  font-size: 12px;
+  line-height: 16px;
+}
+
 .generateHint {
   display: block;
   width: 100%;
@@ -256,7 +263,7 @@
   color: var(--semantic-fg-white-hover);
 }
 
-@media (max-width: shell.$shell-compact-breakpoint) {
+@mixin stackedFeatureLayout {
   .formShell {
     height: 100%;
     min-height: 100%;
@@ -299,6 +306,14 @@
     overflow-x: hidden;
     overflow-y: visible;
   }
+}
+
+@media (max-width: shell.$shell-compact-breakpoint) {
+  @include stackedFeatureLayout;
+}
+
+@container assistant-workspace (max-width: 900px) {
+  @include stackedFeatureLayout;
 }
 
 @media (max-width: 640px) {

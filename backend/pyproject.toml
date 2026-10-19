@@ -22,6 +22,9 @@ dependencies = [
     "pynvml>=11.5.0; sys_platform != 'darwin'",
     "psutil>=5.9.0",
     "pydantic>=2.7.0",
+    "pydantic-ai-slim[google,openai]>=1.0,<3",
+    "httpx2>=2.13,<3",
+    "httpx>=0.27",
     # LTX-2 inference dependencies (v1.4.1).
     # LLM: changing ltx-core / ltx-pipelines version or git tag requires re-checking
     # every monkey-patch in backend/services/patches/ (imported from ltx2_server.py).
@@ -62,6 +65,10 @@ dependencies = [
     "triton-windows; sys_platform == 'win32'",
     "triton; sys_platform == 'linux'",
 ]
+
+[tool.uv]
+# The Windows inference wheel above only supports the bundled CPython 3.13 runtime.
+environments = ["sys_platform != 'win32' or python_version == '3.13'"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

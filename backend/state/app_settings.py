@@ -7,11 +7,13 @@ from typing import Annotated, Any, Literal, TypeGuard, TypeVar, cast, get_args
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints, create_model, field_validator
 
-from api_types import LTXLocalModelId
+from api_types import LTXLocalModelId, LocalAssistantModel
+from runtime_config.reject_reasons import BudgetMode
 
 RemoteExposure = Literal["off", "lan"]
 DashboardRange = Literal["7d", "30d", "all"]
 MAX_GENERATION_SEED = 2_147_483_647
+AssistantProviderName = Literal["gemini", "local"]
 
 
 def _parse_remote_exposure(value: object) -> RemoteExposure:
@@ -19,6 +21,13 @@ def _parse_remote_exposure(value: object) -> RemoteExposure:
 
 
 RemoteExposureSetting = Annotated[RemoteExposure, BeforeValidator(_parse_remote_exposure)]
+
+
+def _parse_budget_mode(value: object) -> BudgetMode:
+    return "standard" if value == "standard" else "reckless"
+
+
+BudgetModeSetting = Annotated[BudgetMode, BeforeValidator(_parse_budget_mode)]
 
 
 def _parse_dashboard_range(value: object) -> DashboardRange:
@@ -90,6 +99,7 @@ class GenerationSeedUpdate(SettingsBaseModel):
 class AppSettings(SettingsBaseModel):
     use_torch_compile: bool = False
     diffusion_stage_cache_enabled: bool = False
+    budget_mode: BudgetModeSetting = "reckless"
     ltx_api_key: str = ""
     user_prefers_ltx_api_video_generations: bool = False
     fal_api_key: str = ""
@@ -110,6 +120,11 @@ class AppSettings(SettingsBaseModel):
     # Empty string means "use DEFAULT_GEMINI_MODEL at generate time" — unlike API keys, an
     # empty patch is persisted so the user can reset to the default without a tombstone value.
     gemini_model: str = ""
+    assistant_provider: AssistantProviderName = "gemini"
+    assistant_local_model: LocalAssistantModel = "qwen3.5:9b"
+    # Gemini only: a written reply ends the run without waiting for its jobs, so the next
+    # message starts at once. Off by default; no closing message when the jobs finish.
+    assistant_parallel_gemini: bool = False
     seed_locked: bool = False
     locked_seed: int = 42
     models_dir: str = ""
@@ -191,6 +206,7 @@ UpdateSettingsRequest = AppSettingsPatch
 class SettingsResponse(SettingsBaseModel):
     use_torch_compile: bool = False
     diffusion_stage_cache_enabled: bool = False
+    budget_mode: BudgetModeSetting = "reckless"
     has_ltx_api_key: bool = False
     user_prefers_ltx_api_video_generations: bool = False
     has_fal_api_key: bool = False
@@ -202,6 +218,9 @@ class SettingsResponse(SettingsBaseModel):
     prompt_enhancer_provider_preference: Literal["local", "api"] | None = None
     has_gemini_api_key: bool = False
     gemini_model: str = ""
+    assistant_provider: AssistantProviderName = "gemini"
+    assistant_local_model: LocalAssistantModel = "qwen3.5:9b"
+    assistant_parallel_gemini: bool = False
     seed_locked: bool = False
     locked_seed: int = 42
     models_dir: str = ""

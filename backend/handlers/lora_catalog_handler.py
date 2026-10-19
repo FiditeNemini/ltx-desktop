@@ -26,17 +26,22 @@ from api_types import (
     LoraListResponse,
 )
 from handlers.base import StateHandlerBase, with_state_lock
+from handlers.checkpoint_files import commit_staged_checkpoint, stage_checkpoint
 from handlers.hf_auth_utils import optional_hf_token, require_hf_token
+from runtime_config.ic_lora_high_res import HIGH_RES_ONLY_IC_LORAS
 from runtime_config.ic_lora_job_budget import with_budgeted_duration_controls
 from runtime_config.model_download_specs import (
     catalog_item_visible_for_installed_ltx,
     downloaded_ic_lora_variant_ids,
     downloaded_lora_variant_ids,
+    get_model_cp_spec,
+    missing_checkpoints,
+    resolve_catalog_staging_dir,
+    resolve_catalog_staging_root,
     resolve_lora_path,
     resolve_ic_lora_path,
 )
-from runtime_config.video_job_budget import memory_gb_for_job
-from services.interfaces import ModelDownloader, TaskRunner
+from services.interfaces import GpuInfo, ModelDownloader, TaskRunner
 from services.lora_catalog import LoraCatalogProvider
 from services.lora_catalog.media_urls import with_resolved_media
 from state.app_state_types import (
@@ -173,11 +178,16 @@ class LoraCatalogHandler(StateHandlerBase):
         model_downloader: ModelDownloader,
         task_runner: TaskRunner,
         config: "RuntimeConfig",
+        gpu_info: GpuInfo,
+        high_res_enabled: Callable[[], bool] = lambda: False,
     ) -> None:
-        super().__init__(state, lock, config)
+        super().__init__(state, lock, config, gpu_info=gpu_info)
+        self._high_res_enabled = high_res_enabled
         self._catalog = catalog
         self._model_downloader = model_downloader
         self._task_runner = task_runner
+        # A crash leaves the staging folder of a session. No download runs yet, so all of it is stale.
+        shutil.rmtree(resolve_catalog_staging_root(self.models_dir), ignore_errors=True)
 
     # --- listing ---
     # Catalog download.variants is always non-empty; the first variant is the default
@@ -185,24 +195,25 @@ class LoraCatalogHandler(StateHandlerBase):
     # and when a download request omits variant_id).
     def list_ic_loras(self, fresh: bool = False) -> IcLoraListResponse:
         catalog = self._catalog.get_catalog()
-        darwin = self.config.darwin_unified_memory
-        memory_gb = memory_gb_for_job(
-            vram_gb=self.config.vram_gb,
-            available_ram_gb=self.config.available_ram_gb,
-            darwin=darwin,
-        )
+        # Display on total: duration options must not drop total-fitting cells
+        # just because free is momentarily depressed; generate stays authoritative.
+        job_filter = self._local_job_filter(total_only=True)
         items: list[IcLoraListItem] = []
+        high_res = self._high_res_enabled()
         for r in catalog.ic_loras:
+            if r.id in HIGH_RES_ONLY_IC_LORAS and not high_res:
+                continue
             if not fresh and not catalog_item_visible_for_installed_ltx(r.supported_models, self.models_dir):
                 continue
             variant_ids = downloaded_ic_lora_variant_ids(
-                self.models_dir, r.id, [(v.id, v.filename) for v in r.download.variants]
+                self.models_dir,
+                r.id,
+                [(v.id, v.filename) for v in r.download.variants],
+                r.requires_checkpoints,
             )
             item = with_budgeted_duration_controls(
                 with_resolved_media(r),
-                memory_gb=memory_gb,
-                process_mode=self.config.local_generations_mode,
-                darwin=darwin,
+                job_filter=job_filter,
             )
             items.append(
                 IcLoraListItem(
@@ -211,7 +222,7 @@ class LoraCatalogHandler(StateHandlerBase):
                     downloaded_variant_ids=variant_ids,
                 )
             )
-        return IcLoraListResponse(ic_loras=items)
+        return IcLoraListResponse(ic_loras=items, budgetMode=job_filter.budget_mode)
 
     def list_loras(self, fresh: bool = False) -> LoraListResponse:
         catalog = self._catalog.get_catalog()
@@ -258,6 +269,10 @@ class LoraCatalogHandler(StateHandlerBase):
         item = kind.lookup(self._catalog, item_id)
         if item is None:
             raise HTTPError(404, kind.not_found)
+        if kind is _IC_LORA and item.id in HIGH_RES_ONLY_IC_LORAS and not self._high_res_enabled():
+            # Hidden from the list without the flag, so a download is unknown too. A create
+            # for a known recipe answers 422 HIGH_RES_NOT_ENABLED instead: the id exists there.
+            raise HTTPError(404, kind.not_found)
         variant = item.download.resolve_variant(variant_id)
         if variant is None:
             raise HTTPError(404, "UNKNOWN_DOWNLOAD_VARIANT")
@@ -265,6 +280,11 @@ class LoraCatalogHandler(StateHandlerBase):
         hf_token = self._resolve_download_token(
             requires_hf_login=item.requires_hf_login, use_hf_auth=use_hf_auth
         )
+        dest = kind.resolve_path(self.models_dir, item.id, variant.filename)
+        # An entry that reads processor models (Video Guide) fetches the missing ones after its
+        # file. A retry keeps a file that is already installed.
+        fetch_file = not dest.exists()
+        missing_cps = missing_checkpoints(self.models_dir, item.requires_checkpoints)
         with self._lock:
             if getattr(self.state, kind.session_attr) is not None:
                 raise HTTPError(409, "DOWNLOAD_ALREADY_RUNNING")
@@ -276,28 +296,40 @@ class LoraCatalogHandler(StateHandlerBase):
                     id=session_id,
                     item_id=item_id,
                     downloaded_bytes=0,
-                    expected_bytes=variant.size_bytes,
+                    expected_bytes=(variant.size_bytes if fetch_file else 0)
+                    + sum(get_model_cp_spec(cp).expected_size_bytes for cp in missing_cps),
                 ),
             )
 
-        dest = kind.resolve_path(self.models_dir, item.id, variant.filename)
+        def _progress_from(base: int) -> Callable[[int], None]:
+            return lambda n: self._update_progress(kind, session_id, base + n)
 
         def _work() -> None:
-            # Stage into a temp dir and atomically move on success, so an interrupted download
-            # never leaves a partial file at the final path (where it would report "downloaded"
-            # and get used by generation).
-            staging_dir = dest.parent / ".tmp"
+            # Stage into this session's own folder and atomically move on success, so an interrupted
+            # download never leaves a partial file at the final path (where it would report
+            # "downloaded" and get used by generation). The model download clears its own staging
+            # folder, so the two never share one.
+            staging_dir = resolve_catalog_staging_dir(self.models_dir, session_id)
             staging_dir.mkdir(parents=True, exist_ok=True)
             try:
-                staged = self._model_downloader.download_file(
-                    repo_id=variant.resolved_repo_id(item.download.repo_id),
-                    filename=variant.filename,
-                    local_dir=str(staging_dir),
-                    token=hf_token,
-                    on_progress=lambda n: self._update_progress(kind, session_id, n),
-                )
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                Path(staged).replace(dest)
+                finished_bytes = 0
+                if fetch_file:
+                    staged = self._model_downloader.download_file(
+                        repo_id=variant.resolved_repo_id(item.download.repo_id),
+                        filename=variant.filename,
+                        local_dir=str(staging_dir),
+                        token=hf_token,
+                        on_progress=_progress_from(0),
+                    )
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    Path(staged).replace(dest)
+                    finished_bytes = variant.size_bytes
+                for cp in missing_cps:
+                    stage_checkpoint(
+                        self._model_downloader, staging_dir, cp, hf_token, _progress_from(finished_bytes)
+                    )
+                    commit_staged_checkpoint(self.models_dir, staging_dir, cp)
+                    finished_bytes += get_model_cp_spec(cp).expected_size_bytes
             finally:
                 shutil.rmtree(staging_dir, ignore_errors=True)
             self._finish(kind, session_id)

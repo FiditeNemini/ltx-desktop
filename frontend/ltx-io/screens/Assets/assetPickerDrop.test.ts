@@ -83,4 +83,16 @@ describe("resolveAssetPickerDrop", () => {
       { kind: "asset", id: "asset-4" },
     );
   });
+
+  it("takes a dropped asset of any kind when the picker shows all kinds", () => {
+    assert.deepEqual(
+      resolveAssetPickerDrop({
+        assetPayload: JSON.stringify({ id: "asset-5", media_kind: "image" }),
+        file: null,
+        mediaKind: null,
+        isEligibleFile: () => true,
+      }),
+      { kind: "asset", id: "asset-5" },
+    );
+  });
 });

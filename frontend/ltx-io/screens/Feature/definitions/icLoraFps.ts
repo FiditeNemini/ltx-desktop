@@ -3,6 +3,11 @@ import cap from "../../../../../shared/ic-lora-input-cap.json" with { type: "jso
 /** Supported output rates, highest-last in the shared file. */
 export const IC_LORA_SUPPORTED_FPS = cap.supportedFps;
 
+/** True for a rate the IC-LoRA recipes support. */
+export function isIcLoraSupportedFps(rate: number): boolean {
+  return IC_LORA_SUPPORTED_FPS.some((supported) => supported === rate);
+}
+
 export const IC_LORA_FPS_MATCH_TOLERANCE = cap.fpsMatchTolerance;
 
 export function icLoraMaxInputSeconds(fps: number): number {

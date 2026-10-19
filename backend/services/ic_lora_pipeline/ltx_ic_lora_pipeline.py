@@ -12,10 +12,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+import psutil
 import torch
 from numpy.typing import NDArray
 
 from api_types import ImageConditioningInput
+from runtime_config.ic_lora_chunking import ic_lora_carry_frames
 from runtime_config.ic_lora_tiling import IC_LORA_TILE_OVERLAP, IcLoraTiling
 from services.ic_lora_pipeline.ic_lora_inference import (
     InferenceResult,
@@ -26,12 +28,15 @@ from services.ic_lora_pipeline.ic_lora_inference import (
 from services.ltx_pipeline_common import (
     auto_tiling_config,
     build_model_paths,
-    offload_mode_for_prefetch_count,
+    is_decode_tile_shortage,
+    resolve_cuda_decode_tiling_retry,
+    resolve_tiling_config,
 )
-from services.services_utils import PipelineTilingType, device_supports_fp8
+from services.services_utils import PipelineTilingType, TilingConfigType, device_supports_fp8
 
 if TYPE_CHECKING:
     from ltx_pipelines.chunks import ChunkConfig
+    from ltx_pipelines.utils.types import OffloadMode
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +52,7 @@ class LTXIcLoraPipeline:
         streaming_prefetch_count: int | None,
         lora_strength: float = 1.0,
         *,
+        offload_mode: OffloadMode,
         video_vae_path: str | None = None,
         audio_vae_path: str | None = None,
         duration_head_path: str | None = None,
@@ -61,6 +67,7 @@ class LTXIcLoraPipeline:
             device=device,
             streaming_prefetch_count=streaming_prefetch_count,
             lora_strength=lora_strength,
+            offload_mode=offload_mode,
             video_vae_path=video_vae_path,
             audio_vae_path=audio_vae_path,
             duration_head_path=duration_head_path,
@@ -78,6 +85,7 @@ class LTXIcLoraPipeline:
         streaming_prefetch_count: int | None,
         lora_strength: float = 1.0,
         *,
+        offload_mode: OffloadMode,
         video_vae_path: str | None = None,
         audio_vae_path: str | None = None,
         duration_head_path: str | None = None,
@@ -97,7 +105,6 @@ class LTXIcLoraPipeline:
         lora_entry = LoraPathStrengthAndSDOps(path=lora_path, strength=lora_strength, sd_ops=LTXV_LORA_COMFY_RENAMING_MAP)
         self._checkpoint_path = checkpoint_path
         self._quantization = build_fp8_cast_policy(checkpoint_path) if device_supports_fp8(device) else None
-        offload_mode = offload_mode_for_prefetch_count(streaming_prefetch_count, device)
         self.pipeline = TiledICLoraPipeline(
             model_paths=build_model_paths(
                 checkpoint_path,
@@ -117,6 +124,39 @@ class LTXIcLoraPipeline:
                 if stage_2_ic_lora
                 else None
             ),
+        )
+
+    def _chunk_carry_frames(self) -> int:
+        return ic_lora_carry_frames(self._tiling)
+
+    def _decode_tiling(
+        self,
+        *,
+        skip_stage_2: bool,
+        height: int,
+        width: int,
+        num_frames: int,
+        chunk_config: ChunkConfig | None,
+    ) -> PipelineTilingType:
+        """Decode tiling for the picture the decoder sees.
+
+        A single-stage run decodes at half the canvas. Upstream plans ``AUTO_TILING``
+        against the full canvas, which is four times the pixels. At 4K that plan finds no
+        tile that fits and the job fails before the first denoising step. On CUDA the
+        decode patch plans the tiles again from the real latent, so only this early plan
+        must not fail.
+        """
+        if not skip_stage_2:
+            return auto_tiling_config()
+        decoder = self.pipeline.video_decoder
+        window = num_frames if chunk_config is None else min(num_frames, chunk_config.chunk_pixel_frames)
+        return resolve_tiling_config(
+            decoder.checkpoint_path,
+            height=height // 2,
+            width=width // 2,
+            num_frames=window,
+            device=self._device,
+            diffvae_optimization=decoder.diffvae_optimization,
         )
 
     def _tile_stage_1(self, stage_width: int, stage_height: int, tiling: IcLoraTiling) -> None:
@@ -177,6 +217,28 @@ class LTXIcLoraPipeline:
                 "[ic-lora] %s: %d adapter tensors targeting %d transformer modules.",
                 name, len(adapter_keys), len(targeted),
             )
+
+    def _stable_decode_tiling(
+        self, chunk_config: ChunkConfig | None, height: int, width: int, num_frames: int
+    ) -> TilingConfigType:
+        """Explicit decode tiling for the stable-budget retry (CUDA only).
+
+        Mirrors the arguments upstream resolves AUTO_TILING with (per-window
+        frames, the decoder's own optimization mode, no keyframes — this wrapper
+        never passes decode_with_keyframes), so the retry differs from the first
+        attempt only in the budget number. Decode re-resolves post-evict anyway;
+        this config survives the early gate and tiles the reference encode.
+        """
+        return resolve_cuda_decode_tiling_retry(
+            self.pipeline.video_decoder.checkpoint_path,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            chunk_pixel_frames=chunk_config.chunk_pixel_frames if chunk_config is not None else None,
+            device=self._device,
+            keyframes=False,
+            diffvae_optimization=self.pipeline.video_decoder.diffvae_optimization,
+        )
 
     def _run_inference(
         self,
@@ -305,6 +367,7 @@ class LTXIcLoraPipeline:
             height=height,
             num_frames=num_frames,
             frame_rate=frame_rate,
+            carry_frames=self._chunk_carry_frames(),
         )
         if chunk_config is not None:
             logger.info(
@@ -325,41 +388,67 @@ class LTXIcLoraPipeline:
                     "reduce frames (shorter clip / lower FPS) or RES FACTOR.",
                     free_gb,
                 )
-        started = time.monotonic()
-        try:
+        def _attempt(tiling_config: PipelineTilingType) -> None:
             from services.denoising_progress import distilled_total_steps, track_denoising
 
-            with track_denoising(distilled_total_steps(stage_2=not skip_stage_2) * chunk_count):
-                result = self._run_inference(
-                    prompt=prompt,
-                    seed=seed,
+            try:
+                with track_denoising(distilled_total_steps(stage_2=not skip_stage_2) * chunk_count):
+                    result = self._run_inference(
+                        prompt=prompt,
+                        seed=seed,
+                        height=height,
+                        width=width,
+                        num_frames=num_frames,
+                        frame_rate=frame_rate,
+                        images=images,
+                        video_conditioning=video_conditioning,
+                        tiling_config=tiling_config,
+                        skip_stage_2=skip_stage_2,
+                        conditioning_attention_mask=conditioning_attention_mask,
+                        chunk_config=chunk_config,
+                    )
+                    encode_result(
+                        result,
+                        output_path=output_path,
+                        num_frames=num_frames,
+                        frame_rate=frame_rate,
+                        mute_audio=mute_audio,
+                        source_audio_path=source_audio_path,
+                        streamed=chunk_config is not None,
+                        device=self._device,
+                    )
+            except torch.cuda.OutOfMemoryError:
+                logger.error(
+                    "[ic-lora] CUDA OOM at stage-1 %dx%d x %d frames — lower RES FACTOR or trim the clip.",
+                    width // 2, height // 2, num_frames,
+                )
+                raise
+
+        started = time.monotonic()
+        try:
+            _attempt(
+                self._decode_tiling(
+                    skip_stage_2=skip_stage_2,
                     height=height,
                     width=width,
                     num_frames=num_frames,
-                    frame_rate=frame_rate,
-                    images=images,
-                    video_conditioning=video_conditioning,
-                    tiling_config=auto_tiling_config(),
-                    skip_stage_2=skip_stage_2,
-                    conditioning_attention_mask=conditioning_attention_mask,
                     chunk_config=chunk_config,
                 )
-                encode_result(
-                    result,
-                    output_path=output_path,
-                    num_frames=num_frames,
-                    frame_rate=frame_rate,
-                    mute_audio=mute_audio,
-                    source_audio_path=source_audio_path,
-                    streamed=chunk_config is not None,
-                    device=self._device,
-                )
-        except torch.cuda.OutOfMemoryError:
-            logger.error(
-                "[ic-lora] CUDA OOM at stage-1 %dx%d x %d frames — lower RES FACTOR or trim the clip.",
-                width // 2, height // 2, num_frames,
             )
-            raise
+        except ValueError as exc:
+            if (
+                self._device.type != "cuda"
+                or not torch.cuda.is_available()
+                or not is_decode_tile_shortage(exc)
+            ):
+                raise
+            logger.warning(
+                "[ic-lora] decode tiling refused on the momentary budget — "
+                "retrying once against the stable decode-phase budget: %s",
+                exc,
+            )
+            decode_height, decode_width = (height // 2, width // 2) if skip_stage_2 else (height, width)
+            _attempt(self._stable_decode_tiling(chunk_config, decode_height, decode_width, num_frames))
         # The tile and the window count tell a tiled run from a plain one, so run times can be
         # compared. This line has no CUDA condition, so a Mac run is measured too.
         tile = "none"
@@ -367,8 +456,9 @@ class LTXIcLoraPipeline:
             tile_width, tile_height = self._tiling.tile_size(width // 2, height // 2)
             tile = f"{tile_width}x{tile_height}"
         logger.info(
-            "[ic-lora] run time %.0fs (%d frames, tile %s, %d window(s))",
+            "[ic-lora] run time %.0fs (%d frames, tile %s, %d window(s), process RAM %.1f GB)",
             time.monotonic() - started, num_frames, tile, chunk_count,
+            psutil.Process().memory_info().rss / 1e9,
         )
         if cuda:
             peak_alloc = torch.cuda.max_memory_allocated(self._device) / 1e9

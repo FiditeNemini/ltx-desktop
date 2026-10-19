@@ -26,9 +26,8 @@ class HealthHandler(StateHandlerBase):
         gpu_info: GpuInfo,
         config: RuntimeConfig,
     ) -> None:
-        super().__init__(state, lock, config)
+        super().__init__(state, lock, config, gpu_info=gpu_info)
         self._models = models_handler
-        self._gpu_info = gpu_info
 
     def get_health(self) -> HealthResponse:
         active_model: str | None = None
@@ -48,7 +47,7 @@ class HealthHandler(StateHandlerBase):
             status="ok",
             models_loaded=models_loaded,
             active_model=active_model,
-            gpu_info=GpuTelemetry(**self._gpu_info.get_gpu_info()),
+            gpu_info=GpuTelemetry(**self._gpu.get_gpu_info()),
             sage_attention=self.config.use_sage_attention,
             models_status=[
                 ModelStatusItem(
@@ -62,12 +61,18 @@ class HealthHandler(StateHandlerBase):
 
     def get_gpu_info(self) -> GpuInfoResponse:
         return GpuInfoResponse(
-            cuda_available=self._gpu_info.get_cuda_available(),
-            mps_available=self._gpu_info.get_mps_available(),
-            gpu_available=self._gpu_info.get_gpu_available(),
-            gpu_name=self._gpu_info.get_device_name(),
-            vram_gb=self._gpu_info.get_vram_total_gb(),
-            gpu_info=GpuTelemetry(**self._gpu_info.get_gpu_info()),
+            cuda_available=self._gpu.get_cuda_available(),
+            mps_available=self._gpu.get_mps_available(),
+            gpu_available=self._gpu.get_gpu_available(),
+            gpu_name=self._gpu.get_device_name(),
+            vram_gb=self._gpu.get_vram_total_gb(),
+            gpu_info=GpuTelemetry(**self._gpu.get_gpu_info()),
+            total_vram_bytes=self._gpu.get_cuda_total_vram_bytes(),
+            free_vram_bytes=self._gpu.get_free_cuda_vram_bytes(),
+            total_ram_bytes=self._gpu.get_total_ram_bytes(),
+            system=self.config.system or None,
+            checkpoint_drive_type=self.config.checkpoint_drive_type,
+            mps_pool_bytes=self._gpu.get_mps_pool_bytes(),
         )
 
     def get_mps_memory(self) -> MpsMemoryResponse:

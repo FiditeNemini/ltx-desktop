@@ -64,6 +64,8 @@ import services.patches.safetensors_loader_fix as _safetensors_loader_fix  # pyr
 del _safetensors_loader_fix
 import services.patches.disk_streaming_pread as _disk_streaming_pread  # Remove once ltx-core DiskTensorReader passes backend=pread on Darwin. No-op off Darwin.
 _disk_streaming_pread.install()
+import services.patches.linux_disk_streaming_backend as _linux_disk_streaming_backend  # Remove once safetensors maps read-only (LTX-Desktop#163). No-op off Linux.
+_linux_disk_streaming_backend.install()
 import services.patches.safetensors_metadata_fix as _safetensors_metadata_fix  # pyright: ignore[reportUnusedImport]  # Remove once safetensors supports read-only mmap
 del _safetensors_metadata_fix
 import services.patches.pinned_pool_fix as _pinned_pool_fix  # pyright: ignore[reportUnusedImport]  # Remove once ltx-core alloc_buffer does not report pinned-host failure as CUDA VRAM OOM (LTX-Desktop#141)
@@ -110,6 +112,8 @@ _mps_prebuilt_ext.log_mps_backend_status()
 # install() ran before basicConfig, so its status log would have been dropped.
 _disk_streaming_pread.log_status()
 del _disk_streaming_pread
+_linux_disk_streaming_backend.log_status()
+del _linux_disk_streaming_backend
 
 # ============================================================
 # SageAttention Integration
@@ -232,68 +236,51 @@ SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 DEFAULT_APP_SETTINGS = AppSettings()
 
 from app_factory import DEFAULT_ALLOWED_ORIGINS, create_app
-from dataclasses import dataclass
 from state import RuntimeConfig, build_initial_state
-from runtime_config.runtime_policy import LocalGenerationMode, decide_local_generation_mode
+from runtime_config.accelerator import accelerator_supports_fp8
+from runtime_config.local_runtime import LocalRuntime, resolve_local_runtime
+from runtime_config.macos_version import detect_macos_major
+from runtime_config.runtime_policy import LocalGenerationMode
 from server_utils.model_layout_migration import migrate_legacy_models_layout
 from services.gpu_info.gpu_info_impl import GpuInfoImpl, platform_label
+from services.storage_info.storage_info_impl import StorageInfoImpl
 
 migrate_legacy_models_layout(APP_DATA_DIR)
 
 LTX_API_BASE_URL = "https://api.ltx.video"
 
 
-@dataclass(frozen=True)
-class _LocalRuntime:
-    mode: LocalGenerationMode
-    vram_gb: int | None
-    available_ram_gb: int | None
-    darwin: bool
-
-
-def _resolve_local_runtime() -> _LocalRuntime:
-    from runtime_config.accelerator import accelerator_backend
-
+def _resolve_startup_local_runtime() -> LocalRuntime:
     gpu_info = GpuInfoImpl()
     system = platform.system()
-    cuda_available = gpu_info.get_cuda_available()
-    mps_available = gpu_info.get_mps_available()
-    vram_gb = gpu_info.get_vram_total_gb()
-    fp8_capable = accelerator_backend() == "cuda"
-    # Darwin has no discrete VRAM (unified memory). Eligibility uses *total* RAM
-    # (``get_vram_total_gb`` / SKU). Job sizing still uses free RAM at launch.
-    available_ram_gb = gpu_info.get_available_ram_gb() if system == "Darwin" else None
-    ram_gb = vram_gb if system == "Darwin" else None
-
-    # Server-owned source of truth for mode selection.
-    mode = decide_local_generation_mode(
+    fp8_capable = accelerator_supports_fp8()
+    macos_major = detect_macos_major()
+    if system == "Darwin" and macos_major is None:
+        logger.warning("Could not read the macOS version. The macOS minimum for local generation is not enforced.")
+    runtime = resolve_local_runtime(
+        gpu_info,
         system=system,
-        cuda_available=cuda_available,
-        vram_gb=vram_gb,
-        mps_available=mps_available,
-        ram_gb=ram_gb,
         fp8_capable=fp8_capable,
+        storage_info=StorageInfoImpl(APP_DATA_DIR),
+        macos_major=macos_major,
     )
     logger.info(
-        "Runtime policy local_generations_mode=%s (system=%s cuda_available=%s mps_available=%s "
-        "vram_gb=%s available_ram_gb=%s fp8_capable=%s)",
-        mode,
+        "Runtime policy local_generations_mode=%s (system=%s macos_major=%s cuda_available=%s mps_available=%s "
+        "vram_gb=%s available_ram_gb=%s fp8_capable=%s checkpoint_drive=%s)",
+        runtime.mode,
         system,
-        cuda_available,
-        mps_available,
-        vram_gb,
-        available_ram_gb,
+        macos_major,
+        gpu_info.get_cuda_available(),
+        gpu_info.get_mps_available(),
+        runtime.vram_gb,
+        runtime.available_ram_gb,
         fp8_capable,
+        runtime.checkpoint_drive_type,
     )
-    return _LocalRuntime(
-        mode=mode,
-        vram_gb=vram_gb,
-        available_ram_gb=available_ram_gb,
-        darwin=system == "Darwin",
-    )
+    return runtime
 
 
-_LOCAL_RUNTIME = _resolve_local_runtime()
+_LOCAL_RUNTIME = _resolve_startup_local_runtime()
 LOCAL_GENERATIONS_MODE = _LOCAL_RUNTIME.mode
 
 
@@ -339,10 +326,6 @@ runtime_config = RuntimeConfig(
     outputs_dir=OUTPUTS_DIR,
     settings_file=SETTINGS_FILE,
     ltx_api_base_url=LTX_API_BASE_URL,
-    local_generations_mode=_EFFECTIVE_LOCAL_GENERATIONS_MODE,
-    vram_gb=_LOCAL_RUNTIME.vram_gb,
-    available_ram_gb=_LOCAL_RUNTIME.available_ram_gb,
-    darwin_unified_memory=_LOCAL_RUNTIME.darwin,
     use_sage_attention=use_sage_attention,
     camera_motion_prompts=CAMERA_MOTION_PROMPTS,
     default_negative_prompt=DEFAULT_NEGATIVE_PROMPT,
@@ -351,6 +334,9 @@ runtime_config = RuntimeConfig(
     backend_port=int(os.environ.get("LTX_PORT", "") or PORT),
     lora_catalog_source=str(Path(__file__).parent / "runtime_config" / "lora_catalog.json"),
     lora_catalog_fallback_path=str(Path(__file__).parent / "runtime_config" / "lora_catalog.json"),
+    **_LOCAL_RUNTIME.runtime_config_kwargs(
+        local_generations_mode=_EFFECTIVE_LOCAL_GENERATIONS_MODE
+    ),
 )
 
 handler = build_initial_state(runtime_config, DEFAULT_APP_SETTINGS)

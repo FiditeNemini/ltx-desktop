@@ -12,6 +12,8 @@ type PageHeaderProps = {
   showHistoryNav?: boolean;
   /** When the shell `<main>` already applies `--shell-page-inset`. */
   insetFromShell?: boolean;
+  /** On a narrow Remote screen, keep the actions row at the end edge when it wraps. */
+  actionsAtEndWhenWrapped?: boolean;
 };
 
 export function PageHeader({
@@ -20,6 +22,7 @@ export function PageHeader({
   beforeActions,
   showHistoryNav = false,
   insetFromShell = false,
+  actionsAtEndWhenWrapped = false,
 }: PageHeaderProps) {
   return (
     <header
@@ -29,7 +32,9 @@ export function PageHeader({
         {showHistoryNav ? <HistoryNavButtons /> : null}
         {leading}
       </div>
-      <div className={styles.trailing}>
+      <div
+        className={clsx(styles.trailing, actionsAtEndWhenWrapped && styles.trailingAtEnd)}
+      >
         {beforeActions}
         <HomeHeaderActions queueControl={queueControl} />
       </div>

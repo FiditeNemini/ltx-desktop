@@ -15,7 +15,6 @@ import { generationPresentation } from "../../lib/generationPresentation.ts";
 import type { ExploreAsset } from "@/lib/explore-contract";
 import { generationQueueTooltipPortal } from "./generationQueueTooltipPortal.ts";
 import {
-  activeQueueProgressPercent,
   formatActiveQueueProgress,
   formatActiveQueueProgressDetail,
   orderedQueueInputAssets,
@@ -219,6 +218,7 @@ type ActiveQueueRowProps = {
   mediaUrlForAsset: (asset: ExploreAsset) => string | null;
   thumbUrlForAsset: (asset: ExploreAsset) => string | null;
   onCancel: () => void;
+  onOpen: () => void;
   listItemMotion?: GenerationQueueRowListMotion;
 };
 
@@ -229,6 +229,7 @@ export function ActiveQueueRow({
   mediaUrlForAsset,
   thumbUrlForAsset,
   onCancel,
+  onOpen,
   listItemMotion,
 }: ActiveQueueRowProps) {
   const presentation = generationPresentation(entry.generation);
@@ -276,6 +277,8 @@ export function ActiveQueueRow({
           mediaUrlForAsset={mediaUrlForAsset}
           thumbUrlForAsset={thumbUrlForAsset}
           titleSuffix={titleProgressSuffix}
+          openable
+          onOpen={onOpen}
         />
         <div className={styles.rowTrailing}>
           <Tooltip
@@ -304,9 +307,9 @@ export function ActiveQueueRow({
       </div>
       {isCancelling ? (
         <span className={styles.srOnly}>Cancelling generation</span>
-      ) : progress != null ? (
+      ) : progressLabel != null ? (
         <span className={styles.srOnly}>
-          {progressDetail} — {activeQueueProgressPercent(progress)}% complete
+          {progressDetail} — {progressLabel} complete
         </span>
       ) : null}
     </motion.li>
@@ -386,6 +389,7 @@ type QueuedSortableRowProps = {
   mediaUrlForAsset: (asset: ExploreAsset) => string | null;
   thumbUrlForAsset: (asset: ExploreAsset) => string | null;
   onCancel: () => void;
+  onOpen: () => void;
   listItemMotion?: GenerationQueueRowListMotion;
 };
 
@@ -397,6 +401,7 @@ export function GenerationQueueSortableRow({
   mediaUrlForAsset,
   thumbUrlForAsset,
   onCancel,
+  onOpen,
   listItemMotion,
 }: QueuedSortableRowProps) {
   const presentation = generationPresentation(entry.generation);
@@ -428,6 +433,8 @@ export function GenerationQueueSortableRow({
             entry={entry}
             mediaUrlForAsset={mediaUrlForAsset}
             thumbUrlForAsset={thumbUrlForAsset}
+            openable
+            onOpen={onOpen}
           />
           <div className={styles.rowTrailing}>
             <Tooltip

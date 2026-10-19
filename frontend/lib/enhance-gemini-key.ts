@@ -8,17 +8,29 @@ export function isEnhanceBlockedByMissingGeminiKey(input: {
   enhanceProvider: 'local' | 'api'
   hasGeminiApiKey: boolean
   hasEnhanceInput: boolean
-  isGenerationInProgressForEnhance: boolean
-  isOtherGenerationRunning: boolean
 }): boolean {
   // True when Enhance would run via Gemini but no key is configured (API-only path).
   // When local Gemma is available, the provider hook falls back to local instead.
+  // A running generation does not matter: Gemini is an HTTP call and runs beside it.
   return (
     input.enhanceAvailableForMode
     && input.enhanceProvider === 'api'
     && !input.hasGeminiApiKey
     && input.hasEnhanceInput
-    && !input.isGenerationInProgressForEnhance
-    && !input.isOtherGenerationRunning
+  )
+}
+
+/**
+ * Whether a running generation stops Enhance. Local Gemma needs the GPU slot, so it waits.
+ * Gemini is an HTTP call and runs beside a generation.
+ */
+export function isEnhanceBlockedByGeneration(input: {
+  enhanceProvider: 'local' | 'api'
+  isGenerationInProgressForEnhance: boolean
+  isOtherGenerationRunning: boolean
+}): boolean {
+  return (
+    input.enhanceProvider === 'local'
+    && (input.isGenerationInProgressForEnhance || input.isOtherGenerationRunning)
   )
 }

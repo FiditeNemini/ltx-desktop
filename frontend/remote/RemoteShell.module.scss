@@ -17,6 +17,20 @@
   overflow: hidden;
 }
 
+// The chat scrolls its own messages, so the page must not scroll the composer away.
+main.assistantPage {
+  overflow: hidden;
+  scrollbar-gutter: auto;
+}
+
+div.assistantPageInner {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-width: none;
+  padding: 0 0 env(safe-area-inset-bottom, 0px);
+}
+
 .home {
   box-sizing: border-box;
   height: 100%;

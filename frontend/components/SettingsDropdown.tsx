@@ -2,6 +2,8 @@ import React, { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle } from "lucide-react";
 
+import { BudgetFraction } from "@/components/BudgetFraction";
+import { budgetTooltip, type BudgetReadout } from "@/lib/budget-figure";
 import { useThemedPortalContainer } from "@/ds/styles/themes/useTheme";
 
 import { useFixedMenu } from "../hooks/use-fixed-menu";
@@ -31,6 +33,10 @@ export function SettingsDropdown({
     disabled?: boolean;
     tooltip?: string;
     warning?: string;
+    /** Yellow budget marker. Omitted keeps the gray caveat triangle. */
+    warningTone?: "caveat" | "risk";
+    /** Structured need/have pair. Present only for a budget limit. */
+    budget?: BudgetReadout | null;
     icon?: React.ReactNode;
   }[];
   value: string;
@@ -58,6 +64,9 @@ export function SettingsDropdown({
     setIsOpen(open);
   };
 
+  const selectedOption = options.find((option) => option.value === value);
+  const selectedRisk = selectedOption?.warningTone === "risk";
+
   const triggerButton = (
     <button
       type="button"
@@ -75,6 +84,16 @@ export function SettingsDropdown({
       }
     >
       {trigger}
+      {selectedRisk ? (
+        <AlertTriangle
+          className="h-3 w-3 text-[color:var(--semantic-fg-warning-primary-enabled)]"
+          aria-label={
+            selectedOption?.budget
+              ? budgetTooltip(selectedOption.budget)
+              : selectedOption?.warning
+          }
+        />
+      ) : null}
     </button>
   );
 
@@ -131,17 +150,31 @@ export function SettingsDropdown({
                       {option.label}
                     </span>
                     <span className="flex items-center gap-2 flex-shrink-0">
-                      {option.warning && (
-                        <Tooltip content={option.warning}>
-                          <span
-                            className="inline-flex text-fg-tertiary/80"
-                            onClick={(event) => event.stopPropagation()}
-                            aria-label={option.warning}
-                          >
-                            <AlertTriangle className="h-3 w-3" />
-                          </span>
-                        </Tooltip>
-                      )}
+                      {option.disabled && option.budget ? (
+                        <BudgetFraction readout={option.budget} />
+                      ) : null}
+                      {option.warning &&
+                        (option.budget != null ? (
+                          <Tooltip content={budgetTooltip(option.budget)}>
+                            <span onClick={(event) => event.stopPropagation()}>
+                              <BudgetFraction readout={option.budget} />
+                            </span>
+                          </Tooltip>
+                        ) : (
+                          <Tooltip content={option.warning}>
+                            <span
+                              className={
+                                option.warningTone === "risk"
+                                  ? "inline-flex text-[color:var(--semantic-fg-warning-primary-enabled)]"
+                                  : "inline-flex text-fg-tertiary/80"
+                              }
+                              onClick={(event) => event.stopPropagation()}
+                              aria-label={option.warning}
+                            >
+                              <AlertTriangle className="h-3 w-3" />
+                            </span>
+                          </Tooltip>
+                        ))}
                       {showSelectedIndicator &&
                         value === option.value &&
                         !option.disabled && (
@@ -161,9 +194,11 @@ export function SettingsDropdown({
                         )}
                     </span>
                   </button>
-                  {option.disabled && option.tooltip && (
+                  {option.tooltip && (
                     <div className="absolute left-full ml-2 top-1/2 -translate-y-1/2 px-2 py-1 bg-action-hover rounded text-xs text-fg-secondary whitespace-nowrap opacity-0 group-hover/option:opacity-100 pointer-events-none z-[10000] transition-opacity">
-                      {option.tooltip}
+                      {option.budget
+                        ? budgetTooltip(option.budget)
+                        : option.tooltip}
                     </div>
                   )}
                 </div>

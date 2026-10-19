@@ -63,6 +63,7 @@ html {
   /* Windows/Linux keep a native title bar above the page, so the webview starts at y=0. */
   --window-chrome-top: 0px;
   --window-chrome-start: 0px;
+  --window-chrome-end: 0px;
   /* Unpinned sidebar pin button, including the gap before header content. */
   --collapsed-sidebar-chrome-width: calc(
     var(--window-chrome-start) + var(--spacing-lg) + var(--spacing-xxl) + var(--spacing-lg)
@@ -74,7 +75,15 @@ html[data-platform="darwin"] {
      Traffic-light x is 16px = --spacing-lg (see MACOS_TRAFFIC_LIGHT_POSITION). */
   --window-chrome-top: var(--spacing-4xl);
   /* Width of the traffic-light cluster from the window edge (Telegram-style header). */
-  --window-chrome-start: calc(var(--spacing-4xl) + var(--spacing-xl));
+  --traffic-lights-width: calc(var(--spacing-4xl) + var(--spacing-xl));
+  --window-chrome-start: var(--traffic-lights-width);
+}
+
+/* RTL mirrors the traffic lights to the right edge. The page stays LTR. */
+html[data-platform="darwin"][data-traffic-lights="end"] {
+  --window-chrome-start: 0px;
+  /* Traffic-light cluster width plus a gap before the header actions. */
+  --window-chrome-end: calc(var(--traffic-lights-width) + var(--spacing-md));
 }
 
 /* Drag contract (macOS only): apply `.window-drag` ONLY to a narrow,

@@ -18,6 +18,7 @@ from services.ffmpeg import (
     FFMPEG_PROTOCOL_WHITELIST,
     FfmpegCancelledError,
     run_ffmpeg,
+    timeout_for_pixels,
     timeout_for_source_duration,
 )
 from services.generation_interrupt import GenerationCancelledError, is_requested
@@ -77,12 +78,17 @@ def _matte_geometry(matte: Path) -> _MatteGeometry:
     _kind, _mime, probed = probe_file(matte)
     if probed.mediaType != "video":
         raise MediaError("UNREADABLE_MEDIA", "the matte is not a video")
+    width, height = probed.metadata.width, probed.metadata.height
+    frames = video_frame_count(matte)
     return _MatteGeometry(
-        width=probed.metadata.width,
-        height=probed.metadata.height,
+        width=width,
+        height=height,
         fps=video_fps(matte),
-        frames=video_frame_count(matte),
-        timeout=timeout_for_source_duration(probed.metadata.durationMs / 1000),
+        frames=frames,
+        timeout=max(
+            timeout_for_source_duration(probed.metadata.durationMs / 1000),
+            timeout_for_pixels(width, height, frames),
+        ),
     )
 
 

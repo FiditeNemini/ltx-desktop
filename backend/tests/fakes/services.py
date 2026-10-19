@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -12,6 +12,7 @@ import time
 
 from PIL import Image
 from frame_math import AutoDurationSpec
+from ltx_pipelines.utils.types import OffloadMode
 from api_types import (
     ExtendMode,
     ImageConditioningInput,
@@ -31,6 +32,8 @@ from api_types import (
 from runtime_config.ic_lora_tiling import IcLoraTiling
 from services.interfaces import VideoInfoPayload
 from services.ltx_api_client.ltx_api_client import LTXRetakeResult
+from services.prompt_enhancement.i2v_frames import SceneFrame, VideoRole
+from tests.fakes.assistant import FakeAssistantModels, FakeAssistantProvider
 from tests.fakes.fake_gpu_info import FakeGpuInfo
 
 
@@ -411,9 +414,10 @@ class FakeModelDownloader:
         local_dir: str,
         token: str | None,
         on_progress: Callable[[int], None] | None = None,
+        revision: str | None = None,
     ) -> Path:
         self._raise_if_needed()
-        self.calls.append({"kind": "file", "repo_id": repo_id, "filename": filename, "local_dir": local_dir, "token": token, "on_progress": on_progress})
+        self.calls.append({"kind": "file", "repo_id": repo_id, "filename": filename, "local_dir": local_dir, "token": token, "on_progress": on_progress, **({"revision": revision} if revision else {})})
 
         if on_progress is not None:
             on_progress(512)
@@ -430,6 +434,7 @@ class FakeModelDownloader:
         local_dir: str,
         token: str | None,
         on_progress: Callable[[int], None] | None = None,
+        revision: str | None = None,
     ) -> Path:
         self._raise_if_needed()
         self.calls.append(
@@ -438,6 +443,7 @@ class FakeModelDownloader:
                 "repo_id": repo_id,
                 "local_dir": local_dir,
                 "on_progress": on_progress,
+                **({"revision": revision} if revision else {}),
             }
         )
 
@@ -732,8 +738,9 @@ class FakeCapture:
 
 
 class FakeWriter:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, fps: float = 0.0) -> None:
         self.path = Path(path)
+        self.fps = fps
         self.frames: list[Any] = []
         self.released = False
 
@@ -794,7 +801,7 @@ class FakeVideoProcessor:
         return f"jpeg:{frame}".encode("utf-8")
 
     def create_writer(self, path: str, fourcc: str, fps: float, size: tuple[int, int]) -> FakeWriter:  # noqa: ARG002
-        writer = FakeWriter(path)
+        writer = FakeWriter(path, fps)
         self.writers.append(writer)
         return writer
 
@@ -825,6 +832,7 @@ class _FakeVideoPipelineBase:
         self.steps_completed = 0
         self.entered_inference = threading.Event()
         self.last_streaming_prefetch_count: int | None = None
+        self.last_offload_mode: OffloadMode | None = None
         self.create_count: int = 0
 
     def _record_generate(self, payload: dict[str, Any]) -> None:
@@ -864,6 +872,7 @@ class FakeFastVideoPipeline(_FakeVideoPipelineBase):
         streaming_prefetch_count: int | None,
         loras: list[tuple[str, float]] | None = None,
         *,
+        offload_mode: OffloadMode,
         video_vae_path: str | None = None,
         audio_vae_path: str | None = None,
         duration_head_path: str | None = None,
@@ -881,6 +890,7 @@ class FakeFastVideoPipeline(_FakeVideoPipelineBase):
         if pipeline is None:
             raise RuntimeError("FakeFastVideoPipeline singleton is not bound")
         pipeline.last_streaming_prefetch_count = streaming_prefetch_count
+        pipeline.last_offload_mode = offload_mode
         pipeline.create_count += 1
         pipeline.create_loras.append(list(loras or []))
         return pipeline
@@ -898,6 +908,7 @@ class FakeFastVideoPipeline(_FakeVideoPipelineBase):
         *,
         guide_all_images: bool = False,
         skip_stage_2: bool = False,
+        chunk_pixel_frames: int | None = None,
     ) -> None:
         payload = {
             "prompt": prompt,
@@ -910,6 +921,7 @@ class FakeFastVideoPipeline(_FakeVideoPipelineBase):
             "output_path": output_path,
             "guide_all_images": guide_all_images,
             "skip_stage_2": skip_stage_2,
+            "chunk_pixel_frames": chunk_pixel_frames,
         }
         if self.inference_steps:
             from services.generation_interrupt import raise_if_requested
@@ -1011,6 +1023,7 @@ class FakePromptEnhancerPipeline:
         self.created_with: list[dict[str, Any]] = []
         self.enhance_t2v_calls: list[dict[str, Any]] = []
         self.enhance_i2v_calls: list[dict[str, Any]] = []
+        self.enhance_video_frames_calls: list[dict[str, Any]] = []
         self.raise_on_enhance: Exception | None = None
         self.enhanced_prompt: str = "enhanced prompt"
 
@@ -1047,6 +1060,33 @@ class FakePromptEnhancerPipeline:
             raise self.raise_on_enhance
         return self.enhanced_prompt
 
+    def enhance_with_video_frames(
+        self,
+        prompt: str,
+        frames: Sequence[SceneFrame],
+        system_prompt: str | None,
+        seed: int,
+        role: VideoRole,
+    ) -> str:
+        # The frame files are temporary, so a test reads what they were while the call runs.
+        self.enhance_video_frames_calls.append(
+            {
+                "prompt": prompt,
+                "frame_times": [frame.time_seconds for frame in frames],
+                "frame_paths": [frame.path for frame in frames],
+                "look_images": sum(1 for frame in frames if frame.is_reference),
+                "look_image_first": bool(frames) and frames[0].is_reference,
+                "look_image_notes": [frame.note for frame in frames if frame.is_reference],
+                "frames_existed": all(Path(frame.path).is_file() for frame in frames),
+                "system_prompt": system_prompt,
+                "seed": seed,
+                "role": role,
+            }
+        )
+        if self.raise_on_enhance is not None:
+            raise self.raise_on_enhance
+        return self.enhanced_prompt
+
 
 class FakeIcLoraPipeline:
     _singleton: ClassVar["FakeIcLoraPipeline | None"] = None
@@ -1065,6 +1105,7 @@ class FakeIcLoraPipeline:
         streaming_prefetch_count: int | None,
         lora_strength: float = 1.0,
         *,
+        offload_mode: OffloadMode,
         video_vae_path: str | None = None,
         audio_vae_path: str | None = None,
         duration_head_path: str | None = None,
@@ -1088,6 +1129,7 @@ class FakeIcLoraPipeline:
         pipeline.last_stage_2_ic_lora = stage_2_ic_lora
         pipeline.last_tiling = tiling
         pipeline.last_streaming_prefetch_count = streaming_prefetch_count
+        pipeline.last_offload_mode = offload_mode
         pipeline.create_count += 1
         return pipeline
 
@@ -1095,6 +1137,7 @@ class FakeIcLoraPipeline:
         self.generate_calls: list[dict[str, Any]] = []
         self.raise_on_generate: Exception | None = None
         self.last_streaming_prefetch_count: int | None = None
+        self.last_offload_mode: OffloadMode | None = None
         self.last_checkpoint_path: str | None = None
         self.last_gemma_root: str | None = None
         self.last_lora_path: str | None = None
@@ -1182,6 +1225,7 @@ class FakeA2VPipeline:
         streaming_prefetch_count: int | None,
         loras: list[tuple[str, float]] | None = None,
         *,
+        offload_mode: OffloadMode,
         video_vae_path: str | None = None,
         audio_vae_path: str | None = None,
         duration_head_path: str | None = None,
@@ -1199,6 +1243,7 @@ class FakeA2VPipeline:
         if pipeline is None:
             raise RuntimeError("FakeA2VPipeline singleton is not bound")
         pipeline.last_streaming_prefetch_count = streaming_prefetch_count
+        pipeline.last_offload_mode = offload_mode
         pipeline.create_count += 1
         pipeline.create_loras.append(list(loras or []))
         return pipeline
@@ -1208,6 +1253,7 @@ class FakeA2VPipeline:
         self.create_loras: list[list[tuple[str, float]]] = []
         self.raise_on_generate: Exception | None = None
         self.last_streaming_prefetch_count: int | None = None
+        self.last_offload_mode: OffloadMode | None = None
         self.create_count: int = 0
 
     def generate(self, **kwargs: Any) -> None:
@@ -1234,6 +1280,7 @@ class FakeRetakePipeline:
         device: str | object,
         streaming_prefetch_count: int | None,
         *,
+        offload_mode: OffloadMode,
         loras: list[object] | None = None,
         quantization: object | None = None,
         video_vae_path: str | None = None,
@@ -1248,6 +1295,7 @@ class FakeRetakePipeline:
         pipeline.create_calls.append({
             "checkpoint_path": checkpoint_path,
             "gemma_root": gemma_root,
+            "offload_mode": offload_mode,
             "video_vae_path": video_vae_path,
             "audio_vae_path": audio_vae_path,
             "duration_head_path": duration_head_path,
@@ -1322,6 +1370,8 @@ class FakeTextEncoder:
 
 @dataclass
 class FakeServices:
+    assistant_provider: FakeAssistantProvider = field(default_factory=FakeAssistantProvider)
+    assistant_models: FakeAssistantModels = field(default_factory=FakeAssistantModels)
     http: FakeHTTPClient = field(default_factory=FakeHTTPClient)
     gpu_cleaner: FakeGpuCleaner = field(default_factory=FakeGpuCleaner)
     model_downloader: FakeModelDownloader = field(default_factory=FakeModelDownloader)

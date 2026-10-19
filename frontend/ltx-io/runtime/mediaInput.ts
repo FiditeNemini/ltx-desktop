@@ -75,12 +75,17 @@ function requestAcceptsImage(
 /**
  * A2V import affordance: a video pick should resolve to its extracted audio
  * track only when the field wants audio and also accepts video as a source.
- * Video-only fields (Retake / Extend) ingest the clip as video.
+ * Video-only fields (Retake / Extend) and any-media picks that also take images
+ * (Assistant attachments) ingest the clip as video.
  */
 export function requestExtractsAudioFromVideo(
   request: ExploreMediaChooseRequest,
 ): boolean {
-  return requestAcceptsAudio(request) && requestAcceptsVideo(request);
+  return (
+    requestAcceptsAudio(request) &&
+    requestAcceptsVideo(request) &&
+    !requestAcceptsImage(request)
+  );
 }
 
 /** Human name for the native dialog filter, derived from the same suffixes as the predicates. */
@@ -90,6 +95,9 @@ export function describeMediaFilter(
   const hasAudio = requestAcceptsAudio(request);
   const hasVideo = requestAcceptsVideo(request);
   const hasImage = requestAcceptsImage(request);
+  if (hasImage && (hasAudio || hasVideo)) {
+    return "Media";
+  }
   if (hasAudio && hasVideo) {
     return "Audio or video";
   }

@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
-from api_types import MediaKind
+from api_types import MediaKind, PipelineOffloadMode, VideoLoadMode
 from services.records import GenerationRecord
 
 
@@ -25,6 +25,21 @@ class OutputAllocation:
     dest_path: str
 
 
+@dataclass(frozen=True)
+class ExecutionOutcome:
+    """What an executor reports beyond its output files.
+
+    Modes are None when the executor's pipeline does not surface them
+    (retake/extend today) — nulls mean unknown, never default them.
+    """
+
+    # A prompt the app wrote for a blank one. The runner stores it with the success, so a run
+    # that fails or is cancelled keeps its blank prompt and a retry starts from it.
+    written_prompt: str | None = None
+    load_mode: VideoLoadMode | None = None
+    offload_mode: PipelineOffloadMode | None = None
+
+
 class GenerationExecutor(Protocol):
     def validate_params(
         self, spec: Mapping[str, object], *, contract_version: int
@@ -36,4 +51,4 @@ class GenerationExecutor(Protocol):
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None: ...
+    ) -> ExecutionOutcome | None: ...

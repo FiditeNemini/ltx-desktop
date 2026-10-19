@@ -1,7 +1,10 @@
 import { HOME_FEATURES } from "../../lib/home-features.ts";
 import { formatPipelineDisplayName } from "../../lib/video-generation-model-specs.ts";
+import { videoGenerationResolutionLabel } from "../../lib/video-resolution.ts";
 
 import { formatA2vDurationBadge } from "./a2vDurationPolicy.ts";
+import { formatResolution } from "./formatResolution.ts";
+import { IC_LORA_CONTROL_COPY, isIcLoraControlType } from "./icLoraControlType.ts";
 import { roundDurationSeconds } from "./roundDuration.ts";
 import {
   readGenerationParams,
@@ -10,7 +13,26 @@ import {
 
 export { roundDurationSeconds };
 
-type GenerationPresentationSource = Pick<Generation, "feature" | "spec">;
+type GenerationPresentationSource = Pick<Generation, "feature" | "spec"> & {
+  outputs?: Generation["outputs"];
+  risk?: Generation["risk"];
+};
+
+/**
+ * Retake and Extend keep the source picture size unless a smaller one is asked for, and the
+ * run caps it. The spec holds the request, not the result, so the label comes from the output.
+ */
+const OUTPUT_SIZED_FEATURES: ReadonlySet<string> = new Set(["retake", "extend"]);
+
+function outputResolutionLabel(generation: GenerationPresentationSource): string | null {
+  if (!OUTPUT_SIZED_FEATURES.has(generation.feature)) return null;
+  for (const output of generation.outputs ?? []) {
+    if (output.metadata.mediaType === "video") {
+      return formatResolution(output.metadata.metadata);
+    }
+  }
+  return null;
+}
 
 export function formatDurationBadge(seconds: number): string {
   const rounded = roundDurationSeconds(seconds);
@@ -22,6 +44,7 @@ export type GenerationPresentation = {
   label: string;
   prompt: string;
   badges: string[];
+  /** Snapshotted reckless-bet line. Null when the job was not a bet. */
   /** All input asset IDs for queue / summary UI (frames, audio, etc.). */
   inputAssetIds: string[];
   imageInputAssetIds: string[];
@@ -74,6 +97,25 @@ function imageInputAssetIds(generation: GenerationPresentationSource): string[] 
   });
 }
 
+/**
+ * The strength the run used. Desktop keeps it on `loras[0].scale`. The phone remote withholds
+ * the `loras` array (it holds the file path) and sends a top-level `scale`. Undefined when the
+ * run has no LoRA, so a plain text-to-video run shows no strength.
+ */
+function readLoraStrength(params: Record<string, unknown> | null): number | undefined {
+  if (!params) return undefined;
+  const loras = params.loras;
+  const stored =
+    Array.isArray(loras) && loras.length > 0
+      ? (loras[0] as { scale?: unknown } | null)?.scale
+      : params.scale;
+  return typeof stored === "number" && Number.isFinite(stored) ? stored : undefined;
+}
+
+export function formatLoraStrengthBadge(strength: number): string {
+  return `Strength ${Number(strength.toFixed(2))}`;
+}
+
 function featureLabel(feature: string): string {
   const known = HOME_FEATURES.find((item) => item.id === feature);
   if (known) return known.title;
@@ -90,7 +132,15 @@ export function generationPresentation(
       ? formatPipelineDisplayName(params.model) ?? params.model
       : null;
   if (model) badges.push(model);
-  if (typeof params?.resolution === "string") badges.push(params.resolution);
+  // Old runs and other recipes carry no `controlType`, or an unknown one: they show no badge.
+  if (isIcLoraControlType(params?.controlType)) {
+    badges.push(IC_LORA_CONTROL_COPY[params.controlType].label);
+  }
+  const resolution =
+    typeof params?.resolution === "string"
+      ? videoGenerationResolutionLabel(params.resolution)
+      : outputResolutionLabel(generation);
+  if (resolution) badges.push(resolution);
   if (typeof params?.duration === "number") badges.push(formatDurationBadge(params.duration));
   else if (
     typeof params?.numFrames === "number" &&
@@ -112,6 +162,8 @@ export function generationPresentation(
   ) {
     badges.push(params.aspectRatio === "auto" ? "Auto" : params.aspectRatio);
   }
+  const strength = readLoraStrength(params);
+  if (strength !== undefined) badges.push(formatLoraStrengthBadge(strength));
   if (typeof params?.seed === "number" && Number.isFinite(params.seed)) {
     badges.push(`Seed ${params.seed}`);
   }

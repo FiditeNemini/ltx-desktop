@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from _routes._errors import HTTPError
 from api_types import (
@@ -208,7 +208,12 @@ def queued_lora_recipes() -> list[LoraRecipe]:
     return [recipe for recipe in LORA_RECIPES.values() if recipe.mode in ("t2v", "i2v")]
 
 
-def apply_recipe_prompt_template(recipe: LoraRecipe, prompt: str) -> str:
+class _HasPromptTemplate(Protocol):
+    @property
+    def prompt_template(self) -> str | None: ...
+
+
+def apply_recipe_prompt_template(recipe: _HasPromptTemplate, prompt: str) -> str:
     """Wrap ``prompt`` in the recipe's scaffold, after enhancement.
 
     Skipped when the recipe has no template, when the template is malformed (no

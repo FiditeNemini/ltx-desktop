@@ -7,12 +7,14 @@ import FailLineIcon from "@ds/assets/Icons/Fail/Line.svg?react";
 import RemoveIcon from "@ds/assets/Icons/Remove.svg?react";
 import RetryIcon from "@ds/assets/Icons/Reset.svg?react";
 import CloseIcon from "@ds/assets/Icons/Close/Normal.svg?react";
+import { useAssetDragSource } from "@/lib/asset-drag";
 
 import { DotsLoader } from "../../../components/shared/DotsLoader/DotsLoader";
 import { LoadingPulse } from "../../../components/shared/LoadingPulse/LoadingPulse";
 import { VideoPlayer } from "../../../components/VideoView/VideoPlayer";
 import { useAssetDownload } from "../../../hooks/useAssetDownload";
 import { promptEmbeddingFailureNotice } from "../../../lib/promptEmbeddingFailure";
+import { staticFailureNotice } from "../../../lib/staticFailureNotices";
 import { rejectedLtxApiKeyNotice } from "../../../lib/rejectedLtxApiKey";
 import { useExploreRuntime } from "../../../runtime/ExploreRuntime";
 import { isInFlightGeneration, type Generation } from "../../../lib/resultsFeedModel";
@@ -109,7 +111,8 @@ export function ResultFrame({
     usesLtxApiTextEncoding: runtime.usesLtxApiTextEncoding,
     canOpenSettings: runtime.openTextEncodingSettings != null,
   });
-  const failureNotice = rejectedKey ?? embeddingFailed;
+  const staticFailure = staticFailureNotice({ errorCode: generation.error_code });
+  const failureNotice = rejectedKey ?? embeddingFailed ?? staticFailure;
   const openFailureSettings = rejectedKey
     ? runtime.openLtxApiKeySettings
     : runtime.openTextEncodingSettings;
@@ -130,11 +133,14 @@ export function ResultFrame({
           download: downloadResultFile,
         })
       : null;
+  const dragSource = useAssetDragSource(
+    generation.status === "succeeded" && output ? output.id : null,
+  );
 
   return (
     <Flex direction="column" gap="sm">
       <ResultMetaBar generation={generation} />
-      <div className={styles.outputStackItem}>
+      <div className={styles.outputStackItem} {...dragSource}>
         {isInFlightGeneration(generation) ? (
           <>
             <LoadingPulse />

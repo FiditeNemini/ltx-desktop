@@ -21,7 +21,7 @@ from _routes.assets import (
 )
 from remote.app import SpaStaticFiles, create_remote_app
 from remote.redact import redact_asset_paths
-from services.media_probe import ALLOWED_IMAGE_SUFFIXES, MAX_IMAGE_BYTES, MAX_VIDEO_BYTES
+from services.media_probe import ALLOWED_IMAGE_SUFFIXES, MAX_IMAGE_BYTES, MAX_VIDEO_UPLOAD_BYTES
 from services.records import AssetRecord, OutputSpec, UnavailableError
 from services.sqlite_store import SqliteStore
 from tests.http_error_assertions import assert_http_error
@@ -387,6 +387,21 @@ def test_list_phone_assets_omits_paths_and_rejects_delete(
         assert deleted.status_code == 405
 
 
+def test_phone_upload_is_named_after_the_uploaded_file_not_its_temp_file(
+    test_state, tmp_path: Path
+) -> None:
+    png_bytes = _png(tmp_path / "phone.png").read_bytes()
+    app = create_remote_app(handler=test_state, remote_token="pair-token")
+    with TestClient(app) as client:
+        uploaded = client.post(
+            "/api/assets/upload",
+            headers=AUTH,
+            files={"file": ("favicon.png", png_bytes, "image/png")},
+        )
+    assert uploaded.status_code == 200
+    assert uploaded.json()["name"] == "favicon.png"
+
+
 def test_list_and_get_phone_assets_do_not_tombstone_missing_files(
     test_state,
 ) -> None:
@@ -645,7 +660,7 @@ def test_remote_upload_rejects_video_over_max_bytes(
             headers={
                 **AUTH,
                 "content-length": str(
-                    MAX_VIDEO_BYTES + _MULTIPART_OVERHEAD_BYTES + 1
+                    MAX_VIDEO_UPLOAD_BYTES + _MULTIPART_OVERHEAD_BYTES + 1
                 ),
             },
             files={"file": ("huge.mp4", video_bytes, "video/mp4")},

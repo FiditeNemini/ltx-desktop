@@ -23,6 +23,7 @@ import { extractVideoFrameToFile, getVideoDimensions } from '../export/ffmpeg-ut
 import { createDownsampledThumbnail, getImageDimensions, getThumbnailPaths } from './image-utils'
 import { handle } from './typed-handle'
 import { isAllowedExternalUrl } from '../allowed-external-url'
+import { isRemoteFilePath } from '../../shared/remote-file-path'
 
 const MIME_TYPES: Record<string, string> = {
   '.png': 'image/png',
@@ -408,7 +409,8 @@ export function registerFileHandlers(): void {
     const results: Record<string, boolean> = {}
     for (const p of filePaths) {
       try {
-        results[p] = fs.existsSync(p)
+        // Never touch a network path. Windows would send credentials to the remote host.
+        results[p] = !isRemoteFilePath(p) && fs.existsSync(p)
       } catch {
         results[p] = false
       }

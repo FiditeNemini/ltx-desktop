@@ -55,6 +55,8 @@ import {
   type VideoGenerationModelSpecItem,
   type VideoGenerationPipeline,
 } from '../lib/video-generation-model-specs'
+import { preflightCellStatus } from '../lib/budget-risk'
+import { localUnavailableMessage } from '../lib/local-generation-availability'
 import {
   GENSPACE_IMAGE_ASPECT_RATIOS,
   genSpaceImageAspectRatio,
@@ -79,6 +81,7 @@ import { shouldShowGeneratingTile } from '../lib/genspace-gallery'
 import { shouldShowLastFrameChip } from '../lib/genspace-last-frame'
 import {
   GEMINI_KEY_REQUIRED_SETTINGS_DETAIL,
+  isEnhanceBlockedByGeneration,
   isEnhanceBlockedByMissingGeminiKey,
 } from '../lib/enhance-gemini-key'
 import { enhanceActionLabel } from '../lib/enhance-ui-copy'
@@ -715,6 +718,7 @@ function PromptBar({
         modelSpecs: videoModelSpecs,
         hasAudio: genSpaceUsesAudioInput(mode) && Boolean(inputAudio),
         minimumDuration: isLocalMode ? undefined : GENSPACE_MIN_SELECTABLE_DURATION_S,
+        budgetMode: 'reckless',
       })
     : null
   const showVideoFpsControl = Boolean(
@@ -1180,9 +1184,18 @@ function PromptBar({
                     ...(showAutoDurationOption
                       ? [{ value: 'auto', label: 'Auto' }]
                       : []),
+                    // Kept-then-dropped stays sorted: the budget grows
+                    // monotonically in duration, so drops sit above keeps.
                     ...resolvedVideoOptions.durationOptions.map((value) => ({
                       value: String(value),
                       label: `${value} Sec`,
+                    })),
+                    ...resolvedVideoOptions.disabledDurationOptions.map((option) => ({
+                      value: String(option.value),
+                      label: `${option.value} Sec`,
+                      disabled: true,
+                      tooltip: option.message,
+                      ...(option.readout ? { budget: option.readout } : {}),
                     })),
                   ]}
                   trigger={
@@ -1199,10 +1212,21 @@ function PromptBar({
                   title="RESOLUTION"
                   value={resolvedVideoOptions.selectedResolution ?? settings.videoResolution}
                   onChange={(v) => onSettingsChange({ ...settings, videoResolution: v })}
-                  options={resolvedVideoOptions.resolutionOptions.map((value) => ({
-                    value,
-                    label: videoGenerationResolutionLabel(value),
-                  }))}
+                  options={[
+                    ...resolvedVideoOptions.resolutionOptions.map((value) => ({
+                      value,
+                      label: videoGenerationResolutionLabel(value),
+                    })),
+                    // A kept resolution implies all smaller ones kept, so
+                    // drops append above keeps in canonical order.
+                    ...resolvedVideoOptions.disabledResolutionOptions.map((option) => ({
+                      value: option.value,
+                      label: videoGenerationResolutionLabel(option.value),
+                      disabled: true,
+                      tooltip: option.message,
+                      ...(option.readout ? { budget: option.readout } : {}),
+                    })),
+                  ]}
                   trigger={
                     <>
                       <Monitor className="h-3.5 w-3.5" />
@@ -1220,7 +1244,19 @@ function PromptBar({
                     title="FPS"
                     value={String(resolvedVideoOptions.selectedFps ?? settings.fps)}
                     onChange={(v) => onSettingsChange({ ...settings, fps: parseInt(v) })}
-                    options={resolvedVideoOptions.fpsOptions.map((value) => ({ value: String(value), label: `${value}` }))}
+                    options={[
+                      ...resolvedVideoOptions.fpsOptions.map((value) => ({
+                        value: String(value),
+                        label: `${value}`,
+                      })),
+                      ...resolvedVideoOptions.disabledFpsOptions.map((option) => ({
+                        value: String(option.value),
+                        label: `${option.value}`,
+                        disabled: true,
+                        tooltip: option.message,
+                        ...(option.readout ? { budget: option.readout } : {}),
+                      })),
+                    ]}
                     trigger={
                       <>
                         <Film className="h-3.5 w-3.5" />
@@ -1238,10 +1274,20 @@ function PromptBar({
                     resolvedVideoOptions.aspectRatioOptions,
                   ).map((value) => {
                     const warning = untrainedAspectRatioWarning(value);
+                    const disabled = resolvedVideoOptions.disabledAspectRatioOptions.find(
+                      (option) => option.value === value,
+                    );
                     return {
                       value,
                       label: value,
-                      ...(warning ? { warning } : {}),
+                      ...(warning != null ? { warning } : {}),
+                      ...(disabled
+                        ? {
+                            disabled: true,
+                            tooltip: disabled.message,
+                            ...(disabled.readout ? { budget: disabled.readout } : {}),
+                          }
+                        : {}),
                     };
                   })}
                   trigger={
@@ -1461,7 +1507,9 @@ export function GenSpace() {
     ? 'Loading generation settings...'
     : videoGenerationModelSpecsErrorMessage
       ? `Could not load generation settings: ${videoGenerationModelSpecsErrorMessage}`
-      : null
+      : shouldVideoGenerateWithLtxApi
+        ? null
+        : localUnavailableMessage(videoGenerationModelSpecsResponse, window.electronAPI.platform, 'reckless')
   const sanitizeVideoSettings = useCallback(
     (
       next: typeof settings,
@@ -1472,9 +1520,10 @@ export function GenSpace() {
         hasAudio: genSpaceUsesAudioInput(mode) && Boolean(inputAudio),
         minimumDuration: shouldVideoGenerateWithLtxApi ? GENSPACE_MIN_SELECTABLE_DURATION_S : undefined,
         durationSelection,
+        budgetMode: 'reckless',
       }) ?? next
     },
-    [inputAudio, mode, shouldVideoGenerateWithLtxApi, videoModelSpecs],
+    [inputAudio, mode, shouldVideoGenerateWithLtxApi, videoGenerationModelSpecsResponse, videoModelSpecs],
   )
   
   const {
@@ -1734,6 +1783,14 @@ export function GenSpace() {
     width: 0,
     height: 0,
   })
+  // Upload preflight verdicts, keyed by entry + input so stale verdicts never
+  // apply to a new selection. Null while missing or failed: unknown is
+  // allowed, and Generate re-decides on the same inputs.
+  const [icLoraPreflight, setIcLoraPreflight] = useState<{
+    entryId: string
+    inputPath: string
+    cells: ApiSuccessOf<'preflightIcLora'>['cells']
+  } | null>(null)
   const [icLoraPanelKey, setIcLoraPanelKey] = useState(0)
   const [icLoraCondType, setIcLoraCondType] = useState<ICLoraConditioningType>('canny')
   // Transformation knobs apply only to custom IC-LoRAs. Reset them when switching to
@@ -2545,14 +2602,17 @@ export function GenSpace() {
     : (mode === 'video' || mode === 'image') && !!inputImage
   const canEnhancePrompt = enhanceAvailableForMode
     && (enhanceProvider === 'api' ? hasGeminiApiKey : true)
-    && (hasEnhanceText || hasEnhanceImage) && !isGenerationInProgressForEnhance && !isOtherGenerationRunning
+    && (hasEnhanceText || hasEnhanceImage)
+    && !isEnhanceBlockedByGeneration({
+      enhanceProvider,
+      isGenerationInProgressForEnhance,
+      isOtherGenerationRunning,
+    })
   const enhanceBlockedByMissingGeminiKey = isEnhanceBlockedByMissingGeminiKey({
     enhanceAvailableForMode,
     enhanceProvider,
     hasGeminiApiKey,
     hasEnhanceInput: hasEnhanceText || hasEnhanceImage,
-    isGenerationInProgressForEnhance,
-    isOtherGenerationRunning,
   })
   const canUndoPrompt = historyIndex > 0
   const canRedoPrompt = historyIndex >= 0 && historyIndex < promptHistory.length - 1
@@ -2579,8 +2639,13 @@ export function GenSpace() {
     setEnhancePromptError(null)
 
     // Recovery marker so a reload mid-enhance can reconnect to the still-running backend call
-    // (see the mount effect below) instead of silently losing the result.
-    await writeRecoveryContext({ prompt: sourcePrompt, genType: 'enhance' })
+    // (see the mount effect below) instead of silently losing the result. Gemini enhance does
+    // not use the generation slot, so there is nothing to reconnect to. The marker is also the
+    // one a running generation uses, and Gemini enhance can run beside that generation.
+    const usesGenerationSlot = enhanceProvider === 'local'
+    if (usesGenerationSlot) {
+      await writeRecoveryContext({ prompt: sourcePrompt, genType: 'enhance' })
+    }
 
     const loraCatalogIds = mode === 'video'
       ? (selectedLoras ?? []).map(l => l.catalogId).filter((id): id is string => !!id)
@@ -2647,7 +2712,7 @@ export function GenSpace() {
       return
     }
     logger.info('Enhance request succeeded, clearing recovery marker')
-    localStorage.removeItem(GENERATION_RECOVERY_KEY)
+    if (usesGenerationSlot) localStorage.removeItem(GENERATION_RECOVERY_KEY)
     if (shouldApplyEnhanceResult(promptRef.current, sourcePrompt)) {
       applyEnhanceResult(sourcePrompt, result.data.enhancedPrompt)
     }
@@ -3060,6 +3125,7 @@ export function GenSpace() {
       modelSpecs: videoModelSpecs,
       hasAudio: genSpaceUsesAudioInput(mode) && Boolean(inputAudio),
       minimumDuration: shouldVideoGenerateWithLtxApi ? GENSPACE_MIN_SELECTABLE_DURATION_S : undefined,
+      budgetMode: 'reckless',
     }).hasCompatibleOptions
   )
   // One global backend slot: Stop / Generate-disable must follow the in-flight job, not the
@@ -3146,6 +3212,107 @@ export function GenSpace() {
     }
   }, [filteredAssets, selectedAsset])
 
+  // Full duration grid (kept + list-time drops) for the upload preflight to
+  // verdict on real pixels. Entries without a duration control (video inputs)
+  // transform the whole clip; the backend ignores the stand-in.
+  const icLoraDurationGrid = useMemo(() => {
+    const control = (selectedIcLora?.controls ?? []).find((c) => c.id === 'duration' && c.kind === 'int')
+    const values = [
+      ...((control?.options ?? []) as (number | string)[]),
+      ...(control?.dropped_options ?? []).map((d) => d.value),
+    ].filter((v): v is number => typeof v === 'number')
+    return values.length > 0 ? values : [5]
+  }, [selectedIcLora])
+
+  useEffect(() => {
+    if (!isCatalogIcLora || selectedIcLoraId == null || !icLoraInput.videoPath || !icLoraInput.ready) {
+      setIcLoraPreflight(null)
+      return
+    }
+    let cancelled = false
+    const entryId = selectedIcLoraId
+    const inputPath = icLoraInput.videoPath
+    // Mirror the submit spread: overrides ride only when the advanced flag is
+    // on, otherwise the backend reads the entry defaults — both sides agree.
+    ApiClient.preflightIcLora({
+      ic_lora_id: entryId,
+      input_path: inputPath,
+      durations: icLoraDurationGrid,
+      ...(advancedIcLoraControls
+        ? { skip_stage_2: icLoraSkipStage2, resolution_factor: icLoraResolutionFactor }
+        : {}),
+    }).then((result) => {
+      if (cancelled) return
+      if (!result.ok) {
+        logger.warn(`IC-LoRA preflight failed: ${result.error.message}`)
+        setIcLoraPreflight(null)
+        return
+      }
+      setIcLoraPreflight({
+        entryId,
+        inputPath,
+        cells: result.data.cells,
+      })
+    })
+    return () => { cancelled = true }
+  }, [
+    isCatalogIcLora,
+    selectedIcLoraId,
+    icLoraInput.videoPath,
+    icLoraInput.ready,
+    icLoraSkipStage2,
+    icLoraResolutionFactor,
+    advancedIcLoraControls,
+    icLoraDurationGrid,
+  ])
+
+  const freshIcLoraPreflightCells =
+    icLoraPreflight != null &&
+    icLoraPreflight.entryId === selectedIcLoraId &&
+    icLoraPreflight.inputPath === icLoraInput.videoPath
+      ? icLoraPreflight.cells
+      : null
+
+  // Keep the selected duration inside the authoritative grid: when the upload
+  // preflight fails the current value but passes a smaller one, move there.
+  // Never yanks a passing selection; unknown keeps everything.
+  useEffect(() => {
+    if (freshIcLoraPreflightCells == null) return
+    const current = controlValues.duration
+    if (typeof current !== 'number') return
+    const currentCell = freshIcLoraPreflightCells.find((c) => c.duration === current)
+    if (preflightCellStatus(currentCell, 'reckless').status !== 'blocked') return
+    const passing = freshIcLoraPreflightCells
+      .filter((c) => preflightCellStatus(c, 'reckless').status !== 'blocked')
+      .map((c) => c.duration)
+    if (passing.length === 0) return
+    onControlChange('duration', Math.max(...passing))
+  }, [freshIcLoraPreflightCells, controlValues.duration, onControlChange])
+
+  const icLoraPreflightWarning = useMemo(() => {
+    if (freshIcLoraPreflightCells == null || freshIcLoraPreflightCells.length === 0) return null
+    const current = controlValues.duration
+    const currentCell =
+      typeof current === 'number'
+        ? freshIcLoraPreflightCells.find((c) => c.duration === current)
+        : undefined
+    if (currentCell !== undefined) {
+      const status = preflightCellStatus(currentCell, 'reckless')
+      return status.status === 'blocked' ? status.message : null
+    }
+    // Video entries verdict the whole clip in a single cell; surface it.
+    if (freshIcLoraPreflightCells.length === 1) {
+      const only = freshIcLoraPreflightCells[0]
+      return only.ok ? null : (only.message ?? null)
+    }
+    // Current selection unevaluated but nothing passes: name the smallest refusal.
+    if (freshIcLoraPreflightCells.every((c) => !c.ok)) {
+      const min = [...freshIcLoraPreflightCells].sort((a, b) => a.duration - b.duration)[0]
+      return min.message ?? null
+    }
+    return null
+  }, [freshIcLoraPreflightCells, controlValues.duration])
+
   // Shared IC-LoRA control props — consumed by the bottom-row settings (PromptBar) and the
   // advanced side panel beside the prompt.
   const icLoraControlsProps: IcLoraControlsProps = {
@@ -3173,6 +3340,7 @@ export function GenSpace() {
     controls: selectedIcLora?.controls ?? [],
     controlValues,
     onControlChange,
+    preflightDurationCells: freshIcLoraPreflightCells,
   }
 
   return (
@@ -3336,6 +3504,7 @@ export function GenSpace() {
             onConditioningStrengthChange={setIcLoraStrength}
             outputVideoPath={icLoraResult?.videoPath || null}
             onChange={setIcLoraInput}
+            preflightWarning={icLoraPreflightWarning}
           />
           <LoraLibraryModal
             open={libraryModalOpen}

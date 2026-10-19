@@ -22,6 +22,7 @@ describe("remote app routes", () => {
     pairedLayout: createElement(RouteStub),
     homeLayoutPages: {
       home: createElement(RouteStub),
+      assistant: createElement(RouteStub),
       assets: createElement(RouteStub),
       dashboard: createElement(RouteStub),
     },
@@ -59,6 +60,11 @@ describe("remote app routes", () => {
   it("matches /activity-dashboard instead of the wildcard", () => {
     const matched = matchRoutes(routes, "/activity-dashboard");
     assert.equal(matched?.at(-1)?.route.path, paths.dashboard);
+  });
+
+  it("opens a chat link on the Assistant page instead of falling through to Home", () => {
+    const matched = matchRoutes(routes, `${paths.assistant}/2b1c0d4e-1f2a-4b3c-8d4e-5f6a7b8c9d0e`);
+    assert.equal(matched?.at(-1)?.route.path, `${paths.assistant}/*`);
   });
 
   it("matches the Assets path instead of the wildcard", () => {

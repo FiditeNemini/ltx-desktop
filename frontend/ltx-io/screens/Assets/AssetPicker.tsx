@@ -20,8 +20,10 @@ import { type AssetsMediaKind } from "./assetsSearchParams";
 
 const PICKER_MODAL_NAME = "asset-picker";
 
-function pickerTitle(mediaKind: AssetsMediaKind): string {
+function pickerTitle(mediaKind: AssetsMediaKind | null): string {
   switch (mediaKind) {
+    case null:
+      return "Assets";
     case "video":
       return "Videos";
     case "audio":
@@ -35,8 +37,10 @@ function pickerTitle(mediaKind: AssetsMediaKind): string {
   }
 }
 
-function emptyTitle(mediaKind: AssetsMediaKind): string {
+function emptyTitle(mediaKind: AssetsMediaKind | null): string {
   switch (mediaKind) {
+    case null:
+      return "No assets yet";
     case "video":
       return "No videos yet";
     case "audio":
@@ -56,9 +60,12 @@ function emptyTitle(mediaKind: AssetsMediaKind): string {
 // leave the Assets library screen unfiltered, so it still shows the GIF. A filter here
 // keeps the pages as the API returns them. If short pages are a problem, add a MIME type
 // filter to `listAssets` instead.
-function useAssetsByKind(mediaKind: AssetsMediaKind) {
+function useAssetsByKind(mediaKind: AssetsMediaKind | null) {
   const { api } = useExploreRuntime();
-  const listFilters = { media_kind: mediaKind, sort: "created_at-desc" as const };
+  const listFilters = {
+    media_kind: mediaKind ?? undefined,
+    sort: "created_at-desc" as const,
+  };
 
   return useInfiniteQuery({
     queryKey: assetQueryKeys.list(listFilters),
@@ -80,7 +87,8 @@ export function AssetPicker({
   onDropData,
   onUpload,
 }: {
-  mediaKind: AssetsMediaKind;
+  /** null lists every kind. */
+  mediaKind: AssetsMediaKind | null;
   onSelect: (asset: ExploreAsset) => void;
   onDropData: (dataTransfer: DataTransfer) => void;
   /** Device file chooser. Resolves null when the user cancels. */
@@ -216,7 +224,8 @@ export function useOpenAssetPicker({
   onDropAssetId,
   onUpload,
 }: {
-  mediaKind: AssetsMediaKind;
+  /** null lists every kind. */
+  mediaKind: AssetsMediaKind | null;
   isEligibleFile: (file: File) => boolean;
   onSelect: (asset: ExploreAsset) => void;
   onDropFile: (file: File) => void;

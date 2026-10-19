@@ -33,6 +33,15 @@ def snap_to_frame_grid(n: int, *, floor: int = 9) -> int:
     return max(floor, ((max(1, n) - 1) // 8) * 8 + 1)
 
 
+def snap_up_to_frame_grid(n: int, *, floor: int = 9) -> int:
+    """Snap a frame count UP to the smallest valid (n - 1) % 8 == 0 count, clamped to ``floor``.
+
+    For a clip that must keep every frame. The caller repeats the last frame to reach the
+    count, then cuts the output back to ``n``. A count already on the grid is unchanged.
+    """
+    return max(floor, -(-(max(1, n) - 1) // 8) * 8 + 1)
+
+
 def compute_num_frames(duration_seconds: int, fps: int) -> int:
     """Frame count for a duration, snapped to the pipeline's (n - 1) % 8 == 0 grid."""
     n = ((duration_seconds * fps) // 8) * 8 + 1

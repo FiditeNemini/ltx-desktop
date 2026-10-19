@@ -10,6 +10,8 @@ import type { EnhanceProvider } from "@/hooks/use-prompt-enhancer-provider";
 import { SettingField } from "./fields/SettingField";
 import { AudioAssetField } from "./fields/AudioAssetField";
 import { ImageAssetField } from "./fields/ImageAssetField";
+import { ImageAssetsField } from "./fields/ImageAssetsField";
+import { MotionPathField } from "./fields/MotionPathField";
 import { FormSeedField } from "./fields/FormSeedField";
 import { SliderField } from "./fields/SliderField";
 import { VideoAssetField } from "./fields/VideoAssetField";
@@ -27,6 +29,8 @@ import {
   createFeatureFieldChange,
   readAudioAssetFieldValue,
   readImageAssetFieldValue,
+  readImageAssetsFieldValue,
+  readMotionPathFieldValue,
   readOptionsFieldValue,
   readSliderFieldValue,
   readVideoAssetFieldValue,
@@ -35,6 +39,7 @@ import {
   type FeatureFormModel,
   type FeatureValues,
   type FieldOption,
+  type ImageAssetFieldKey,
   type OptionsFieldDef,
   type OptionsFieldKey,
   type SliderFieldKey,
@@ -64,6 +69,8 @@ export type VideoAssetRangeBinding<TSchema extends FeatureFieldSchema> = {
   minDuration: number;
   maxDuration: number;
   label: string;
+  /** Preflight longest-passing selection at the current tier, when known. */
+  maxDurationSeconds?: number;
 };
 
 function assertNever(value: never): never {
@@ -79,7 +86,11 @@ function videoAssetRangeValue<TSchema extends FeatureFieldSchema>(
     startSec: readSliderFieldValue(values, binding.startDataKey),
     durationSec: readSliderFieldValue(values, binding.durationDataKey),
     minDurationSec: binding.minDuration,
-    maxDurationSec: binding.maxDuration,
+    // Product cap tightened by the preflight longest-passing selection when known.
+    maxDurationSec:
+      binding.maxDurationSeconds == null
+        ? binding.maxDuration
+        : Math.min(binding.maxDuration, binding.maxDurationSeconds),
     label: binding.label,
     onChange: (startSec, durationSec) => {
       // Computed keys always widen to a string index; the keys themselves are
@@ -119,6 +130,7 @@ export function FeatureFormView<TSchema extends FeatureFieldSchema>({
   actionError,
   generations,
   isGenerationsLoading,
+  isGenerationsFetching,
   generationsError,
   onCancel,
   onRetry,
@@ -156,6 +168,7 @@ export function FeatureFormView<TSchema extends FeatureFieldSchema>({
   actionError: ReactNode;
   generations: Generation[];
   isGenerationsLoading: boolean;
+  isGenerationsFetching: boolean;
   generationsError: string | null;
   onCancel: (id: string) => void;
   onRetry: (id: string) => void;
@@ -176,6 +189,8 @@ export function FeatureFormView<TSchema extends FeatureFieldSchema>({
   videoRange?: VideoAssetRangeBinding<TSchema>;
   onPatchValues?: (patch: Partial<FeatureValues<TSchema>>) => void;
 }) {
+  const fieldIssue = (fieldId: string) =>
+    revealedIssues.find((candidate) => candidate.fieldId === fieldId);
   const displayGroups = useMemo(() => {
     const displayFields = presentation?.orderOptionFields
       ? applyOptionFieldOrder(form.fields, presentation.orderOptionFields)
@@ -199,9 +214,7 @@ export function FeatureFormView<TSchema extends FeatureFieldSchema>({
                     switch (group.kind) {
                       case "textarea": {
                         const field = group.field;
-                        const issue = revealedIssues.find(
-                          (candidate) => candidate.fieldId === field.id,
-                        );
+                        const issue = fieldIssue(field.id);
                         return (
                           <section
                             key={field.id}
@@ -278,9 +291,7 @@ export function FeatureFormView<TSchema extends FeatureFieldSchema>({
                             className={styles.labeledSettings}
                           >
                             {group.fields.map((field) => {
-                              const issue = revealedIssues.find(
-                                (candidate) => candidate.fieldId === field.id,
-                              );
+                              const issue = fieldIssue(field.id);
                               return (
                                 <SettingField
                                   key={field.id}
@@ -314,9 +325,7 @@ export function FeatureFormView<TSchema extends FeatureFieldSchema>({
                         );
                       case "image-asset": {
                         const field = group.field;
-                        const issue = revealedIssues.find(
-                          (candidate) => candidate.fieldId === field.id,
-                        );
+                        const issue = fieldIssue(field.id);
                         return (
                           <section
                             key={field.id}
@@ -349,11 +358,40 @@ export function FeatureFormView<TSchema extends FeatureFieldSchema>({
                           </section>
                         );
                       }
+                      case "image-assets": {
+                        const field = group.field;
+                        return (
+                          <section
+                            key={field.id}
+                            className={styles.stepSection}
+                          >
+                            <ImageAssetsField
+                              field={field}
+                              maxCount={field.maxCount}
+                              value={readImageAssetsFieldValue(values, field.dataKey)}
+                              issue={revealedIssues.find(
+                                (candidate) => candidate.fieldId === field.id,
+                              )}
+                              onChange={(nextValue) =>
+                                onFieldChange(
+                                  createFeatureFieldChange<
+                                    TSchema,
+                                    typeof field.dataKey
+                                  >({
+                                    kind: "image-assets",
+                                    fieldId: field.id,
+                                    dataKey: field.dataKey,
+                                    value: nextValue,
+                                  }),
+                                )
+                              }
+                            />
+                          </section>
+                        );
+                      }
                       case "slider": {
                         const field = group.field;
-                        const issue = revealedIssues.find(
-                          (candidate) => candidate.fieldId === field.id,
-                        );
+                        const issue = fieldIssue(field.id);
                         return (
                           <section
                             key={field.id}
@@ -385,9 +423,7 @@ export function FeatureFormView<TSchema extends FeatureFieldSchema>({
                       }
                       case "audio-asset": {
                         const field = group.field;
-                        const issue = revealedIssues.find(
-                          (candidate) => candidate.fieldId === field.id,
-                        );
+                        const issue = fieldIssue(field.id);
                         return (
                           <section
                             key={field.id}
@@ -423,9 +459,7 @@ export function FeatureFormView<TSchema extends FeatureFieldSchema>({
                       }
                       case "video-asset": {
                         const field = group.field;
-                        const issue = revealedIssues.find(
-                          (candidate) => candidate.fieldId === field.id,
-                        );
+                        const issue = fieldIssue(field.id);
                         return (
                           <section
                             key={field.id}
@@ -461,6 +495,59 @@ export function FeatureFormView<TSchema extends FeatureFieldSchema>({
                                     dataKey: field.dataKey,
                                     value: nextValue,
                                   }),
+                                )
+                              }
+                            />
+                          </section>
+                        );
+                      }
+                      case "motion-path": {
+                        const field = group.field;
+                        return (
+                          <section
+                            key={field.id}
+                            className={styles.stepSection}
+                          >
+                            <MotionPathField
+                              field={field}
+                              image={readImageAssetFieldValue(values, field.imageKey) ?? null}
+                              paths={readMotionPathFieldValue(values, field.dataKey)}
+                              duration={Number(readOptionsFieldValue(values, field.durationKey))}
+                              issue={fieldIssue(field.id)}
+                              onChange={(edit) =>
+                                onFieldChange(
+                                  ...("image" in edit
+                                    ? [
+                                        createFeatureFieldChange<
+                                          TSchema,
+                                          ImageAssetFieldKey<TSchema>
+                                        >({
+                                          kind: "image-asset",
+                                          fieldId: field.id,
+                                          dataKey: field.imageKey,
+                                          value: edit.image,
+                                        }),
+                                      ]
+                                    : [
+                                        createFeatureFieldChange<
+                                          TSchema,
+                                          typeof field.dataKey
+                                        >({
+                                          kind: "motion-path",
+                                          fieldId: field.id,
+                                          dataKey: field.dataKey,
+                                          value: edit.paths,
+                                        }),
+                                        createFeatureFieldChange<
+                                          TSchema,
+                                          typeof field.durationKey
+                                        >({
+                                          kind: "options",
+                                          fieldId: field.durationKey,
+                                          dataKey: field.durationKey,
+                                          value: edit.duration,
+                                        }),
+                                      ]),
                                 )
                               }
                             />
@@ -539,6 +626,7 @@ export function FeatureFormView<TSchema extends FeatureFieldSchema>({
                   <ResultsFeed
                     generations={generations}
                     isLoading={isGenerationsLoading}
+                    isFetching={isGenerationsFetching}
                     loadError={generationsError}
                     onCancel={onCancel}
                     onRetry={onRetry}

@@ -1,9 +1,9 @@
 import {
   getHomeFeature,
-  HOME_FEATURE_SECTIONS,
   HOME_FEATURES,
   HOME_SIDEBAR_FEATURED_FEATURES,
-  isHomeFeatureEnabled,
+  isHomeFeatureOffered,
+  offeredHomeFeatureSections,
   type HomeFeatureDefinition,
   type HomeFeatureId,
 } from "../../../lib/home-features.ts";
@@ -166,12 +166,13 @@ function featureHaystack(feature: HomeFeatureDefinition): string {
 export function searchQuickSearchFeatures(
   query: string,
   limit = 24,
+  highResVideoToVideo = false,
 ): HomeFeatureDefinition[] {
   const tokens = tokenizeQuickSearchQuery(query);
   if (tokens.length === 0) return [];
 
   return HOME_FEATURES.flatMap((feature) => {
-    if (!isHomeFeatureEnabled(feature.id)) return [];
+    if (!isHomeFeatureOffered(feature.id, highResVideoToVideo)) return [];
     const listing = featureListingFields(feature);
     const aliases = featureSearchAliases(feature);
     const score = scoreQuickSearchMatch(tokens, {
@@ -223,6 +224,7 @@ export function searchQuickSearchPages(
 
 export function buildQuickSearchBrowseSections(
   recentFeatureIds: readonly HomeFeatureId[],
+  highResVideoToVideo = false,
 ): QuickSearchBrowseSection[] {
   const recentIds = new Set(recentFeatureIds);
   const featured = HOME_SIDEBAR_FEATURED_FEATURES.filter(
@@ -237,7 +239,7 @@ export function buildQuickSearchBrowseSections(
     sections.push({ id: "recent", label: "Recent workflows", features: recent });
   }
 
-  for (const section of HOME_FEATURE_SECTIONS) {
+  for (const section of offeredHomeFeatureSections(highResVideoToVideo)) {
     sections.push({
       id: section.id,
       label: section.heading,
@@ -270,10 +272,17 @@ export function browseSectionsToRows(
   );
 }
 
-export function searchQuickSearchRows(query: string): QuickSearchRow[] {
+export function searchQuickSearchRows(
+  query: string,
+  highResVideoToVideo = false,
+): QuickSearchRow[] {
   const trimmed = query.trim();
   if (!trimmed) return [];
-  const featureRows: QuickSearchFeatureRow[] = searchQuickSearchFeatures(trimmed).map(
+  const featureRows: QuickSearchFeatureRow[] = searchQuickSearchFeatures(
+    trimmed,
+    undefined,
+    highResVideoToVideo,
+  ).map(
     (feature) => ({
       kind: "feature",
       id: feature.id,

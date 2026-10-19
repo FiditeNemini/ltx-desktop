@@ -13,6 +13,7 @@ import re
 from typing import Literal, cast
 
 from api_types import IcLoraCatalogItem, InstructionSection, LoraCatalogItem, PromptTemplateSpec, TriggerPlacement
+from services.prompt_enhancement.i2v_frames import VideoRole
 
 _INCLUDED_KINDS = ("summary", "prompting")
 
@@ -34,22 +35,29 @@ def _trigger_instruction(item: LoraCatalogItem) -> str | None:
     return f'Trigger word: "{item.trigger}" — must appear somewhere in the rewritten prompt.'
 
 
-def render_catalog_item_block(item: LoraCatalogItem) -> str:
+# The examples are target prompts, not a template. Without this the model copies their wording.
+_EXAMPLES_LABEL = (
+    "Example prompts for this LoRA. Match their style and level of detail. "
+    "Do not copy their wording or their subject:"
+)
+
+
+def render_catalog_item_block(item: LoraCatalogItem, *, include_trigger: bool = True) -> str:
     """Render one LoRA/IC-LoRA's catalog metadata as a block of text for Gemma to read.
 
     Only `summary`/`prompting`-kind instructions are included — `tips`/`input` are human-facing
     (strength recommendations, checkpoint choice, input-media notes) and would only add noise to
     the rewrite. `enhancement_examples` (never shown in the LoRA info UI) are appended as extra
-    few-shot grounding.
+    few-shot grounding. Without the trigger line for callers that add the trigger themselves.
     """
     lines = [f"### {item.name}"]
     for kind in _INCLUDED_KINDS:
         lines.extend(_instruction_text(item.instructions, kind))
-    trigger_instruction = _trigger_instruction(item)
+    trigger_instruction = _trigger_instruction(item) if include_trigger else None
     if trigger_instruction:
         lines.append(trigger_instruction)
     if item.enhancement_examples:
-        lines.append("Additional examples of prompts that use this LoRA well:")
+        lines.append(_EXAMPLES_LABEL)
         lines.extend(f"- {example}" for example in item.enhancement_examples)
     return "\n".join(lines)
 
@@ -128,6 +136,121 @@ def build_i2v_user_prompt_text(
     return f"User Raw Input Prompt: {prompt}."
 
 
+def _no_guess_rule(subject: str) -> str:
+    """The rule against detail an image does not show. ``subject`` is "a still" or "a panel"."""
+    return (
+        f"Do not guess wardrobe, accessories, or colors that {subject} does not show "
+        "— stay vague if they are unclear."
+    )
+
+
+_VIDEO_FRAMES_COMMON_RULES = (
+    "The user turn contains stills sampled in time order from a source video, each labeled "
+    "with its position in the clip. Do not describe the stills one by one: write about the "
+    "clip as a whole. If earlier instructions describe a single reference image or an exact "
+    "first frame, ignore that framing. Keep the output format required above exactly."
+)
+
+_VIDEO_ROLE_RULES: dict[VideoRole, str] = {
+    "driving": (
+        "The video is the input this IC-LoRA transforms. Treat the stills as ground truth "
+        "for the scene: its subjects, setting, action, and camera. Use the user's text as the "
+        "instruction for what the IC-LoRA must do to that scene. Do not invent subjects, "
+        "places, or events the stills do not show. If the user gave no text, derive the "
+        "instruction from the IC-LoRA description above and what the stills show. "
+        "Use that description to know what the IC-LoRA does, but do not reuse its wording: "
+        "write the shot, not what the IC-LoRA does. "
+        "A still labeled as a look reference image shows the look the result must have: the "
+        "colors, the materials, the light, and the style. Write the prompt for the clip's "
+        "subjects, setting, action, and camera, rendered in that look. Its label says whether "
+        "it is a frame of the clip. If it is not, take no subjects, places, or events from it "
+        "and use the other stills for them. If it is the finished first frame of the clip, it "
+        "also shows how the clip's opening subjects and setting look when finished. "
+    ),
+    "panels": (
+        "The user turn contains the constructed reference sheet image of this IC-LoRA, laying "
+        "out each character, prop, or location in its own panel across rows. Treat the sheet as "
+        "ground truth. Write the full prompt in two labeled parts, like the example prompts "
+        "above. Start with Reference sheet: and describe every panel in detail with its row and "
+        "position (for example, Top Row Left (Character): ..., Bottom Row (Setting): ...): its "
+        "role, and its look, clothing, colors, and materials. End with Generated video: and "
+        "write one long, detailed scene: the shot and the camera, who is in it and what each "
+        "one does, any spoken words in quotes, the light, and the background. Use the panels "
+        "for every subject in the scene. Describe only what the sheet shows. One panel shows "
+        "one subject, even from several sides or poses: write it once and do not count views "
+        "as separate subjects. "
+        + _no_guess_rule("a panel")
+        + " Do not add a subject, prop, or place that has no panel. "
+        "For the Generated video part, build on the user's text and keep its action and "
+        "intent. If the user gave no text, write one simple action that uses the panels. "
+        "Ignore any advice above to keep the prompt short. Keep the output format required "
+        "above: one paragraph."
+    ),
+    "scene": (
+        "The video is an existing clip that will be edited or continued. Use the stills only "
+        "for general context: the setting, the subjects, the lighting, and the visual style. "
+        "The user's text is the instruction and has the most weight. Follow it, and do not "
+        "add events, subjects, or camera moves it does not ask for. Do not retell what the "
+        "stills already show. Add detail only where the user's text or the stills support it. "
+        "If the user gave no text, write a prompt that fits the scene shown. "
+        "Some stills are labeled as before or after a part of the clip that is being "
+        "replaced. That part is not shown. The user's text describes what happens in the "
+        "replaced part, so write it to fit the stills around it. "
+    ),
+}
+
+
+# The `panels` rewrite is a two-part prompt of 300 to 700 words. The default cap of 512
+# tokens on both providers ends it inside the `Generated video:` half.
+_PANELS_MAX_OUTPUT_TOKENS = 1536
+
+
+def video_role_max_output_tokens(role: VideoRole) -> int | None:
+    """The output cap a role needs above the provider default, or None to keep the default."""
+    return _PANELS_MAX_OUTPUT_TOKENS if role == "panels" else None
+
+
+def with_video_role_rules(system_prompt: str, role: VideoRole) -> str:
+    """``system_prompt`` plus the rules for how a source video's stills steer the rewrite.
+
+    Applied by each provider after it resolves its own default, so the rules ride on the
+    IC-LoRA prompt, the model's caption style, or the generic fallback alike.
+    """
+    # Panels are not stills of a clip, so the rules about time order and the clip do not apply.
+    common = "" if role == "panels" else _VIDEO_FRAMES_COMMON_RULES
+    return "\n\n".join([system_prompt, _VIDEO_ROLE_RULES[role] + common])
+
+
+_LOOK_REFERENCE_REQUEST = (
+    "Write the shot itself, not the task. Give the look of the look reference image in "
+    "concrete plain words: the light and the time of day, the season, the colors, and the "
+    "surfaces and materials. Use short phrases, and end with a few words on the finish. "
+    "Never mention the reference image or the stills."
+)
+
+
+def build_video_user_prompt_text(
+    prompt: str, *, role: VideoRole, has_look_reference: bool = False
+) -> str:
+    """User-turn text of a video-aware enhance call. A typed prompt is marked as the instruction.
+
+    A look reference image is asked for here as well as in the system prompt. The model
+    weighs the user turn more, and a catalog entry that asks for one short sentence would
+    otherwise leave the look out.
+    """
+    stripped = prompt.strip()
+    look = f" {_LOOK_REFERENCE_REQUEST}" if has_look_reference and role == "driving" else ""
+    if stripped:
+        if role in ("driving", "panels"):
+            return f"User instruction for this video: {stripped}{look}"
+        return f"User prompt (primary, follow it): {stripped}"
+    if role == "panels":
+        return "No user prompt. Describe the panels from the images, and write one simple action that uses them."
+    if role == "driving":
+        return f"No user prompt. Write the prompt from the stills and the IC-LoRA description.{look}"
+    return "No user prompt. Write a prompt that fits the scene shown in the stills."
+
+
 # Multi-keyframe enhance is stills-as-ground-truth, not a t2v rewrite. Distilled from the
 # Atlas shot-control enhancer so interpolations stay identity-consistent and physically
 # continuous, while keeping this app's single-paragraph output contract (no JSON, no MM:SS.ff).
@@ -141,8 +264,8 @@ _KEYFRAME_RULES = (
     "For each still, first describe that still's visible "
     "state (pose, expression, staging, clothing as shown), then the connecting action that "
     "gets from it to the next still. Do not invent a blend or compromise pose that is in none "
-    "of the stills. Do not guess wardrobe, accessories, or colors that a still does not show "
-    "— stay vague if they are unclear. At each labeled time the video must match that still: "
+    "of the stills. " + _no_guess_rule("a still") + " "
+    "At each labeled time the video must match that still: "
     "same subject identity, setting, lighting, and composition. A person who shares core "
     "appearance across stills is ONE person who moved — never a second copy.\n"
     "Write a single continuous take that interpolates fluidly between the stills in time "
@@ -299,7 +422,13 @@ def fill_prompt_template(spec: PromptTemplateSpec, values: dict[str, str]) -> st
     for name, placeholder in spec.placeholders.items():
         if placeholder.choices is not None and values[name] not in placeholder.choices:
             raise ValueError(f"'{name}' value {values[name]!r} must be one of {placeholder.choices}")
-    return spec.template.format(**values)
+    # The template owns the full stop after a placeholder. A value that ends with one too would
+    # make "..", so the trailing stops of that value go.
+    stitched = {
+        name: value.rstrip().rstrip(".") if f"{{{name}}}." in spec.template else value
+        for name, value in values.items()
+    }
+    return spec.template.format(**stitched)
 
 
 def enforce_trigger_placement(text: str, trigger: str, placement: TriggerPlacement) -> str:

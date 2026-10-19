@@ -24,6 +24,7 @@ from _routes.image_gen import router as image_gen_router
 from _routes.prompt_enhancement import router as prompt_enhancement_router
 from _routes.models import router as models_router
 from _routes.suggest_gap_prompt import router as suggest_gap_prompt_router
+from _routes.assistant import router as assistant_router
 from _routes.retake import router as retake_router
 from _routes.extend import router as extend_router
 from _routes.assets import router as assets_router
@@ -36,6 +37,7 @@ from _routes.settings import router as settings_router
 from _routes.remote import router as remote_status_router
 from api_types import HTTPErrorResponse
 from http_exception_handlers import install_http_exception_handlers
+from security_headers import install_security_headers
 from remote.controller import RemoteExposureController, remote_controller_from_app
 from state import get_state_service, init_state_service
 
@@ -76,9 +78,12 @@ def create_app(
         if controller is None:
             raise RuntimeError("Desktop app is missing RemoteExposureController")
         controller.sync()
+        handler.assistant.start()
         try:
             yield
         finally:
+            await handler.assistant.shutdown()
+            handler.assistant_runtime.stop()
             controller.stop()
             handler.generation_queue.stop()
 
@@ -134,6 +139,7 @@ def create_app(
         )
 
     install_http_exception_handlers(app)
+    install_security_headers(app)
 
     app.include_router(health_router)
     app.include_router(generation_router)
@@ -142,6 +148,7 @@ def create_app(
     app.include_router(settings_router)
     app.include_router(image_gen_router)
     app.include_router(suggest_gap_prompt_router)
+    app.include_router(assistant_router)
     app.include_router(retake_router)
     app.include_router(extend_router)
     app.include_router(assets_router)

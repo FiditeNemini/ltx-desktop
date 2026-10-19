@@ -62,6 +62,14 @@
   gap: var(--spacing-sm);
 }
 
+.renderTabs {
+  margin-bottom: var(--spacing-md);
+}
+
+.renderNote {
+  margin: 0 0 var(--spacing-md);
+}
+
 .filterRow {
   display: flex;
   flex-wrap: wrap;

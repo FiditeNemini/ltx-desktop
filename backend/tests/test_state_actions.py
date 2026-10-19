@@ -8,9 +8,11 @@ import time
 import pytest
 
 from _routes._errors import HTTPError
+from runtime_config.ic_lora_stage_mode import IcLoraStageMode
 from runtime_config.video_job_budget import (
-    EDIT_JOB_TOO_LARGE_MESSAGE,
-    VIDEO_JOB_TOO_LARGE_MESSAGE,
+    HardwareProfile,
+    LocalJobFilter,
+    MemoryBudget,
     VideoJobLoad,
     decide_edit_job,
 )
@@ -65,6 +67,31 @@ def test_try_reserve_generation_start_available_again_after_release(test_state):
     test_state.generation.release_generation_start_reservation()
 
     assert test_state.generation.try_reserve_generation_start() is True
+
+
+def test_persistent_reservation_does_not_expire(test_state):
+    with test_state.generation.reserved_generation_start(persistent=True):
+        assert test_state.state.generation_starting_since is None
+        assert test_state.generation.try_reserve_generation_start() is False
+    assert test_state.generation.try_reserve_generation_start() is True
+
+
+def test_queue_yields_holds_queue_waiters_but_not_direct_reservations(test_state):
+    shutdown, claimed = threading.Event(), threading.Event()
+
+    def queue_waiter():
+        with test_state.generation.wait_for_generation_slot(shutdown):
+            claimed.set()
+
+    with test_state.generation.queue_yields():
+        waiter = threading.Thread(target=queue_waiter)
+        waiter.start()
+        assert not claimed.wait(0.2)
+        assert test_state.generation.try_reserve_generation_start(persistent=True) is True
+        test_state.generation.release_generation_start_reservation()
+        assert not claimed.is_set()
+    assert claimed.wait(2)
+    waiter.join(2)
 
 
 def test_try_reserve_generation_start_stale_reservation_expires(test_state):
@@ -308,6 +335,29 @@ def test_retake_pipeline_eviction(test_state, create_fake_model_files):
     assert isinstance(test_state.state.gpu_slot.active_pipeline, VideoPipelineState)
 
 
+def test_retake_pipeline_uses_text_encoder_of_the_requested_model(
+    test_state, fake_services, create_fake_model_files
+):
+    # Queued Home jobs pass the offering's checkpoint while Settings stays on 2.5. The 2.3
+    # checkpoint must get its own Gemma 3 encoder, not the active 2.5 encode-only one.
+    create_fake_model_files(model_id="ltx-2.5-22b-distilled")
+    create_fake_model_files(model_id="ltx-2.3-22b-distilled-1.1")
+    test_state.state.app_settings.use_local_text_encoder = True
+    test_state.state.app_settings.active_ltx_model_id = "ltx-2.5-22b-distilled"
+    spec_23 = get_ltx_model_spec("ltx-2.3-22b-distilled-1.1")
+    expected_gemma_root = str(
+        resolve_model_path(test_state.config.default_models_dir, spec_23.text_encoder_cp)
+    )
+
+    state = test_state.pipelines.load_retake_pipeline(
+        distilled=True, ltx_model_id="ltx-2.3-22b-distilled-1.1"
+    )
+
+    assert state.ltx_model_id == "ltx-2.3-22b-distilled-1.1"
+    assert state.gemma_root == expected_gemma_root
+    assert fake_services.retake_pipeline.create_calls[-1]["gemma_root"] == expected_gemma_root
+
+
 def test_retake_1080p_streams_without_flipping_process_mode(
     test_state, fake_services, create_fake_model_files
 ):
@@ -335,8 +385,20 @@ def test_long_1080p_edit_window_is_capped_to_what_31gb_loads(
         1920,
         1088,
         cap,
-        memory_gb=31,
-        process_mode="full_models_loading",
+        job_filter=LocalJobFilter(
+            profile=HardwareProfile(
+                system="Linux",
+                model_id=None,
+                process_mode="full_models_loading",
+            ),
+            budget=MemoryBudget(
+                total_vram_bytes=None,
+                free_vram_bytes=None,
+                total_ram_bytes=None,
+                memory_gb=31,
+                mps_pool_bytes=None,
+            ),
+        ),
     )
     assert isinstance(decision, VideoJobLoad)
 
@@ -350,13 +412,77 @@ def test_long_1080p_edit_window_is_capped_to_what_31gb_loads(
             distilled=True, width=1920, height=1088, frames=505
         )
     assert gen_space.value.status_code == 422
-    assert gen_space.value.detail == VIDEO_JOB_TOO_LARGE_MESSAGE
+    assert gen_space.value.detail == (
+        "This job needs 44.2 GB of GPU memory but this card has 31.0 GB. "
+        "Lower the resolution, duration, frame rate, or aspect width."
+    )
 
     with pytest.raises(HTTPError) as home:
         test_state.pipelines.load_retake_pipeline(
             distilled=True, width=1920, height=1088, frames=505, queued_home=True
         )
-    assert home.value.detail == EDIT_JOB_TOO_LARGE_MESSAGE
+    assert home.value.detail == (
+        "This job needs 44.2 GB of GPU memory but this card has 31.0 GB. "
+        "Lower the resolution."
+    )
+
+
+def test_executor_frame_cap_ignores_resident_occupancy(
+    test_state, fake_services, create_fake_model_files
+):
+    """Depressed free (resident pipeline still loaded) must not shorten the executor window."""
+    create_fake_model_files()
+    test_state.config.system = "Windows"
+    test_state.config.vram_gb = 31
+    test_state.config.vram_bytes = 31 * 1024**3
+    test_state.config.total_ram_bytes = 64 * 1024**3
+    test_state.config.local_generations_mode = "streaming_models_loading"
+    bare = test_state.pipelines.edit_encode_frame_cap(1920, 1088)
+    fake_services.gpu_info.free_vram_bytes = 20 * 1024**3
+    assert test_state.pipelines.edit_encode_frame_cap(1920, 1088) < bare
+    assert (
+        test_state.pipelines.edit_encode_frame_cap(1920, 1088, total_only=True)
+        == bare
+    )
+
+
+def _windows_low_ram(test_state) -> None:
+    test_state.config.system = "Windows"
+    test_state.config.vram_gb = 31
+    test_state.config.vram_bytes = 31 * 1024**3
+    test_state.config.total_ram_bytes = 16 * 1024**3
+    test_state.config.checkpoint_drive_type = None
+    test_state.config.local_generations_mode = "streaming_models_loading"
+
+
+def test_edit_load_mode_maps_ram_shortfall(test_state) -> None:
+    """Windows 16 GB RAM: streamed edit 422s with the RAM code, not TOO_LARGE."""
+    _windows_low_ram(test_state)
+    with pytest.raises(HTTPError) as exc_info:
+        test_state.pipelines._edit_load_mode(1280, 704, 337)
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == (
+        "This job needs 64 GB of system RAM but this machine has 16 GB. "
+        "Close heavy programs; on desktops, more RAM is the real fix."
+    )
+
+
+def test_ic_lora_load_mode_maps_ram_shortfall(test_state) -> None:
+    """Windows 16 GB RAM: streamed IC-LoRA 422s through the shared table."""
+    _windows_low_ram(test_state)
+    with pytest.raises(HTTPError) as exc_info:
+        test_state.ic_lora._ic_lora_job(
+            1024,
+            576,
+            frame_count=121,
+            stage_mode=IcLoraStageMode.SINGLE_STAGE,
+            resolution_factor=1.5,
+        )
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == (
+        "This job needs 64 GB of system RAM but this machine has 16 GB. "
+        "Close heavy programs; on desktops, more RAM is the real fix."
+    )
 
 
 def test_retake_540p_5s_stays_full(test_state, fake_services, create_fake_model_files):

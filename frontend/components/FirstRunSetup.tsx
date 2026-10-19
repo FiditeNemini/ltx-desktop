@@ -26,7 +26,6 @@ import {
   type FirstRunLoraItem,
 } from '@/lib/first-run-downloads'
 import { formatBytes } from '@/lib/format'
-import { isHomeFeatureEnabled } from '@/lib/home-features'
 import { logger } from '@/lib/logger'
 
 import { HfAccessCard } from './first-run/HfAccessCard'
@@ -256,9 +255,9 @@ export function LaunchGate({ onComplete }: LaunchGateProps) {
         ? loraResult.data.loras.map((entry) => firstRunLoraFromCatalog('lora', entry.lora, entry.downloaded))
         : []),
       ...(icLoraResult.ok
-        ? icLoraResult.data.ic_loras
-            .filter((entry) => isHomeFeatureEnabled(entry.ic_lora.id))
-            .map((entry) => firstRunLoraFromCatalog('ic-lora', entry.ic_lora, entry.downloaded))
+        ? icLoraResult.data.ic_loras.map((entry) =>
+            firstRunLoraFromCatalog('ic-lora', entry.ic_lora, entry.downloaded),
+          )
         : []),
     ]
     setLoraItems(nextLoraItems)

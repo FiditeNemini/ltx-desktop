@@ -9,7 +9,10 @@ import {
   EXTEND_SEED_FILENAME,
   IC_LORA_SEED_DIR,
   icLoraSeedFilename,
+  INGREDIENTS_SHEET_SEED_FILENAME,
   LAYOUT_TO_RENDER_IMAGE_SEED_FILENAME,
+  MOTION_TRACK_IMAGE_SEED,
+  VIDEO_GUIDE_IMAGE_SEED,
   PACKAGED_SEED_KINDS,
   RESTORE_IMAGE_SEED_FILENAME,
   RETAKE_SEED_DIR,
@@ -69,6 +72,23 @@ const PACKAGED_SEEDS: Record<
     dir: IC_LORA_SEED_DIR,
     filename: RESTORE_IMAGE_SEED_FILENAME,
     missing: "Restore look image is missing",
+  },
+  "ingredients-sheet": {
+    dir: IC_LORA_SEED_DIR,
+    filename: INGREDIENTS_SHEET_SEED_FILENAME,
+    missing: "Ingredients reference sheet is missing",
+  },
+  "refine-details-video": icLoraSeedSpec("refine-details", "Refine Details"),
+  "motion-track-image": {
+    dir: IC_LORA_SEED_DIR,
+    filename: MOTION_TRACK_IMAGE_SEED.filename,
+    missing: "Motion Track image is missing",
+  },
+  "video-guide-video": icLoraSeedSpec("video-guide", "Video Guide"),
+  "video-guide-image": {
+    dir: IC_LORA_SEED_DIR,
+    filename: VIDEO_GUIDE_IMAGE_SEED.filename,
+    missing: "Video Guide start frame is missing",
   },
 };
 

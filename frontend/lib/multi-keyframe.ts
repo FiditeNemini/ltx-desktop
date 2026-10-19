@@ -1,5 +1,6 @@
 import { clampKeyframeStrength, DEFAULT_KEYFRAME_STRENGTH } from './keyframe-strength.ts'
 import { pickFreeFrameIndex } from './keyframe-timeline.ts'
+import { randomUUID } from './random-uuid.ts'
 
 export {
   clampKeyframeStrength,
@@ -23,7 +24,7 @@ export function appendKeyframePaths(
   lastFrame: number,
   preferredFrame: number,
   maxCount: number,
-  createId: () => string = () => crypto.randomUUID(),
+  createId: () => string = randomUUID,
 ): KeyframeItem[] {
   const next = [...keyframes]
   for (const path of paths) {
@@ -93,7 +94,7 @@ export function toPersistedKeyframes(
 
 export function fromPersistedKeyframes(
   keyframes: readonly { path: string; frameIndex: number; strength?: number }[],
-  createId: () => string = () => crypto.randomUUID(),
+  createId: () => string = randomUUID,
 ): KeyframeItem[] {
   return keyframes.map(({ path, frameIndex, strength }) => ({
     id: createId(),

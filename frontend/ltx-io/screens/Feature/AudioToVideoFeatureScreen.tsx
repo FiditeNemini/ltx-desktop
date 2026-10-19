@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 
 import { planExploreAudioToVideoSeed } from "../../hooks/exploreAudioToVideoSeed.ts";
-import { useAsset } from "../../hooks/useAsset";
+import { useAsset, useImageAssetSize } from "../../hooks/useAsset";
 import { useCreateAudioToVideo } from "../../hooks/useCreateAudioToVideo";
 import { useExploreAudioToVideoSeed } from "../../hooks/useExploreAudioToVideoSeed";
 import { useGenerations } from "../../hooks/useGenerations";
@@ -44,20 +44,30 @@ export function AudioToVideoFeatureScreen() {
     (state) => state.getValues("audio-to-video")?.model,
   );
   const audioAssetQuery = useAsset(audioAssetId);
+  const startFrameId = useFeatureFormStore(
+    (state) => state.getValues("audio-to-video")?.startFrame?.assetId ?? null,
+  );
+  const startFrameSize = useImageAssetSize(startFrameId);
   const audioDuration = audioAssetQuery.data
     ? audioDurationSeconds(audioAssetQuery.data)
     : null;
   const audioDurationPending = audioAssetId != null && audioAssetQuery.isPending;
 
-  const context = useMemo<AudioToVideoContext>(
-    () => ({
+  const context = useMemo<AudioToVideoContext>(() => {
+    return {
       specs: specsQuery.data,
       seed: seedQuery.data ?? null,
       audioDurationSeconds: audioDuration,
       audioDurationPending,
-    }),
-    [audioDuration, audioDurationPending, seedQuery.data, specsQuery.data],
-  );
+      startFrameSize,
+    };
+  }, [
+    audioDuration,
+    audioDurationPending,
+    seedQuery.data,
+    specsQuery.data,
+    startFrameSize,
+  ]);
 
   const contextReady =
     specsQuery.isSuccess &&
@@ -76,6 +86,7 @@ export function AudioToVideoFeatureScreen() {
       definition={audioToVideoDefinition}
       context={context}
       contextReady={contextReady}
+      generateEnabled={specsQuery.budgetModeReady}
       resourceError={resourceError}
       createGeneration={createGeneration}
       ResultFrameAdapter={ResultFrame}

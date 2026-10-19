@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
-from services.prompt_enhancement.i2v_frames import KeyframeStill
+from services.prompt_enhancement.i2v_frames import KeyframeStill, SceneFrame, VideoRole
 
 
 @runtime_checkable
@@ -26,5 +27,15 @@ class PromptEnhancerPipeline(Protocol):
         keyframes: list[KeyframeStill] | None = None,
         duration: int | None = None,
         fps: int | None = None,
+    ) -> str:
+        ...
+
+    def enhance_with_video_frames(
+        self,
+        prompt: str,
+        frames: Sequence[SceneFrame],
+        system_prompt: str | None,
+        seed: int,
+        role: VideoRole,
     ) -> str:
         ...

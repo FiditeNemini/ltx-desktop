@@ -58,6 +58,12 @@
   padding: 0 var(--spacing-sm);
 }
 
+.trailing {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+}
+
 .arrow {
   display: flex;
   align-items: center;
@@ -74,6 +80,10 @@
 
   &.rotated {
     transform: rotate(180deg);
+  }
+
+  &.arrowAfterTrailing {
+    margin-left: var(--spacing-xs);
   }
 }
 

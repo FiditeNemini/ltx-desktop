@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from services.dashboard_feature_runs import nearest_resolution
 from services.dashboard_stats import percentile
 from services.sqlite_store import SqliteStore
 
@@ -806,3 +807,169 @@ def test_old_lora_runs_take_their_name_from_the_catalog(tmp_path: Path, fake_ser
     snapshot = handler.get(window="7d", tz="UTC", now=NOW)
 
     assert [usage.name for usage in snapshot.loras.top] == ["Cozy Felt Style"]
+
+
+def _resize_output(
+    conn: sqlite3.Connection, generation_id: str, width: float, height: float
+) -> None:
+    conn.execute(
+        "UPDATE assets SET metadata = ? WHERE producer_generation_id = ?",
+        (
+            json.dumps(
+                {
+                    "mediaType": "video",
+                    "metadata": {
+                        "width": width,
+                        "height": height,
+                        "durationMs": 5_000,
+                        "sizeBytes": 10,
+                        "audioStreamCount": 0,
+                    },
+                }
+            ),
+            generation_id,
+        ),
+    )
+
+
+def _edit_spec(duration: float) -> str:
+    return json.dumps(
+        {"params": {"model": "ltx-2.3-fast", "duration": duration}, "inputs": {}}
+    )
+
+
+def test_alpha_gen_matte_is_not_counted_as_a_second_clip(tmp_path: Path) -> None:
+    store, conn = _open(tmp_path)
+    _insert(
+        conn,
+        generation_id="alpha",
+        feature="alpha-gen",
+        status="succeeded",
+        finished=DAY,
+        run_ms=1_000,
+        spec=_spec(),
+        asset_duration_ms=5_000,
+    )
+    conn.execute(
+        """
+        INSERT INTO assets (
+            id, media_kind, origin, producer_generation_id, output_ordinal,
+            mime_type, name, metadata, created_at
+        ) VALUES ('alpha-matte', 'video', 'generated', 'alpha', 1,
+                  'video/mp4', 'matte.mp4', ?, 1)
+        """,
+        (_video_meta(5_000),),
+    )
+    conn.commit()
+    conn.close()
+
+    snapshot = store.dashboard(window="7d", tz="UTC", now=NOW)
+
+    assert snapshot.kpis.content_count == 1
+    assert snapshot.kpis.footage_s == 5
+    assert snapshot.keep_rate.total == 1
+
+
+def test_ic_lora_runs_count_in_the_loras_panel(tmp_path: Path) -> None:
+    store, conn = _open(tmp_path)
+    _insert(
+        conn,
+        generation_id="night",
+        feature="day-to-night",
+        status="succeeded",
+        finished=DAY,
+        run_ms=1_000,
+        spec=_spec(loras=[{"ref": "", "scale": 1, "catalogId": "day-to-night", "displayName": "Day to Night"}]),
+        asset_duration_ms=5_000,
+    )
+    conn.commit()
+    conn.close()
+
+    snapshot = store.dashboard(window="7d", tz="UTC", now=NOW)
+
+    assert [(usage.name, usage.runs, usage.keep_rate) for usage in snapshot.loras.top] == [
+        ("Day to Night", 1, 1.0)
+    ]
+
+
+def test_retake_output_snaps_to_the_offered_resolution_and_aspect_ratio(
+    tmp_path: Path,
+) -> None:
+    store, conn = _open(tmp_path)
+    _insert(
+        conn,
+        generation_id="retake-snap",
+        feature="retake",
+        status="succeeded",
+        finished=DAY,
+        run_ms=90_000,
+        spec=_edit_spec(5),
+        asset_duration_ms=12_000,
+    )
+    _resize_output(conn, "retake-snap", 1920, 1088)
+    conn.commit()
+    conn.close()
+
+    snapshot = store.dashboard(window="7d", tz="UTC", now=NOW)
+
+    [cell] = snapshot.render_by_feature
+    assert (cell.feature, cell.resolution, cell.aspect_ratio, cell.duration_s) == (
+        "retake",
+        "1080p",
+        "16:9",
+        6.0,
+    )
+    assert snapshot.render == []
+
+
+def test_a_resolution_exactly_between_two_labels_takes_the_lower_one() -> None:
+    assert nearest_resolution(1120, 630) == "540p"
+
+
+def test_a_fractional_output_size_is_skipped_and_does_not_break_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    store, conn = _open(tmp_path)
+    _insert(
+        conn,
+        generation_id="retake-bad",
+        feature="retake",
+        status="succeeded",
+        finished=DAY,
+        run_ms=90_000,
+        spec=_edit_spec(5),
+        asset_duration_ms=12_000,
+    )
+    _resize_output(conn, "retake-bad", 0.5, 0.5)
+    conn.commit()
+    conn.close()
+
+    snapshot = store.dashboard(window="7d", tz="UTC", now=NOW)
+
+    assert snapshot.render_by_feature == []
+    assert snapshot.kpis.succeeded == 1
+
+
+def test_usual_settings_report_the_model_that_was_used_most(tmp_path: Path) -> None:
+    store, conn = _open(tmp_path)
+    for index, (model, finished) in enumerate(
+        (("ltx-2.3-fast", OLD), ("ltx-2.3-fast", OLD), ("ltx-2.5-fast", DAY))
+    ):
+        spec = json.loads(_spec())
+        spec["params"]["model"] = model
+        _insert(
+            conn,
+            generation_id=f"usual-{index}",
+            feature="text-to-video",
+            status="succeeded",
+            finished=finished,
+            run_ms=1_000,
+            spec=json.dumps(spec),
+        )
+    conn.commit()
+    conn.close()
+
+    snapshot = store.dashboard(window="all", tz="UTC", now=NOW)
+
+    assert snapshot.usual is not None
+    assert snapshot.usual.model == "ltx-2.3-fast"

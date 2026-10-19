@@ -4,73 +4,109 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import time
 import uuid
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
+from typing import assert_never, cast, get_args
 
 from PIL import UnidentifiedImageError
 
 from api_types import (
+    IC_LORA_CONTROL_TYPE_ID,
     ConditioningType,
+    GenerationRisk,
     IcLoraCatalogItem,
+    IcLoraControlType,
     IcLoraExtractRequest,
     IcLoraExtractResponse,
     IcLoraGenerateCancelledResponse,
     IcLoraGenerateCompleteResponse,
     IcLoraGenerateRequest,
     IcLoraGenerateResponse,
+    IcLoraPreflightCell,
+    IcLoraPreflightRequest,
+    IcLoraPreflightResponse,
+    IcLoraPreflightSource,
+    IcLoraRecipeStoredParams,
+    IcLoraSynthesizedStoredParams,
     IcLoraImageInput,
     IcLoraSettings,
     ImageConditioningInput,
     LTXLocalModelId,
+    LTXVideoGenAspectRatio,
+    TargetResolution,
 )
 from _routes._errors import HTTPError
-from frame_math import compute_num_frames, snap_to_frame_grid
+from frame_math import compute_num_frames, snap_to_frame_grid, snap_up_to_frame_grid
 from handlers.base import StateHandlerBase
 from handlers.generation_handler import GenerationHandler
 from handlers.pipelines_handler import PipelinesHandler
 from handlers.prompt_enhancement_handler import PromptEnhancementHandler
+from services.prompt_enhancement.source_video import SourceVideo
 from handlers.text_handler import TextHandler
 from ic_lora_preprocessing import MediaArtifact, OutpaintParams, PreprocessingContext, run_preprocessing
+from runtime_config.ic_lora_high_res import (
+    HIGH_RES_NOT_ENABLED,
+    HIGH_RES_ONLY_IC_LORAS,
+    high_res_cell,
+    high_res_settings,
+    high_res_stage1,
+)
 from runtime_config.ic_lora_job_budget import (
     IcLoraJobLoad,
-    IcLoraJobReject,
     catalog_output_fps,
+    catalog_preview_stills,
     decide_ic_lora_job,
+    dropped_duration_message_and_code,
 )
 from runtime_config.ic_lora_local_envelope import (
-    IC_LORA_SOURCE_TOO_LARGE,
-    IC_LORA_V1_ENVELOPE_MESSAGE,
     effective_denoise_stage1,
     ic_lora_output_canvas,
 )
-from runtime_config.ic_lora_stage_mode import IcLoraStageMode
+from runtime_config.ic_lora_stage_mode import IcLoraStageMode, ic_lora_stage_mode
 from runtime_config.ic_lora_tiling import IcLoraTiling
+from runtime_config.evict_retry import evict_retry_filter
+from runtime_config.reject_reasons import IcLoraDroppedReason
 from runtime_config.video_job_budget import (
-    LOCAL_GENERATION_UNSUPPORTED,
-    LOCAL_GENERATION_UNSUPPORTED_MESSAGE,
-    VIDEO_JOB_TOO_LARGE,
-    VIDEO_JOB_TOO_LARGE_MESSAGE,
+    LoadMode,
+    LocalJobFilter,
+    VideoJobLoad,
+    VideoJobReject,
+    risk_for_reject,
+    risk_if_allowed,
+    unmeasured_load_risk,
+    unmeasured_message,
+    untested_readout,
+    vram_snapshot_suffix,
 )
-from runtime_config.ltx_capabilities import local_caps, supports
+from runtime_config.ltx_capabilities import budget_pixels, local_caps, supports
 from runtime_config.model_download_specs import (
     DEPTH_PROCESSOR_CP_ID,
+    PERSON_DETECTOR_CP_ID,
+    POSE_PROCESSOR_CP_ID,
     catalog_item_visible_for_installed_ltx,
     find_installed_ic_lora_path,
     get_existing_cp_path,
     get_ltx_model_spec,
     ltx_catalog_family_for_model,
     resolve_active_ltx_model_id,
-    resolve_ic_lora_path,
 )
 from runtime_config.models_scanner import is_ic_lora_file, resolve_lora_ref
 from runtime_config.runtime_config import RuntimeConfig
-from runtime_config.video_job_budget import memory_gb_for_job
 from state.conditioning_cache import ConditioningCacheEntry, ConditioningCacheKey
-from services.interfaces import VideoProcessor
+from services.interfaces import GpuInfo, VideoProcessor
+from services.aspect_ratio import center_cropped_size, find_closest_aspect_ratio_option
+from services.features.ic_lora_recipes import IC_LORA_SUPPORTED_FPS, IcLoraRecipe
+from services.features.video import SYNTHESIZED_IC_LORA_EXECUTORS
+from services.features.video.job_common import denoise_canvas, resolve_job_local_model_id
 from services.lora_catalog import LoraCatalogProvider
+from services.records import AssetRecord
 from services.services_utils import FrameArray
 from server_utils.heartbeat import log_heartbeat
 from server_utils.oriented_image import open_oriented_image
@@ -78,6 +114,33 @@ from services.generation_interrupt import GenerationCancelledError, is_cancel_ex
 from state.app_state_types import AppState, ICLoraState
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _IcLoraVerdict:
+    """One IC-LoRA job verdict: the decided load mode, or the refusal pair.
+
+    ``seq``/``full_gib``/``stream_gib`` feed the job-budget log line. The
+    two-stage fence is not a verdict — it raises before any curve runs, in
+    both generate and preflight, through the shared predicate. ``message``/
+    ``code`` ride None on loads — refusals always set both. ``reason`` rides
+    None on loads; refusals carry the dropped reason so callers can tell a
+    VRAM-occupancy miss (``stream_over`` — an evict could help) from the
+    spatial/fence verdicts that share its code. ``chunk_pixel_frames`` is the
+    window the pipeline runs when a load chunks, else None.
+    ``reject`` carries the measured-budget reject for a downgradable
+    refusal, else None — fences and spatial verdicts never set it.
+    """
+
+    mode: LoadMode | None
+    message: str | None = None
+    code: str | None = None
+    seq: float = 0
+    full_gib: float = 0
+    stream_gib: float = 0
+    reason: IcLoraDroppedReason | None = None
+    chunk_pixel_frames: int | None = None
+    reject: VideoJobReject | None = None
 
 
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
@@ -138,11 +201,6 @@ def _resolve_settings(req: IcLoraGenerateRequest, base: IcLoraSettings) -> IcLor
     )
 
 
-def _ic_lora_output_fps(ic_lora: IcLoraCatalogItem) -> int:
-    """The fps the IC-LoRA's control video runs at — the image_to_frames step's fps param."""
-    return catalog_output_fps(ic_lora)
-
-
 class IcLoraHandler(StateHandlerBase):
     def __init__(
         self,
@@ -155,14 +213,75 @@ class IcLoraHandler(StateHandlerBase):
         video_processor: VideoProcessor,
         lora_catalog: LoraCatalogProvider,
         config: RuntimeConfig,
+        gpu_info: GpuInfo,
+        high_res_enabled: Callable[[], bool] = lambda: False,
     ) -> None:
-        super().__init__(state, lock, config)
+        super().__init__(state, lock, config, gpu_info=gpu_info)
+        self._high_res_enabled = high_res_enabled
         self._generation = generation_handler
         self._pipelines = pipelines_handler
         self._text = text_handler
         self._prompt_enhancement = prompt_enhancement_handler
         self._video_processor = video_processor
         self._catalog = lora_catalog
+
+    def _decide_ic_lora_verdict(
+        self,
+        canvas_width: int,
+        canvas_height: int,
+        *,
+        frame_count: int,
+        stage_mode: IcLoraStageMode,
+        resolution_factor: float,
+        job_filter: LocalJobFilter,
+        ic_lora_id: str | None = None,
+        stills: int = 0,
+        tiling: IcLoraTiling | None = None,
+    ) -> _IcLoraVerdict:
+        """Spatial + budget verdict without raising. Generate raises from this;
+        preflight returns it per duration. The token-ceiling fence rides inside
+        decide (first pre-check), so no call site sequences it separately.
+        ic_lora_id threads to the Mac ingredients term (None prices on the line)."""
+        stage1_w, stage1_h = effective_denoise_stage1(
+            canvas_width,
+            canvas_height,
+            skip_stage_2=stage_mode is IcLoraStageMode.SINGLE_STAGE,
+            resolution_factor=resolution_factor,
+        )
+        decision = decide_ic_lora_job(
+            stage1_w,
+            stage1_h,
+            frame_count,
+            stage_mode=stage_mode,
+            job_filter=job_filter,
+            ic_lora_id=ic_lora_id,
+            stills=stills,
+            tiling=tiling,
+        )
+        # Gate precedence, decided upstream: unsupported process mode, spatial
+        # canvas cap, token-ceiling fence, Mac two-stage fence, then the
+        # measured budget curves — the shared builder below routes the
+        # verdict to its message. Load first so it only sees rejects.
+        if isinstance(decision, IcLoraJobLoad):
+            return _IcLoraVerdict(
+                mode=decision.mode,
+                seq=decision.seq,
+                full_gib=decision.full_gib,
+                stream_gib=decision.stream_gib,
+                chunk_pixel_frames=decision.chunk_pixel_frames,
+            )
+        message, code = dropped_duration_message_and_code(decision, job_filter)
+        return _IcLoraVerdict(
+            mode=None,
+            message=message,
+            code=code,
+            seq=decision.seq,
+            full_gib=decision.full_gib,
+            stream_gib=decision.stream_gib,
+            reason=decision.reason,
+            chunk_pixel_frames=decision.chunk_pixel_frames,
+            reject=decision if isinstance(decision, VideoJobReject) else None,
+        )
 
     def _ic_lora_job(
         self,
@@ -172,59 +291,194 @@ class IcLoraHandler(StateHandlerBase):
         frame_count: int,
         stage_mode: IcLoraStageMode,
         resolution_factor: float,
+        ic_lora_id: str | None = None,
         stills: int = 0,
         tiling: IcLoraTiling | None = None,
-    ) -> IcLoraJobLoad:
+        total_only: bool = False,
+        allow_evict_retry: bool = False,
+        allow_risk: bool | None = None,
+        unmeasured_bet: bool = False,
+    ) -> tuple[IcLoraJobLoad, GenerationRisk | None]:
         """422, or pick full vs stream and the chunk window for this job.
 
-        Does not change process mode. The pipeline runs the window this returns."""
-        stage1_w, stage1_h = effective_denoise_stage1(
+        Does not change process mode. The pipeline runs the window this returns.
+        In reckless mode a downgradable reject downgrades to streaming instead,
+        with the bet annotation alongside the load. ``allow_risk=None`` follows
+        the filter's live mode (every request-scoped caller); executors pass an
+        explicit bool parsed from the stored annotation so a mode flip never
+        re-gates a queued job.
+
+        Queued and direct execute (pre-start probe only) pass
+        ``allow_evict_retry``: a total-possible CUDA reject whose shortfall
+        live weights cover gets one evict-and-resample before the 422. The
+        post-preprocess re-check must leave it off — a generation is Running
+        by then and local refs pin the loaded pipeline, so an evict could
+        not free it.
+        """
+        job_filter = self._local_job_filter(total_only=total_only)
+        verdict = self._decide_ic_lora_verdict(
             canvas_width,
             canvas_height,
-            skip_stage_2=stage_mode is IcLoraStageMode.SINGLE_STAGE,
-            resolution_factor=resolution_factor,
-        )
-        darwin = self.config.darwin_unified_memory
-        memory_gb = memory_gb_for_job(
-            vram_gb=self.config.vram_gb,
-            available_ram_gb=self.config.available_ram_gb,
-            darwin=darwin,
-        )
-        decision = decide_ic_lora_job(
-            stage1_w,
-            stage1_h,
-            frame_count,
-            memory_gb=memory_gb,
-            process_mode=self.config.local_generations_mode,
+            frame_count=frame_count,
             stage_mode=stage_mode,
-            darwin=darwin,
+            resolution_factor=resolution_factor,
+            job_filter=job_filter,
+            ic_lora_id=ic_lora_id,
             stills=stills,
             tiling=tiling,
         )
-        outcome = "reject" if isinstance(decision, IcLoraJobReject) else decision.mode
-        logger.info(
-            "[ic-lora] job budget seq=%.0f full=%.1fGiB stream=%.1fGiB -> %s",
-            decision.seq,
-            decision.full_gib,
-            decision.stream_gib,
-            outcome,
-        )
-        if isinstance(decision, IcLoraJobReject):
-            if decision.reason == "spatial":
-                raise HTTPError(422, IC_LORA_V1_ENVELOPE_MESSAGE, code=IC_LORA_SOURCE_TOO_LARGE)
-            if decision.reason == "unsupported":
-                raise HTTPError(
-                    422,
-                    LOCAL_GENERATION_UNSUPPORTED_MESSAGE,
-                    code=LOCAL_GENERATION_UNSUPPORTED,
+        if verdict.mode is None and verdict.reason is not None and allow_evict_retry:
+            rebuilt = evict_retry_filter(
+                feature="iclora",
+                is_vram_occupancy_miss=(verdict.reason == "stream_over"),
+                stream_gib=verdict.stream_gib,
+                seq=verdict.seq,
+                full_gib=verdict.full_gib,
+                job_filter=job_filter,
+                live_allocated_bytes=self._gpu.get_cuda_live_allocated_bytes(),
+                reserved_bytes=self._gpu.get_cuda_reserved_bytes(),
+                log_prefix="ic-lora",
+                evict=self._pipelines.evict_resident_pipeline,
+                rebuild=lambda: self._local_job_filter(total_only=total_only),
+            )
+            if rebuilt is not None:
+                job_filter = rebuilt
+                verdict = self._decide_ic_lora_verdict(
+                    canvas_width,
+                    canvas_height,
+                    frame_count=frame_count,
+                    stage_mode=stage_mode,
+                    resolution_factor=resolution_factor,
+                    job_filter=job_filter,
+                    ic_lora_id=ic_lora_id,
+                    stills=stills,
+                    tiling=tiling,
                 )
-            raise HTTPError(422, VIDEO_JOB_TOO_LARGE_MESSAGE, code=VIDEO_JOB_TOO_LARGE)
-        return decision
+        if verdict.mode is None:
+            assert verdict.message is not None and verdict.code is not None  # refusals set both
+            risk = self._risk_for_iclora_verdict(
+                verdict, job_filter, allow_risk, unmeasured_bet=unmeasured_bet
+            )
+            if risk is not None:
+                logger.info(
+                    "[ic-lora] job budget seq=%.0f full=%.1fGiB stream=%.1fGiB -> risk:%s over_gib=%s over_ram_gb=%s%s",
+                    verdict.seq,
+                    verdict.full_gib,
+                    verdict.stream_gib,
+                    risk.tier,
+                    risk.over_gib,
+                    risk.over_ram_gb,
+                    vram_snapshot_suffix(
+                        allocated_bytes=self._gpu.get_cuda_live_allocated_bytes(),
+                        reserved_bytes=self._gpu.get_cuda_reserved_bytes(),
+                        free_bytes=job_filter.budget.free_vram_bytes,
+                    ),
+                )
+                return (
+                    IcLoraJobLoad(
+                        mode="streaming_models_loading",
+                        seq=verdict.seq,
+                        full_gib=verdict.full_gib,
+                        stream_gib=verdict.stream_gib,
+                        chunk_pixel_frames=verdict.chunk_pixel_frames,
+                    ),
+                    risk,
+                )
+            logger.info(
+                "[ic-lora] job budget seq=%.0f full=%.1fGiB stream=%.1fGiB -> reject%s",
+                verdict.seq,
+                verdict.full_gib,
+                verdict.stream_gib,
+                vram_snapshot_suffix(
+                    allocated_bytes=self._gpu.get_cuda_live_allocated_bytes(),
+                    reserved_bytes=self._gpu.get_cuda_reserved_bytes(),
+                    free_bytes=job_filter.budget.free_vram_bytes,
+                ),
+            )
+            raise HTTPError(422, verdict.message, code=verdict.code)
+        logger.info(
+            "[ic-lora] job budget seq=%.0f full=%.1fGiB stream=%.1fGiB -> %s%s",
+            verdict.seq,
+            verdict.full_gib,
+            verdict.stream_gib,
+            verdict.mode,
+            vram_snapshot_suffix(
+                allocated_bytes=self._gpu.get_cuda_live_allocated_bytes(),
+                reserved_bytes=self._gpu.get_cuda_reserved_bytes(),
+                free_bytes=job_filter.budget.free_vram_bytes,
+            ),
+        )
+        load = IcLoraJobLoad(
+            mode=verdict.mode,
+            seq=verdict.seq,
+            full_gib=verdict.full_gib,
+            stream_gib=verdict.stream_gib,
+            chunk_pixel_frames=verdict.chunk_pixel_frames,
+        )
+        return (
+            load,
+            unmeasured_load_risk(
+                VideoJobLoad(
+                    mode=load.mode,
+                    seq=load.seq,
+                    full_gib=load.full_gib,
+                    stream_gib=load.stream_gib,
+                ),
+                job_filter,
+                feature="iclora",
+                allow_risk=allow_risk,
+            ),
+        )
+
+    @staticmethod
+    def _iclora_verdict_risk(
+        verdict: _IcLoraVerdict,
+        job_filter: LocalJobFilter,
+    ) -> GenerationRisk | None:
+        """Downgrade annotation for a refusal, ignoring the live mode.
+
+        Preflight cells always carry this so a picker can tell a hard refusal
+        from one Reckless would run. Create and execute still gate on the mode.
+        """
+        if verdict.reason is None:
+            return None
+        if verdict.reject is not None:
+            return risk_for_reject(verdict.reject, job_filter)
+        if verdict.reason == "two_stage_over_measured":
+            return GenerationRisk(
+                tier="unmeasured",
+                message=unmeasured_message(),
+                readout=untested_readout(),
+            )
+        if verdict.reason == "mac_two_stage_unmeasured":
+            return GenerationRisk(
+                tier="unmeasured",
+                message=unmeasured_message("mac_two_stage"),
+                readout=untested_readout(),
+            )
+        return None  # spatial / decode floor / unsupported: hard walls
+
+    @staticmethod
+    def _risk_for_iclora_verdict(
+        verdict: _IcLoraVerdict,
+        job_filter: LocalJobFilter,
+        allow_risk: bool | None,
+        *,
+        unmeasured_bet: bool = False,
+    ) -> GenerationRisk | None:
+        return risk_if_allowed(
+            IcLoraHandler._iclora_verdict_risk(verdict, job_filter),
+            job_filter,
+            allow_risk,
+            unmeasured_bet=unmeasured_bet,
+        )
 
     def _probe_ic_lora_source(
-        self, path: str, kind: str, requested_frames: int
+        self, path: str, kind: str, requested_frames: int, *, raw_frames: bool = False
     ) -> tuple[int, int, int]:
-        """Width, height, and snapped frame count from the user file — before preprocess."""
+        """Width, height, and snapped frame count from the user file — before preprocess.
+
+        ``raw_frames`` returns the stored count, for a caller that snaps it itself."""
         if kind == "image":
             try:
                 width, height = open_oriented_image(path).size
@@ -242,7 +496,7 @@ class IcLoraHandler(StateHandlerBase):
         if width <= 0 or height <= 0:
             raise HTTPError(400, "Could not read the input video.")
         src_frames = int(info["frame_count"]) or requested_frames
-        return width, height, snap_to_frame_grid(src_frames, floor=9)
+        return width, height, src_frames if raw_frames else snap_to_frame_grid(src_frames, floor=9)
 
     def _drop_preprocess_artifact(self, artifact_path: str | None, source_path: str) -> None:
         if not artifact_path or artifact_path == source_path:
@@ -269,6 +523,47 @@ class IcLoraHandler(StateHandlerBase):
                 return self._video_processor.apply_depth(frame, ic_state.depth_pipeline)
             case _:
                 raise HTTPError(400, f"Unsupported conditioning_type: {conditioning_type}")
+
+    @contextmanager
+    def _control_frame_processor(
+        self, control_type: IcLoraControlType
+    ) -> Iterator[Callable[[FrameArray], FrameArray]]:
+        """Frame-to-guide-frame function for a ``video_control`` entry.
+
+        A depth or pose model loads here and leaves the GPU when the block ends, so it is not
+        resident during the 22B inference.
+        """
+        # The guide function reads the model through a list. Clearing the list drops the last reference.
+        guide: Callable[[FrameArray], FrameArray]
+        release: Callable[[], None]
+        match control_type:
+            case "canny":
+                yield self._video_processor.apply_canny
+                return
+            case "depth":
+                depth = [
+                    self._pipelines.create_depth_processor(
+                        str(get_existing_cp_path(self.models_dir, DEPTH_PROCESSOR_CP_ID))
+                    )
+                ]
+                guide = lambda frame: self._video_processor.apply_depth(frame, depth[0])
+                release = depth.clear
+            case "pose":
+                pose = [
+                    self._pipelines.create_pose_processor(
+                        str(get_existing_cp_path(self.models_dir, POSE_PROCESSOR_CP_ID)),
+                        str(get_existing_cp_path(self.models_dir, PERSON_DETECTOR_CP_ID)),
+                    )
+                ]
+                guide = lambda frame: self._video_processor.apply_pose(frame, pose[0])
+                release = pose.clear
+            case _:
+                assert_never(control_type)
+        try:
+            yield guide
+        finally:
+            release()
+            self._pipelines.free_unreferenced_gpu_memory()
 
     def _require_ic_lora_model_paths(self, conditioning_type: ConditioningType) -> tuple[Path, Path | None]:
         model_id = resolve_active_ltx_model_id(
@@ -340,9 +635,14 @@ class IcLoraHandler(StateHandlerBase):
         )
 
     @staticmethod
+    def _resampled_frame_count(frame_count: int, src_fps: float, target_fps: float) -> int:
+        return round(frame_count / src_fps * target_fps)
+
+    @staticmethod
     def _frame_count_after_fps_override(frame_count: int, src_fps: float, target_fps: float) -> int:
-        duration = frame_count / src_fps
-        return snap_to_frame_grid(round(duration * target_fps), floor=1)
+        return snap_to_frame_grid(
+            IcLoraHandler._resampled_frame_count(frame_count, src_fps, target_fps), floor=1
+        )
 
     def _resample_control_fps(
         self, control_video_path: str, frame_count: int, src_fps: float, target_fps: float
@@ -419,10 +719,17 @@ class IcLoraHandler(StateHandlerBase):
         seed: int,
         explore_generation: bool = True,
         explicit_generation_seed: bool = False,
+        high_res: bool = False,
+        risk_allowance: bool | None = None,
+        unmeasured_bet: bool = False,
+        panel_paths: Sequence[str] = (),
     ) -> IcLoraGenerateResponse:
         """Local-only Home/Remote entry. The checkpoint id is required.
 
         The caller already holds the GPU slot and allocated ``output_path``.
+        ``panel_paths`` are the ordered images of an image-list recipe. Automatic enhancement
+        shows them to the rewrite. The request has no field for them, so a route cannot set them.
+        ``high_res`` runs the LoRA as tiles in windows, for the 1440p and 2160p cells.
         GenSpace ``generate()`` still reaches ``_generate_ic_lora`` under
         ``reserved_generation_start()``, where ``local_model_id`` may be unset.
         """
@@ -436,6 +743,10 @@ class IcLoraHandler(StateHandlerBase):
             seed=seed,
             explore_generation=explore_generation,
             explicit_generation_seed=explicit_generation_seed,
+            high_res=high_res,
+            risk_allowance=risk_allowance,
+            unmeasured_bet=unmeasured_bet,
+            panel_paths=panel_paths,
         )
 
     def _generate_ic_lora(
@@ -448,11 +759,17 @@ class IcLoraHandler(StateHandlerBase):
         seed: int,
         explore_generation: bool,
         explicit_generation_seed: bool = False,
+        high_res: bool = False,
+        risk_allowance: bool | None = None,
+        unmeasured_bet: bool = False,
+        panel_paths: Sequence[str] = (),
     ) -> IcLoraGenerateResponse:
         assert req.ic_lora_id is not None
         ic_lora = self._catalog.get_ic_lora(req.ic_lora_id)
         if ic_lora is None:
             raise HTTPError(404, "UNKNOWN_IC_LORA")
+        if ic_lora.id in HIGH_RES_ONLY_IC_LORAS and not self._high_res_enabled():
+            raise HTTPError(422, HIGH_RES_NOT_ENABLED, code=HIGH_RES_NOT_ENABLED)
         if not catalog_item_visible_for_installed_ltx(ic_lora.supported_models, self.models_dir):
             raise HTTPError(422, "IC_LORA_UNSUPPORTED_MODEL")
         if (
@@ -483,22 +800,27 @@ class IcLoraHandler(StateHandlerBase):
             variant = ic_lora.download.resolve_variant(req.variant_id)
             if variant is None:
                 raise HTTPError(404, "UNKNOWN_DOWNLOAD_VARIANT")
-            lora_path = resolve_ic_lora_path(self.models_dir, ic_lora.id, variant.filename)
-            if not lora_path.exists():
-                raise HTTPError(409, "IC_LORA_NOT_DOWNLOADED")
+            candidate_filenames = [variant.filename]
         else:
-            lora_path = find_installed_ic_lora_path(
-                self.models_dir, ic_lora.id, ic_lora.download.candidate_filenames()
-            )
-            if lora_path is None:
-                raise HTTPError(409, "IC_LORA_NOT_DOWNLOADED")
+            candidate_filenames = ic_lora.download.candidate_filenames()
+        lora_path = find_installed_ic_lora_path(
+            self.models_dir, ic_lora.id, candidate_filenames, ic_lora.requires_checkpoints
+        )
+        if lora_path is None:
+            raise HTTPError(409, "IC_LORA_NOT_DOWNLOADED")
 
+        if req.loop_fps is not None and req.loop_fps not in IC_LORA_SUPPORTED_FPS:
+            raise HTTPError(400, f"loop_fps must be one of {IC_LORA_SUPPORTED_FPS}")
         control_values = self._resolve_control_values(req, ic_lora)
         duration = int(control_values.get("duration", 5))
-        requested_frames = compute_num_frames(duration, _ic_lora_output_fps(ic_lora))
+        if req.loop_seconds is not None and ic_lora.is_sheet_recipe():
+            duration = req.loop_seconds
+        requested_frames = compute_num_frames(duration, catalog_output_fps(ic_lora, req.loop_fps))
 
         # IC-LoRA defaults, with any explicit UI override (e.g. skip_stage_2) applied on top.
         s = _resolve_settings(req, ic_lora.default_settings)
+        if high_res:
+            s = high_res_settings(s)
         stage_mode = s.stage_mode
         # Optional reference image (e.g. a photoreal seed for 3D-render): conditions the
         # first frame. Only honoured when the catalog entry opts in; ignored otherwise.
@@ -516,6 +838,7 @@ class IcLoraHandler(StateHandlerBase):
         )
         stills = sum(1 for img in reference_images if img.frame_idx < 0)
         logger.info("[ic-lora] IC-LoRA generation started (ic_lora=%s)", ic_lora.id)
+        control: MediaArtifact | None = None
         try:
             probe_w, probe_h, probe_frames = self._probe_ic_lora_source(
                 req.input_path, ic_lora.input.kind, requested_frames
@@ -527,13 +850,18 @@ class IcLoraHandler(StateHandlerBase):
                 input_height=probe_h,
                 resolution=req.resolution,
                 stage_2_ic_lora=s.stage_2_ic_lora,
+                tiling=s.tiling,
             )
-            job = self._ic_lora_job(
+            job, _ = self._ic_lora_job(
                 width,
                 height,
                 frame_count=probe_frames,
                 stage_mode=stage_mode,
                 resolution_factor=resolution_factor,
+                ic_lora_id=req.ic_lora_id,
+                allow_evict_retry=True,
+                allow_risk=risk_allowance,
+                unmeasured_bet=unmeasured_bet,
                 stills=stills,
                 tiling=s.tiling,
             )
@@ -542,9 +870,25 @@ class IcLoraHandler(StateHandlerBase):
                 provenance=req.prompt_provenance,
                 generation_seed=seed,
                 explicit_generation_seed=explicit_generation_seed,
+                image_path=req.input_path if explore_generation and ic_lora.is_sheet_recipe() else None,
                 ic_lora=ic_lora,
                 local_model_id=local_model_id,
                 explore_generation=explore_generation,
+                # Home only. Gen Space keeps its text-only rewrite (it has manual Enhance).
+                source_video=(
+                    SourceVideo(
+                        path=req.input_path,
+                        # The look image of an IC-LoRA that takes one.
+                        reference_image_path=(
+                            req.images[0].path
+                            if ic_lora.allows_reference_image and req.images
+                            else None
+                        ),
+                    )
+                    if explore_generation and ic_lora.input.kind == "video"
+                    else None
+                ),
+                panel_paths=panel_paths if explore_generation and ic_lora.is_sheet_recipe() else (),
             )
             prompt = resolved_prompt.prompt
             enhance_via_api = resolved_prompt.enhance_via_api
@@ -564,14 +908,23 @@ class IcLoraHandler(StateHandlerBase):
             self._generation.update_progress("loading_model", 5, 0, 1)
 
             input_artifact = MediaArtifact(path=req.input_path, kind=ic_lora.input.kind)
-            ctx = PreprocessingContext(
-                num_frames=requested_frames,
-                outputs_dir=self.config.outputs_dir,
-                video_processor=self._video_processor,
-                outpaint=self._outpaint_from_request(req),
-                on_frame=self._generation.raise_if_cancelled,
-            )
-            control = run_preprocessing(ic_lora.preprocessing, input_artifact, ctx)
+            with (
+                self._control_frame_processor(
+                    cast(IcLoraControlType, control_values[IC_LORA_CONTROL_TYPE_ID])
+                )
+                if ic_lora.is_video_control_recipe()
+                else nullcontext(None)
+            ) as control_frame:
+                ctx = PreprocessingContext(
+                    control_frame=control_frame,
+                    num_frames=requested_frames,
+                    loop_fps=req.loop_fps,
+                    outputs_dir=self.config.outputs_dir,
+                    video_processor=self._video_processor,
+                    outpaint=self._outpaint_from_request(req),
+                    on_frame=self._generation.raise_if_cancelled,
+                )
+                control = run_preprocessing(ic_lora.preprocessing, input_artifact, ctx)
             control_video_path = control.path
 
             cap = self._video_processor.open_video(control_video_path)
@@ -599,21 +952,20 @@ class IcLoraHandler(StateHandlerBase):
                     input_height=input_height,
                     resolution=req.resolution,
                     stage_2_ic_lora=s.stage_2_ic_lora,
+                    tiling=s.tiling,
                 )
-                try:
-                    new_job = self._ic_lora_job(
-                        width,
-                        height,
-                        frame_count=frame_count,
-                        stage_mode=stage_mode,
-                        resolution_factor=resolution_factor,
-                        stills=stills,
-                        tiling=s.tiling,
-                    )
-                except HTTPError:
-                    self._drop_preprocess_artifact(control_video_path, req.input_path)
-                    self._drop_preprocess_artifact(control.mask_path, req.input_path)
-                    raise
+                new_job, _ = self._ic_lora_job(
+                    width,
+                    height,
+                    frame_count=frame_count,
+                    stage_mode=stage_mode,
+                    resolution_factor=resolution_factor,
+                    ic_lora_id=req.ic_lora_id,
+                    allow_risk=risk_allowance,
+                    unmeasured_bet=unmeasured_bet,
+                    stills=stills,
+                    tiling=s.tiling,
+                )
                 reload = new_job.mode != job.mode
                 job = new_job
                 if reload:
@@ -675,7 +1027,387 @@ class IcLoraHandler(StateHandlerBase):
             self._generation.fail_generation(str(exc))
             raise HTTPError(500, f"Generation error: {exc}") from exc
         finally:
+            # The guide clip, the looped frames and the outpaint canvas are full-size temporary
+            # files. Every exit removes them: success, cancel and failure.
+            if control is not None:
+                self._drop_preprocess_artifact(control.path, req.input_path)
+                self._drop_preprocess_artifact(control.mask_path, req.input_path)
             self._text.clear_api_embeddings()
+
+    def preflight(self, req: IcLoraPreflightRequest) -> IcLoraPreflightResponse:
+        """Advisory sizing verdicts for a catalog input, before Generate.
+
+        Mirrors the generate probe check (source pixels → output canvas →
+        fence + spatial + budget) without preprocessing, weights, or the GPU
+        slot. Raises like generate on an unknown entry, a model the install
+        can't run, or an unreadable/mismatched input; per-duration failures
+        never raise. Skips the download/prompt checks — sizing advice is
+        useful before weights exist. One free-VRAM sample for all cells.
+        """
+        ic_lora = self._catalog.get_ic_lora(req.ic_lora_id)
+        if ic_lora is None:
+            raise HTTPError(404, "UNKNOWN_IC_LORA")
+        if ic_lora.id in HIGH_RES_ONLY_IC_LORAS and not self._high_res_enabled():
+            raise HTTPError(422, HIGH_RES_NOT_ENABLED, code=HIGH_RES_NOT_ENABLED)
+        if not catalog_item_visible_for_installed_ltx(ic_lora.supported_models, self.models_dir):
+            raise HTTPError(422, "IC_LORA_UNSUPPORTED_MODEL")
+        assert ic_lora.input is not None, "IC-LoRA ic_lora is missing its input spec"
+        if not req.input_path or not Path(req.input_path).exists():
+            raise HTTPError(400, f"Input not found: {req.input_path}")
+        _validate_input_kind(req.input_path, ic_lora.input.kind)
+
+        base = ic_lora.default_settings
+        # Same overlay as generate: a tiled entry always runs one stage.
+        skip_stage_2 = (
+            True
+            if base.tiling is not None
+            else base.skip_stage_2 if req.skip_stage_2 is None else req.skip_stage_2
+        )
+        stage_2_ic_lora = base.stage_2_ic_lora and not skip_stage_2
+        stage_mode = ic_lora_stage_mode(skip_stage_2=skip_stage_2, stage_2_ic_lora=stage_2_ic_lora)
+        resolution_factor = (
+            ic_lora.default_settings.resolution_factor
+            if req.resolution_factor is None
+            else req.resolution_factor
+        )
+        kind = ic_lora.input.kind
+        fps = catalog_output_fps(ic_lora)
+        # Display on total: advisory cells must not grey total-fitting shapes
+        # just because free is momentarily depressed; generate stays authoritative.
+        job_filter = self._local_job_filter(total_only=True)
+
+        # Probe frames are the requested grid for images (the canvas ignores
+        # frames, and each cell grids its own) and the snapped clip for video.
+        # The 121 stand-in is discarded for images, ignored for video.
+        if kind == "image":
+            probe_w, probe_h, _ = self._probe_ic_lora_source(
+                req.input_path, kind, 121
+            )
+            # Frame math runs on whole catalog seconds; ceiling a fractional
+            # request verdicts the covering grid (conservative, exact for ints).
+            targets = [
+                (d, compute_num_frames(math.ceil(d), fps)) for d in req.durations
+            ]
+            # Images have no source frames — the per-cell grids above are the
+            # only frame counts; the source reports dims only.
+            source_frames: int | None = None
+        else:
+            probe_w, probe_h, probe_frames = self._probe_ic_lora_source(
+                req.input_path, kind, 121
+            )
+            # Video entries transform the whole clip: requested durations are
+            # ignored, one cell verdicts the clip at budgeted seconds.
+            targets = [(probe_frames / fps, probe_frames)]
+            source_frames = probe_frames
+        width, height, factor = ic_lora_output_canvas(
+            skip_stage_2=skip_stage_2,
+            resolution_factor=resolution_factor,
+            input_width=probe_w,
+            input_height=probe_h,
+            resolution=req.resolution,
+            stage_2_ic_lora=stage_2_ic_lora,
+        )
+        cells: list[IcLoraPreflightCell] = []
+        for duration, frames in targets:
+            verdict = self._decide_ic_lora_verdict(
+                width,
+                height,
+                frame_count=frames,
+                stage_mode=stage_mode,
+                resolution_factor=factor,
+                job_filter=job_filter,
+                ic_lora_id=req.ic_lora_id,
+                stills=catalog_preview_stills(ic_lora),
+                tiling=base.tiling,
+            )
+            risk = self._iclora_verdict_risk(verdict, job_filter)
+            cells.append(
+                IcLoraPreflightCell(
+                    duration=duration,
+                    ok=verdict.mode is not None,
+                    message=verdict.message,
+                    code=verdict.code,
+                    tier=None if risk is None else risk.tier,
+                    over_gib=None if risk is None else risk.over_gib,
+                    over_ram_gb=None if risk is None else risk.over_ram_gb,
+                    shortfall_kind=None if risk is None else risk.shortfall_kind,
+                    readout=None if risk is None else risk.readout,
+                )
+            )
+        fits = sum(1 for cell in cells if cell.ok)
+        logger.info(
+            "[ic-lora] preflight %s (%dx%d %s): %d/%d durations fit",
+            ic_lora.id,
+            probe_w,
+            probe_h,
+            kind,
+            fits,
+            len(cells),
+        )
+        return IcLoraPreflightResponse(
+            source=IcLoraPreflightSource(
+                kind=kind,
+                width=probe_w,
+                height=probe_h,
+                frames=source_frames,
+                fps=float(fps),
+            ),
+            cells=cells,
+            budgetMode=job_filter.budget_mode,
+        )
+
+    def preflight_queued_recipe_job(
+        self,
+        *,
+        item: IcLoraCatalogItem,
+        video: AssetRecord,
+        stored: IcLoraRecipeStoredParams,
+        source_fps: float | None = None,
+        upscale: bool = False,
+        cutout: bool = False,
+    ) -> GenerationRisk | None:
+        """Create-time mirror of IcLoraRecipeExecutor's budget gate.
+
+        Assembles the same generate request execute would (same closest-match
+        aspect, same explicit-resolution canvas, estimated resampled source frames)
+        and runs it through the same load gate (``recipe_run_frames``), so an
+        over-budget create 422s here with the refusal execute would normally raise
+        instead of enqueueing a job that fails in the runner. A downgraded
+        reckless reject returns its annotation instead. Raises HTTPError;
+        returns None when the job loads clean.
+
+        Only the probe check is mirrored, not the post-preprocess re-check.
+        Both price the resampled frames and the center-cropped canvas. The
+        create-time count comes from the stored frame count and resample math,
+        and the executor reads the file it cropped, so the two counts can differ
+        by a frame. Without ``source_fps`` the probe prices the source rate
+        (legacy callers).
+        """
+        assert item.input is not None, "IC-LoRA recipe entry is missing its input spec"
+        if video.metadata.mediaType != "video":
+            raise HTTPError(422, "INVALID_VIDEO_ASSET", code="INVALID_GENERATION_SPEC")
+        request = IcLoraGenerateRequest(
+            ic_lora_id=item.id,
+            input_path=video.path,
+            prompt=stored.prompt,
+            conditioning_type="custom",
+        )
+        duration = int(self._resolve_control_values(request, item).get("duration", 5))
+        requested_frames = compute_num_frames(duration, catalog_output_fps(item))
+        probe_w, probe_h, probe_frames = self._probe_ic_lora_source(
+            video.path, item.input.kind, requested_frames, raw_frames=True
+        )
+        # Execute decimates the clip to the stored rate before its probe
+        # (center_crop_video output_fps); price the same frames here or
+        # resample-down jobs over-refuse. Same 1e-3 guard as the executor:
+        # a rate at/above the source is a no-op. Image inputs carry the
+        # duration frames, which have no source rate to decimate from.
+        if (
+            item.input.kind == "video"
+            and source_fps is not None
+            and stored.fps + 1e-3 < source_fps
+        ):
+            probe_frames = self._resampled_frame_count(probe_frames, source_fps, stored.fps)
+        _, risk = self.recipe_run_frames(
+            ic_lora_id=item.id,
+            source_width=probe_w,
+            source_height=probe_h,
+            stored=stored,
+            clip_frames=probe_frames,
+            cutout=cutout,
+            upscale=upscale,
+        )
+        return risk
+
+    def recipe_run_frames(
+        self,
+        *,
+        ic_lora_id: str,
+        source_width: int,
+        source_height: int,
+        stored: IcLoraRecipeStoredParams,
+        clip_frames: int,
+        cutout: bool = False,
+        upscale: bool = False,
+        risk_allowance: bool | None = None,
+        unmeasured_bet: bool = False,
+    ) -> tuple[int, GenerationRisk | None]:
+        """Frame count a queued Home recipe runs for a clip of ``clip_frames`` frames, and its risk.
+
+        The count snaps UP, so no frame is dropped: the recipe repeats the last frame to
+        reach it and cuts the output back. When that count is refused or carries a risk, and
+        the count snapped DOWN is strictly better, the job runs the smaller count, and the
+        pipeline drops the last frames as it did before. From best to worst: clean, an
+        ``unmeasured`` risk (a fence that moves with the frame count), an ``over`` risk, a
+        422. Reckless mode returns a risk in place of the 422. When the snapped-down count
+        is no better, or is refused itself, the snapped-up count runs with its risk, or its 422
+        propagates. The check asks "will it ever fit" (``total_only``). The create-time
+        preflight and the run use this one method, but they count the clip frames in two ways
+        (stored count with resample math, and the cropped file itself), so the counts can
+        differ by a frame. The run gates the count it reads from the file.
+
+        An executor passes ``risk_allowance`` and ``unmeasured_bet`` from the stored
+        annotation, so a mode change never gates a queued job again.
+
+        ``source_width`` and ``source_height`` are the size of the file the user picked. The
+        run reads the clip after ``center_crop_video``, so the canvas comes from the cropped
+        size. The cutout recipe keeps the whole frame and always pads up, so it uses the
+        uncropped size and has no snapped-down fallback.
+        """
+        item = self._catalog.get_ic_lora(ic_lora_id)
+        if item is None:
+            raise HTTPError(404, "UNKNOWN_IC_LORA")
+        local_model_id = resolve_job_local_model_id(self.models_dir, stored.model)
+        aspect = cast(
+            LTXVideoGenAspectRatio,
+            find_closest_aspect_ratio_option(
+                source_width, source_height, get_args(LTXVideoGenAspectRatio)
+            ),
+        )
+        high_res = high_res_cell(stored.resolution)
+        if high_res is not None:
+            explicit_width, explicit_height = high_res_stage1(
+                source_width, source_height, high_res, upscale=upscale
+            )
+        else:
+            try:
+                explicit_width, explicit_height = budget_pixels(
+                    local_caps(local_model_id),
+                    stored.resolution,
+                    aspect,
+                    mode="video",
+                )
+            except KeyError as exc:
+                raise HTTPError(400, "INVALID_LOCAL_RESOLUTION") from exc
+        request = IcLoraGenerateRequest(
+            ic_lora_id=item.id,
+            input_path="",
+            prompt=stored.prompt,
+            conditioning_type="custom",
+            resolution=TargetResolution(width=explicit_width, height=explicit_height),
+            audio_mode=stored.audioMode,
+            lora_strength=stored.loras[0].scale,
+        )
+        s = _resolve_settings(request, item.default_settings)
+        if high_res is not None:
+            s = high_res_settings(s)
+        input_width, input_height = (
+            center_cropped_size(source_width, source_height, aspect)
+            if not cutout
+            else (source_width, source_height)
+        )
+        width, height, resolution_factor = ic_lora_output_canvas(
+            skip_stage_2=s.skip_stage_2,
+            resolution_factor=s.resolution_factor,
+            input_width=input_width,
+            input_height=input_height,
+            resolution=request.resolution,
+            stage_2_ic_lora=s.stage_2_ic_lora,
+            tiling=s.tiling,
+        )
+        snapped_up = snap_up_to_frame_grid(clip_frames, floor=9)
+        snapped_down = snap_to_frame_grid(clip_frames, floor=9)
+
+        def check(frame_count: int) -> GenerationRisk | None:
+            # Queued admission gates on total ("will it ever fit"): a running job
+            # depresses free, and the queue exists to wait for a free slot. The
+            # optional look still is priced as present, so execute never costs more.
+            _, risk = self._ic_lora_job(
+                width,
+                height,
+                frame_count=frame_count,
+                stage_mode=s.stage_mode,
+                resolution_factor=resolution_factor,
+                ic_lora_id=item.id,
+                stills=catalog_preview_stills(item),
+                tiling=s.tiling,
+                total_only=True,
+                allow_risk=risk_allowance,
+                unmeasured_bet=unmeasured_bet,
+            )
+            return risk
+
+        def badness(risk: GenerationRisk | None) -> int:
+            if risk is None:
+                return 0
+            return 1 if risk.tier == "unmeasured" else 2
+
+        def probe(frame_count: int) -> tuple[GenerationRisk | None, HTTPError | None]:
+            try:
+                return check(frame_count), None
+            except HTTPError as exc:
+                return None, exc
+
+        can_snap_down = not cutout and snapped_down < snapped_up
+        refused = 3  # worse than any risk
+        up_risk, up_error = probe(snapped_up)
+        if up_error is not None and not can_snap_down:
+            raise up_error
+        up_badness = refused if up_error is not None else badness(up_risk)
+        if up_badness == 0 or not can_snap_down:
+            return snapped_up, up_risk
+        down_risk, down_error = probe(snapped_down)
+        if down_error is not None or badness(down_risk) >= up_badness:
+            # No better count. Keep the snapped-up count, so no frame drops: it runs with its
+            # risk, or its refusal is the answer. A refused snapped-down count never
+            # replaces a runnable snapped-up count.
+            if up_error is not None:
+                raise up_error
+            return snapped_up, up_risk
+        if up_error is not None:
+            reason = str(up_error.detail)
+        else:
+            reason = f"{up_risk.tier} risk" if up_risk is not None else ""
+        logger.warning(
+            "[ic-lora] %d frames over budget (%s): running %d, dropping the last %d",
+            snapped_up, reason, snapped_down, clip_frames - snapped_down,
+        )
+        return snapped_down, down_risk
+
+    def preflight_queued_synthesized_job(
+        self,
+        *,
+        recipe: IcLoraRecipe,
+        item: IcLoraCatalogItem,
+        stored: IcLoraSynthesizedStoredParams,
+    ) -> GenerationRisk | None:
+        """Create-time mirror of a synthesized IC-LoRA executor's budget gate.
+
+        The control file is built at the denoise size, so the canvas and the
+        frames come from the stored params alone. No source file is probed, and
+        the frame count is already on the frame grid, so nothing snaps.
+        """
+        canvas_w, canvas_h = denoise_canvas(
+            resolve_job_local_model_id(self.models_dir, stored.model), stored, name=item.name
+        )
+        if recipe.kind == "video":
+            raise ValueError(f"IC-LoRA recipe '{recipe.recipe_id}' has no synthesized control file")
+        request = SYNTHESIZED_IC_LORA_EXECUTORS[recipe.kind].generate_request(
+            recipe, stored, (canvas_w, canvas_h)
+        )
+        s = _resolve_settings(request, item.default_settings)
+        width, height, resolution_factor = ic_lora_output_canvas(
+            skip_stage_2=s.skip_stage_2,
+            resolution_factor=s.resolution_factor,
+            input_width=canvas_w,
+            input_height=canvas_h,
+            resolution=request.resolution,
+            stage_2_ic_lora=s.stage_2_ic_lora,
+        )
+        # Queued admission gates on total ("will it ever fit"): a running job
+        # depresses free, and the queue exists to wait for a free slot.
+        _, risk = self._ic_lora_job(
+            width,
+            height,
+            frame_count=compute_num_frames(stored.duration, int(stored.fps)),
+            stage_mode=s.stage_mode,
+            resolution_factor=resolution_factor,
+            ic_lora_id=item.id,
+            stills=catalog_preview_stills(item),
+            tiling=s.tiling,
+            total_only=True,
+        )
+        return risk
 
     def generate(self, req: IcLoraGenerateRequest) -> IcLoraGenerateResponse:
         # Hardware viability first: local downloads are disabled on an unsupported
@@ -780,12 +1512,13 @@ class IcLoraHandler(StateHandlerBase):
                     budget_frames = self._frame_count_after_fps_override(
                         frame_count, fps, req.fps_override
                     )
-                job = self._ic_lora_job(
+                job, _ = self._ic_lora_job(
                     width,
                     height,
                     frame_count=snap_to_frame_grid(budget_frames, floor=9),
                     stage_mode=settings.stage_mode,
                     resolution_factor=resolution_factor,
+                    allow_evict_retry=True,
                 )
                 # Before the pipeline claims the GPU. canny/depth get a conditioning system
                 # prompt; a fully custom IC-LoRA falls back to the generic rewrite.

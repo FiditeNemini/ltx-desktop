@@ -37,6 +37,9 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -47,6 +50,7 @@ from ltx_core.types import VIDEO_SCALE_FACTORS, VideoLatentShape
 from ltx_pipelines.utils.blocks import VideoDecoder
 from ltx_pipelines.utils.helpers import cleanup_memory, tiling_config_for_vae
 
+from services.ltx_pipeline_common import is_decode_tile_shortage
 from services.patches import diffusion_stage_cache
 
 logger = logging.getLogger(__name__)
@@ -56,6 +60,25 @@ _MAX_DIFFVAE_TILE_FRAMES = 80
 _MAX_DIFFVAE_TILE_SPATIAL = 608
 _DEFAULT_DIFFVAE_FRAME_OVERLAP = 40
 _DEFAULT_DIFFVAE_SPATIAL_OVERLAP = 160
+
+# Share of the card the decode plan leaves unspent. The planner sizes the largest tile that
+# fits the budget it is given, so a plan against the whole post-evict budget drives CUDA
+# ``reserved`` to device capacity (``free`` 0.00). Allocator blocks are tile-shaped and do not
+# fit each other, so at capacity every tile allocation flushes the cache and retries; 4K Refine
+# windows then crawl for hours instead of minutes. Planning against less shrinks the temporal
+# tile (its accumulator is the largest term that scales with it) and leaves room for those
+# blocks. A card where this leaves no fitting tile plans against the whole budget as before.
+_DECODE_HEADROOM_FRACTION = 0.15
+
+# Experiment override, in GiB: plan against exactly min(measured, this) and skip the headroom
+# fraction. At 4K x 97f the planner needs >=22.5 GiB for a min tile, and 15% headroom on a 32 GB
+# card (~22.3 GiB) may not fit one. Unset keeps the headroom plan.
+_DECODE_BUDGET_CAP_ENV = "LTX_DIFFVAE_DECODE_BUDGET_GIB"
+
+# Debug: when set to a directory, every DiffVAE decode first saves its latent and the resolved
+# tiling there, so a separate script can replay just the decode (and preview the latent) without
+# re-running a 12-27 min denoise. Unset = off.
+_DUMP_LATENT_DIR_ENV = "LTX_DIFFVAE_DUMP_LATENT_DIR"
 
 _orig_video_decoder_call = VideoDecoder.__call__
 
@@ -134,6 +157,18 @@ def _release_denoise_weights() -> None:
     logger.info("Freed resident transformer before DiffVAE decode")
 
 
+def _decode_budget_cap_bytes() -> int | None:
+    raw = os.environ.get(_DECODE_BUDGET_CAP_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        gib = float(raw)
+    except ValueError:
+        logger.warning("Ignoring %s=%r: not a number", _DECODE_BUDGET_CAP_ENV, raw)
+        return None
+    return int(gib * 1024**3) if gib > 0 else None
+
+
 def _pixel_shape_from_latent(latent: torch.Tensor) -> tuple[int, int, int]:
     """Pixel (height, width, frames) from a transformer latent ``(B, C, T, H, W)``.
 
@@ -154,6 +189,10 @@ def _replace_tiling_arg(
     return args, {**kwargs, "tiling_config": tiling_config}
 
 
+def _device_total_bytes(device: torch.device) -> int:
+    return int(torch.cuda.get_device_properties(device).total_memory)
+
+
 def _with_post_evict_cuda_tiling(
     decoder: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -172,23 +211,39 @@ def _with_post_evict_cuda_tiling(
 
     height, width, num_frames = _pixel_shape_from_latent(latent)
     measured = max(int(cuda_activation_budget_bytes(device)), 0)
-    budget = measured
-    recommend_kwargs: dict[str, Any] = {
-        "height": height,
-        "width": width,
-        "num_frames": num_frames,
-        "device": device,
-        "free_bytes": budget,
-    }
+    cap = _decode_budget_cap_bytes()
+    if cap is None:
+        total = _device_total_bytes(device)
+        headroom_budget = max(0, measured - int(_DECODE_HEADROOM_FRACTION * total))
+    else:
+        headroom_budget = min(measured, cap)
     optimization = getattr(decoder, "diffvae_optimization", None)
-    if optimization is not None:
-        recommend_kwargs["diffvae_optimization"] = optimization
-    tiling = _clamp_diffvae_tiles(
-        tiling_config_for_vae(checkpoint, **recommend_kwargs),
-        height,
-        width,
-        num_frames,
-    )
+
+    def plan(budget: int) -> TileSizeConfig:
+        recommend_kwargs: dict[str, Any] = {
+            "height": height,
+            "width": width,
+            "num_frames": num_frames,
+            "device": device,
+            "free_bytes": budget,
+        }
+        if optimization is not None:
+            recommend_kwargs["diffvae_optimization"] = optimization
+        return _clamp_diffvae_tiles(
+            tiling_config_for_vae(checkpoint, **recommend_kwargs),
+            height,
+            width,
+            num_frames,
+        )
+
+    budget = headroom_budget
+    try:
+        tiling = plan(budget)
+    except ValueError as exc:
+        if not is_decode_tile_shortage(exc):
+            raise
+        budget = measured
+        tiling = plan(budget)
     logger.info(
         "DiffVAE CUDA tiling after evict: measured=%.1f GiB budget=%.1f GiB "
         "%sx%sx%s t/h/w tiles=%s/%s/%s",
@@ -244,10 +299,52 @@ def _with_mps_clamped_tiles(
     return _replace_tiling_arg(args, kwargs, tiling)
 
 
+def _axis_dict(axis: Any) -> dict[str, int]:
+    return {
+        "tile_size": int(getattr(axis, "tile_size", 0) or 0),
+        "overlap": int(getattr(axis, "overlap", 0) or 0),
+    }
+
+
+def _dump_latent_for_replay(decoder: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    """Save the decode input before it runs, so a hung decode still leaves a replayable file.
+
+    Never raises: a debug dump must not fail the generation.
+    """
+    raw_dir = os.environ.get(_DUMP_LATENT_DIR_ENV, "").strip()
+    if not raw_dir:
+        return
+    try:
+        latent = kwargs.get("latent", args[0] if args else None)
+        if not isinstance(latent, torch.Tensor):
+            return
+        tiling = kwargs["tiling_config"] if "tiling_config" in kwargs else (args[1] if len(args) >= 2 else None)
+        out_dir = Path(raw_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        shape = "x".join(str(d) for d in latent.shape)
+        path = out_dir / f"diffvae_latent_{time.strftime('%Y%m%d_%H%M%S')}_{shape}.pt"
+        torch.save(
+            {
+                "latent": latent.detach().cpu(),
+                "checkpoint_path": getattr(decoder, "checkpoint_path", None),
+                "dtype": str(getattr(decoder, "_dtype", None)),
+                "diffvae_optimization": str(getattr(decoder, "diffvae_optimization", None)),
+                "tiling": None
+                if tiling is None
+                else {name: _axis_dict(getattr(tiling, name, None)) for name in ("frames", "height", "width")},
+            },
+            path,
+        )
+        logger.info("Dumped DiffVAE decode latent %s to %s", tuple(latent.shape), path)
+    except Exception:
+        logger.warning("Could not dump the DiffVAE decode latent", exc_info=True)
+
+
 def _patched_video_decoder_call(self: VideoDecoder, *args: Any, **kwargs: Any) -> Any:
     _release_denoise_weights()
     args, kwargs = _with_post_evict_cuda_tiling(self, args, kwargs)
     args, kwargs = _with_mps_clamped_tiles(self, args, kwargs)
+    _dump_latent_for_replay(self, args, kwargs)
     return _orig_video_decoder_call(self, *args, **kwargs)
 
 

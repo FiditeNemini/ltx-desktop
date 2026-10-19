@@ -10,11 +10,11 @@ from handlers.video_resolution import (
     correct_frame_count,
     generation_letterbox,
     read_source_metadata,
-    resolve_home_edit_size,
+    resolve_requested_home_edit_size,
 )
-from runtime_config.video_job_budget import EDIT_JOB_TOO_LARGE_MESSAGE, VIDEO_JOB_TOO_LARGE
 from services.features.video.edit_executor import VideoEditExecutor
 from services.features.video.job_common import model_from_spec
+from services.fast_video_pipeline.windowed_run import measured_edit
 from services.records import AssetRecord, CapabilityFailedError, GenerationRecord
 from services.retake_pipeline.retake_mode import (
     InvalidRetakeModeError,
@@ -22,10 +22,10 @@ from services.retake_pipeline.retake_mode import (
 )
 from services.retake_pipeline.retake_stitch import stitch_retake_output
 from services.retake_pipeline.window import (
-    MAX_INPUT_FRAMES,
+    EditRefusal,
     RetakeEncodeWindow,
     feathered_mask_times,
-    window_for_retake,
+    prepare_retake_window,
 )
 from state.app_state_types import RetakePipelineState
 
@@ -67,6 +67,9 @@ class RetakeExecutor(VideoEditExecutor[RetakeParams, RetakeInputs, _PreparedReta
     def parse_inputs(self, spec: Mapping[str, object]) -> RetakeInputs:
         return model_from_spec(spec, "inputs", RetakeInputs)
 
+    def replaced_window(self, params: RetakeParams) -> tuple[float, float]:
+        return params.startTime, params.startTime + params.duration
+
     def prepare(
         self,
         generation: GenerationRecord,
@@ -76,6 +79,9 @@ class RetakeExecutor(VideoEditExecutor[RetakeParams, RetakeInputs, _PreparedReta
         seed: int,
         dest: Path,
         windowed_path: str,
+        *,
+        allow_risk: bool,
+        unmeasured_bet: bool = False,
     ) -> _PreparedRetake:
         try:
             regenerate_video, regenerate_audio = resolve_retake_mode(params.mode)
@@ -83,56 +89,81 @@ class RetakeExecutor(VideoEditExecutor[RetakeParams, RetakeInputs, _PreparedReta
             raise CapabilityFailedError(str(exc), code="INVALID_GENERATION_SPEC") from exc
         fps, source_width, source_height, source_frames = read_source_metadata(video.path)
         target_frames = correct_frame_count(source_frames)
-        corrected_duration = target_frames / fps
-        end_time = min(params.startTime + params.duration, corrected_duration)
-        if params.startTime >= end_time:
-            raise CapabilityFailedError(
-                "Selection is outside the usable video range",
-                code="INVALID_GENERATION_SPEC",
-            )
-        mask_start_frame = max(0, min(target_frames, round(params.startTime * fps)))
-        mask_end_frame = max(
-            mask_start_frame + 1,
-            min(target_frames, round(end_time * fps)),
-        )
-        requested = params.resolution
-        content_width, content_height = resolve_home_edit_size(
-            None if requested is None else requested.width,
-            None if requested is None else requested.height,
+        content_width, content_height = resolve_requested_home_edit_size(
+            params.resolution,
             source_width,
             source_height,
+            high_res=self._pipelines.high_res_video_enabled(),
         )
         box = generation_letterbox(content_width, content_height)
-        frame_cap = self._pipelines.edit_encode_frame_cap(box.canvas_width, box.canvas_height)
-        try:
-            window = window_for_retake(
-                source_frames=target_frames,
-                mask_start_frame=mask_start_frame,
-                mask_end_frame=mask_end_frame,
-                max_input_frames=frame_cap,
-                fps=fps,
-            )
-        except ValueError as exc:
-            # A short selection on a long clip used to pad to 505 and 422.
-            # If the selection itself is larger than the window that fits,
-            # say so as a resolution limit rather than a mask-size error.
-            if frame_cap < MAX_INPUT_FRAMES:
-                raise CapabilityFailedError(
-                    EDIT_JOB_TOO_LARGE_MESSAGE, code=VIDEO_JOB_TOO_LARGE
-                ) from exc
-            raise CapabilityFailedError(str(exc), code="INVALID_GENERATION_SPEC") from exc
+        # Cap on total: the resident pipeline is still loaded here, so free
+        # would shorten the window before the load gate's evict-retry runs.
+        frame_cap = self._pipelines.edit_encode_frame_cap(
+            box.canvas_width,
+            box.canvas_height,
+            total_only=True,
+        )
+        prepared = prepare_retake_window(
+            fps=fps,
+            target_frames=target_frames,
+            target_width=content_width,
+            target_height=content_height,
+            frame_cap=frame_cap,
+            start_time=params.startTime,
+            duration=params.duration,
+        )
+        if isinstance(prepared, EditRefusal):
+            prepared.raise_capability_error()
+        window, end_time = prepared.window, prepared.end_time
         region_start, region_end = feathered_mask_times(window, fps)
         if (
             abs(content_width - source_width) > 31
             or abs(content_height - source_height) > 31
         ):
             logger.info(
-                "Downscaling source video from %dx%d to %dx%d; queued retake supports up to 1080p",
+                "Downscaling source video from %dx%d to %dx%d; queued retake supports up to 1080p (4K with highResVideoToVideo)",
                 source_width,
                 source_height,
                 content_width,
                 content_height,
             )
+        def rewindow(free_cap: int) -> int:
+            nonlocal window, end_time, region_start, region_end
+            original_frames = window.encode_frames
+            shrunk = prepare_retake_window(
+                fps=fps,
+                target_frames=target_frames,
+                target_width=content_width,
+                target_height=content_height,
+                frame_cap=free_cap,
+                start_time=params.startTime,
+                duration=params.duration,
+            )
+            if isinstance(shrunk, EditRefusal):
+                shrunk.raise_capability_error()
+            logger.info(
+                "Retake %s free gate refused the total-fitting %d-frame window; shrinking to free-gated cap %d (encode %d)",
+                generation.id,
+                original_frames,
+                free_cap,
+                shrunk.window.encode_frames,
+            )
+            window, end_time = shrunk.window, shrunk.end_time
+            region_start, region_end = feathered_mask_times(window, fps)
+            return window.encode_frames
+
+        pipeline_state = self._load_edit_window(
+            local_model_id=local_model_id,
+            width=box.canvas_width,
+            height=box.canvas_height,
+            frames=window.encode_frames,
+            total_cap=frame_cap,
+            allow_risk=allow_risk,
+            unmeasured_bet=unmeasured_bet,
+            generation_id=generation.id,
+            log_name="Retake",
+            rewindow=rewindow,
+        )
         logger.info(
             "Retake %s started (%s, source %dx%d → %dx%d canvas %dx%d, %d frames @ %g fps, %s %.2fs–%.2fs, encode %d, seed=%d)",
             generation.id,
@@ -154,14 +185,7 @@ class RetakeExecutor(VideoEditExecutor[RetakeParams, RetakeInputs, _PreparedReta
         return _PreparedRetake(
             params=params,
             video=video,
-            pipeline_state=self._pipelines.load_retake_pipeline(
-                distilled=True,
-                ltx_model_id=local_model_id,
-                width=box.canvas_width,
-                height=box.canvas_height,
-                frames=window.encode_frames,
-                queued_home=True,
-            ),
+            pipeline_state=pipeline_state,
             seed=seed,
             fps=fps,
             content_width=content_width,
@@ -178,6 +202,10 @@ class RetakeExecutor(VideoEditExecutor[RetakeParams, RetakeInputs, _PreparedReta
         )
 
     def generate(self, prepared: _PreparedRetake) -> None:
+        with measured_edit(prepared.canvas_width, prepared.canvas_height, prepared.window.encode_frames):
+            self._generate(prepared)
+
+    def _generate(self, prepared: _PreparedRetake) -> None:
         prepared.pipeline_state.pipeline.generate(
             video_path=prepared.video.path,
             prompt=prepared.params.prompt,

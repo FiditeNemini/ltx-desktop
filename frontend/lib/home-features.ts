@@ -1,7 +1,7 @@
 import { matchPath } from "react-router";
 import { paths } from "../paths.ts";
 import type { FetcherToolId } from "../../shared/deep-link.ts";
-import { IC_LORA_RECIPES } from "./ic-lora-recipes.ts";
+import { IC_LORA_RECIPES, type IcLoraRecipe } from "./ic-lora-recipes.ts";
 import { LORA_RECIPE_HOME_FEATURES } from "./lora-recipes.ts";
 
 type AppPath = (typeof paths)[keyof typeof paths];
@@ -27,6 +27,8 @@ export type HomeFeatureListing = {
   readonly blurb: string;
   readonly categories: string;
   readonly typeLabel: string;
+  /** The Base Model row of the details. A first-class listing omits it. */
+  readonly baseModel?: string;
   /** Model card. Shown as the details “Hugging Face” button when set. */
   readonly huggingfaceUrl?: string;
 };
@@ -119,17 +121,6 @@ export const FIRST_CLASS_HOME_FEATURES = [
 type FirstClassFeature = (typeof FIRST_CLASS_HOME_FEATURES)[number];
 type FirstClassFeatureId = FirstClassFeature["id"];
 
-/** AlphaGen is hidden until it ships. Past results stay in the queue and Assets. */
-const ALPHA_GEN_ENABLED = false;
-
-/**
- * False for a feature kept off Home, the sidebar, Explore Tools, and the Settings and Setup
- * LoRA lists (an IC-LoRA catalog id is its feature id). Its route still opens.
- */
-export function isHomeFeatureEnabled(id: string): boolean {
-  return id !== "alpha-gen" || ALPHA_GEN_ENABLED;
-}
-
 function firstClassFeature(id: FirstClassFeatureId): FirstClassFeature {
   const feature = FIRST_CLASS_HOME_FEATURES.find((item) => item.id === id);
   if (!feature) {
@@ -166,6 +157,13 @@ const HOME_FEATURE_SECTION_DEFINITIONS = [
       ),
     ],
   },
+  {
+    id: "marketing",
+    heading: "Marketing",
+    featureIds: IC_LORA_RECIPES.filter((recipe) => recipe.section === "marketing").map(
+      (recipe) => recipe.id,
+    ),
+  },
 ] as const satisfies readonly {
   readonly id: string;
   readonly heading: string;
@@ -184,21 +182,36 @@ export const HOME_FEATURE_SECTIONS = HOME_FEATURE_SECTION_DEFINITIONS.map(
   (section) => ({
     id: section.id,
     heading: section.heading,
-    features: section.featureIds.filter(isHomeFeatureEnabled).map(firstClassFeature),
+    features: section.featureIds.map(firstClassFeature),
   }),
 );
 
-const HOME_SIDEBAR_FEATURED_FEATURE_IDS = [
-  "image-to-video",
-  "audio-to-video",
-  "extend",
-  "alpha-gen",
-] as const satisfies readonly FirstClassFeatureId[];
+const HIGH_RES_ONLY_FEATURE_IDS: ReadonlySet<string> = new Set(
+  (IC_LORA_RECIPES as readonly IcLoraRecipe[])
+    .filter((recipe) => recipe.requiresHighRes === true)
+    .map((recipe) => recipe.id),
+);
 
-/** Sidebar “Featured” list — first-class features only (not LoRA recipes, not Day to Night). */
-export const HOME_SIDEBAR_FEATURED_FEATURES = HOME_SIDEBAR_FEATURED_FEATURE_IDS.filter(
-  isHomeFeatureEnabled,
-).map(firstClassFeature);
+/**
+ * Whether Home lists the feature. A recipe with `requiresHighRes` needs the
+ * `highResVideoToVideo` flag. The backend refuses it without the flag as well.
+ */
+export function isHomeFeatureOffered(
+  id: string,
+  highResVideoToVideo: boolean,
+): boolean {
+  return highResVideoToVideo || !HIGH_RES_ONLY_FEATURE_IDS.has(id);
+}
+
+/** The gallery sections with the features that need a flag removed when the flag is off. */
+export function offeredHomeFeatureSections(highResVideoToVideo: boolean) {
+  return HOME_FEATURE_SECTIONS.map((section) => ({
+    ...section,
+    features: section.features.filter((feature) =>
+      isHomeFeatureOffered(feature.id, highResVideoToVideo),
+    ),
+  }));
+}
 
 export const HOME_FEATURES = [
   ...FIRST_CLASS_HOME_FEATURES,
@@ -207,6 +220,18 @@ export const HOME_FEATURES = [
 
 export type HomeFeatureId = (typeof HOME_FEATURES)[number]["id"];
 export type HomeFeatureDefinition = (typeof HOME_FEATURES)[number];
+
+const HOME_SIDEBAR_FEATURED_FEATURE_IDS = [
+  "image-to-video",
+  "audio-to-video",
+  "extend",
+  "alpha-gen",
+  "cinemagraph",
+] as const satisfies readonly HomeFeatureId[];
+
+/** Sidebar “Featured” list — a curated set of features (not Day to Night). */
+export const HOME_SIDEBAR_FEATURED_FEATURES =
+  HOME_SIDEBAR_FEATURED_FEATURE_IDS.map(getHomeFeature);
 
 export function isHomeFeatureId(
   value: string | undefined,

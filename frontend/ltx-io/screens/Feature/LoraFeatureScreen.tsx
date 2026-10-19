@@ -123,7 +123,7 @@ export function LoraFeatureScreen({ recipeId }: { recipeId: LoraRecipeId }) {
           generateLabel={controls.generateLabel}
           generateHint={controls.generateHint}
           generateBusy={controls.generateBusy}
-          generateEnabled={controls.generateEnabled}
+          generateEnabled={controls.generateEnabled && specsQuery.budgetModeReady}
           actionError={controls.actionError}
           interceptGenerate={controls.interceptGenerate}
           onCancelGenerate={controls.onCancelGenerate}

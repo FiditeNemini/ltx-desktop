@@ -4,10 +4,12 @@ import { SettingsDropdown } from './SettingsDropdown'
 import { Tooltip } from './ui/tooltip'
 import type { ApiSuccessOf } from '../lib/api-client'
 import type { components } from '../generated/backend-openapi'
+import { mergeDurationControlOptions } from '../lib/ic-lora-duration-options'
 import type { ICLoraConditioningType } from './ICLoraPanel'
 import type { IcLoraAudioMode } from '../hooks/use-ic-lora'
 
 type CatalogControl = components['schemas']['IcLoraControl']
+type PreflightCell = components['schemas']['IcLoraPreflightCell']
 
 // Short hover/focus help per IC-LoRA control. The catalog-driven controls are keyed by control id.
 const CONTROL_TOOLTIPS: Record<string, string> = {
@@ -49,6 +51,9 @@ export interface IcLoraControlsProps {
   controls?: CatalogControl[]
   controlValues?: Record<string, number | string>
   onControlChange?: (id: string, value: number | string) => void
+  // Fresh upload-preflight duration cells for the selected entry + input, or
+  // null while missing/stale. Authoritative over the list-time advisory drops.
+  preflightDurationCells?: readonly PreflightCell[] | null
 }
 
 export function IcLoraSettingsControls({
@@ -67,6 +72,7 @@ export function IcLoraSettingsControls({
   controls,
   controlValues,
   onControlChange,
+  preflightDurationCells,
 }: IcLoraControlsProps) {
   return (
     <>
@@ -135,6 +141,24 @@ export function IcLoraSettingsControls({
             {isCatalogIcLora && (controls ?? []).filter((c) => c.options != null).map((c) => {
               const current = controlValues?.[c.id] ?? c.default ?? ''
               const title = c.label.toUpperCase()
+              const merged =
+                c.id === 'duration' && c.kind === 'int'
+                  ? mergeDurationControlOptions(c, (o) => controlOptionLabel(c, o), preflightDurationCells ?? null)
+                  : null
+              if (merged?.emptyMessage != null) {
+                return (
+                  <Fragment key={c.id}>
+                    <div className="w-px h-4 bg-action-hover mx-0.5" />
+                    <div className="flex shrink-0 items-center gap-1 whitespace-nowrap px-2 py-1.5">
+                      <span className="text-fg-tertiary text-[10px]">{title}</span>
+                      <span className="text-fg-secondary text-xs">{merged.emptyMessage}</span>
+                    </div>
+                  </Fragment>
+                )
+              }
+              const dropdownOptions =
+                merged?.options ??
+                (c.options as (number | string)[]).map((o) => ({ value: String(o), label: controlOptionLabel(c, o) }))
               return (
                 <Fragment key={c.id}>
                   <div className="w-px h-4 bg-action-hover mx-0.5" />
@@ -143,7 +167,7 @@ export function IcLoraSettingsControls({
                     tooltip={CONTROL_TOOLTIPS[c.id]}
                     value={String(current)}
                     onChange={(v) => onControlChange?.(c.id, c.kind === 'int' ? parseInt(v, 10) : v)}
-                    options={(c.options as (number | string)[]).map((o) => ({ value: String(o), label: controlOptionLabel(c, o) }))}
+                    options={dropdownOptions}
                     trigger={
                       <>
                         <span className="text-fg-tertiary text-[10px]">{title}</span>

@@ -110,3 +110,8 @@
     height: 16px;
   }
 }
+
+/** Block so the span covers the whole disabled row as the tooltip trigger. */
+.disabledOptionTrigger {
+  display: block;
+}

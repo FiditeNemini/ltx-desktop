@@ -23,7 +23,15 @@ interface DevFlagSection {
 }
 
 export const DEV_FLAG_SECTIONS: DevFlagSection[] = [
-  { flags: [] },
+  {
+    flags: [
+      {
+        key: 'highResVideoToVideo',
+        label: 'High-resolution video to video (1440p and 4K)',
+        description: 'Add 1440p and 4K to the IC-LoRA recipes, and allow sources above 1080p in Retake and Extend. Text to Video, Image to Video and Audio to Video offer 1440p and 4K without this flag. Long clips run in overlapping time windows. This is slow and needs a large GPU. Each job still passes the hardware check. Reload the model list after you change it. Off by default.',
+      },
+    ],
+  },
   {
     title: 'Legacy flags',
     flags: [

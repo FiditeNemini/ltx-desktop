@@ -612,9 +612,11 @@ def test_create_audio_to_video_accepts_advertised_1080p(
     assert response.json()["spec"]["params"]["numFrames"] == 185
 
 
-def test_create_audio_to_video_uses_1080p_prefix_when_audio_exceeds_cell(
+def test_create_audio_to_video_budgets_static_1080p_when_filter_drops_the_duration(
     client, test_state, create_fake_model_files, tmp_path: Path
 ) -> None:
+    # 20s is inside the static 1080p ceiling. The default card drops that
+    # duration, so this must be a budget refusal, not a silent trim to 10s.
     create_fake_model_files()
     with _reserved_generation_start(test_state):
         audio = client.post(
@@ -630,9 +632,16 @@ def test_create_audio_to_video_uses_1080p_prefix_when_audio_exceeds_cell(
             },
         )
 
-    assert response.status_code == 200
-    assert response.json()["spec"]["params"]["resolution"] == "1080p"
-    assert response.json()["spec"]["params"]["numFrames"] == 233
+    assert_http_error(
+        response,
+        status_code=422,
+        code="VIDEO_JOB_TOO_LARGE",
+        message=(
+            "This job needs 41.7 GB of GPU memory but this card has 31.0 GB. "
+            "Lower the resolution, duration, frame rate, or aspect width."
+        ),
+    )
+    assert _store(test_state).list_generations("audio-to-video") == []
 
 
 def test_create_audio_to_video_rejects_unadvertised_resolution(
@@ -645,7 +654,7 @@ def test_create_audio_to_video_rejects_unadvertised_resolution(
     response = client.post(
         "/api/generations/audio-to-video",
         json={
-            "params": _a2v_params(resolution="1440p"),
+            "params": _a2v_params(resolution="4320p"),
             "inputs": {"audio": {"assetId": audio["id"]}},
         },
     )
@@ -688,9 +697,11 @@ def test_create_audio_to_video_rejects_audio_outside_duration_envelope(
     assert _store(test_state).list_generations("audio-to-video") == []
 
 
-def test_create_audio_to_video_rejects_unadvertised_local_cell(
+def test_create_audio_to_video_unsupported_machine_is_not_an_unadvertised_resolution(
     client, test_state, create_fake_model_files, tmp_path: Path
 ) -> None:
+    # Unsupported drops every duration. That is the machine, not a resolution
+    # the model never offered.
     create_fake_model_files()
     test_state.config.local_generations_mode = "unsupported"
     audio = client.post(
@@ -709,8 +720,8 @@ def test_create_audio_to_video_rejects_unadvertised_local_cell(
     assert_http_error(
         response,
         status_code=422,
-        code="INVALID_VIDEO_GENERATION_SPEC",
-        message="Audio-to-video is not available at the selected resolution.",
+        code="LOCAL_GENERATION_UNSUPPORTED",
+        message="This machine cannot run local generation.",
     )
     assert _store(test_state).list_generations("audio-to-video") == []
 
@@ -2365,6 +2376,13 @@ def test_handler_construction_does_not_fail_running_generations(test_state) -> N
         store=store,
         executor_registry=test_state.executor_registry,
         derive_local_a2v=test_state.video_generation.derive_local_a2v_params,
+        # Construction-only test: preflights never run, so untyped no-ops do.
+        preflight_queued_fast=lambda **kwargs: None,
+        preflight_queued_a2v=lambda **kwargs: None,
+        preflight_queued_edit=lambda **kwargs: None,
+        preflight_edit_matrix=lambda **kwargs: None,  # type: ignore[return-value]
+        preflight_queued_ic_lora_recipe=lambda **kwargs: None,
+        preflight_queued_synthesized_ic_lora=lambda **kwargs: None,
     )
     loaded = store.get_generation(generation.id)
     assert loaded is not None

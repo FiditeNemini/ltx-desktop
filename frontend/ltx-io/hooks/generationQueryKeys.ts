@@ -22,6 +22,7 @@ export const VIDEO_GENERATION_MODEL_SPECS_QUERY_OPTIONS = {
 
 export const generationQueryKeys = {
   all: ["generations"] as const,
+  detail: (id: string) => [...generationQueryKeys.all, "detail", id] as const,
   list: (feature: string) =>
     [...generationQueryKeys.all, "list", feature] as const,
   recentFeatures: (limit: number) =>
@@ -30,8 +31,10 @@ export const generationQueryKeys = {
   dashboard: (range: components["schemas"]["DashboardSelection"]["range"], tz: string) =>
     [...generationQueryKeys.dashboards, range, tz] as const,
   queue: ["generation-queue"] as const,
-  specs: <T extends ExploreModelsVersion>(modelsVersion: T) =>
-    ["video-generation-model-specs", modelsVersion] as const,
+  specs: <T extends ExploreModelsVersion>(
+    modelsVersion: T,
+    budgetMode: "standard" | "reckless" | "server" = "server",
+  ) => ["video-generation-model-specs", modelsVersion, budgetMode] as const,
 };
 
 export type GenerationQueueApi = Pick<

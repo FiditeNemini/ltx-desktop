@@ -4,13 +4,19 @@ import { Tooltip, TooltipProvider } from "@ds/Tooltip/Tooltip";
 
 import styles from "./AspectRatioWarningIcon.module.scss";
 
-/** Soft caveat for ratios outside the distilled training pair. */
-export function AspectRatioWarningIcon({ warning }: { warning: string }) {
+/** Gray for a quality caveat, yellow for a budget bet. */
+export function AspectRatioWarningIcon({
+  warning,
+  tone = "caveat",
+}: {
+  warning: string;
+  tone?: "caveat" | "risk";
+}) {
   return (
     <TooltipProvider delay={70}>
       <Tooltip content={warning} side="top" maxWidth={280}>
         <span
-          className={styles.warningIcon}
+          className={tone === "risk" ? styles.riskIcon : styles.warningIcon}
           aria-label={warning}
           onClick={(event) => event.stopPropagation()}
         >

@@ -37,6 +37,8 @@ export interface PickerBoxBaseProps {
   hidePlaceholder?: boolean;
   /** The badge to be rendered after the value */
   badge?: React.ReactElement<typeof Badge>;
+  /** Sits inside the box, against the arrow. Used for a warning on the selected value. */
+  trailing?: React.ReactNode;
   /** Additional CSS class names to be applied */
   className?: string;
   /** Optional class name for the text */
@@ -107,6 +109,7 @@ export const PickerBox = forwardRef<
     icon,
     thumbnail,
     badge,
+    trailing,
     className,
     textClassName,
     textStyle,
@@ -164,10 +167,12 @@ export const PickerBox = forwardRef<
         </Text>
       )}
       {badge && badge}
+      {trailing ? <div className={styles.trailing}>{trailing}</div> : null}
       {!hideArrow && (
         <div
           className={clsx(
             styles.arrow,
+            trailing != null && styles.arrowAfterTrailing,
             shouldRotateArrowOnActive && state === "active" && styles.rotated,
           )}
         >

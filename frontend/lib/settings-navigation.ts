@@ -6,8 +6,8 @@ export type SettingsTabId =
   | "legacy"
   | "about";
 
-/** In-page anchors (old hash links). */
-export type SettingsLegacyScrollAnchor = "promptEnhancer" | "textEncoding";
+/** In-page anchors on General (old hash links, plus the Assistant section). */
+export type SettingsLegacyScrollAnchor = "promptEnhancer" | "textEncoding" | "assistant";
 
 export type SettingsScrollTarget = SettingsTabId | SettingsLegacyScrollAnchor;
 

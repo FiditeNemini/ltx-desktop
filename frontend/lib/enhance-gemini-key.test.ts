@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   GEMINI_KEY_REQUIRED_SETTINGS_DETAIL,
+  isEnhanceBlockedByGeneration,
   isEnhanceBlockedByMissingGeminiKey,
 } from './enhance-gemini-key.ts'
 
@@ -10,8 +11,6 @@ const blocked = {
   enhanceProvider: 'api' as const,
   hasGeminiApiKey: false,
   hasEnhanceInput: true,
-  isGenerationInProgressForEnhance: false,
-  isOtherGenerationRunning: false,
 }
 
 describe('isEnhanceBlockedByMissingGeminiKey', () => {
@@ -46,17 +45,36 @@ describe('isEnhanceBlockedByMissingGeminiKey', () => {
       false,
     )
   })
+})
 
-  it('is false while this project is already generating', () => {
+describe('isEnhanceBlockedByGeneration', () => {
+  it('blocks local Enhance while this project or another project generates', () => {
+    for (const running of [
+      { isGenerationInProgressForEnhance: true, isOtherGenerationRunning: false },
+      { isGenerationInProgressForEnhance: false, isOtherGenerationRunning: true },
+    ]) {
+      assert.equal(isEnhanceBlockedByGeneration({ enhanceProvider: 'local', ...running }), true)
+    }
+  })
+
+  it('never blocks Gemini Enhance, which runs beside a generation', () => {
     assert.equal(
-      isEnhanceBlockedByMissingGeminiKey({ ...blocked, isGenerationInProgressForEnhance: true }),
+      isEnhanceBlockedByGeneration({
+        enhanceProvider: 'api',
+        isGenerationInProgressForEnhance: true,
+        isOtherGenerationRunning: true,
+      }),
       false,
     )
   })
 
-  it('is false while another project is generating', () => {
+  it('does not block local Enhance when nothing is generating', () => {
     assert.equal(
-      isEnhanceBlockedByMissingGeminiKey({ ...blocked, isOtherGenerationRunning: true }),
+      isEnhanceBlockedByGeneration({
+        enhanceProvider: 'local',
+        isGenerationInProgressForEnhance: false,
+        isOtherGenerationRunning: false,
+      }),
       false,
     )
   })

@@ -40,17 +40,19 @@ async def _validation_error_handler(_request: Request, exc: Exception) -> JSONRe
     )
 
 
-async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    log_unhandled_exception(request, exc)
-    return JSONResponse(
-        status_code=500,
-        content=build_http_error_response(500, str(exc)).model_dump(),
-    )
+# Exception text can carry Desktop file paths, which must never reach a remote device.
+UNHANDLED_REMOTE_MESSAGE = "Something went wrong on the Desktop. Try again."
 
 
-def install_http_exception_handlers(app: FastAPI) -> None:
+def install_http_exception_handlers(app: FastAPI, *, expose_unhandled_details: bool = True) -> None:
     """Register HTTPError, Starlette HTTP, validation, and unhandled exception handlers."""
+
+    async def unhandled(request: Request, exc: Exception) -> JSONResponse:
+        log_unhandled_exception(request, exc)
+        message = str(exc) if expose_unhandled_details else UNHANDLED_REMOTE_MESSAGE
+        return JSONResponse(status_code=500, content=build_http_error_response(500, message).model_dump())
+
     app.add_exception_handler(RequestValidationError, _validation_error_handler)
     app.add_exception_handler(HTTPError, _http_error_handler)
     app.add_exception_handler(StarletteHTTPException, _starlette_http_error_handler)
-    app.add_exception_handler(Exception, _unhandled_exception_handler)
+    app.add_exception_handler(Exception, unhandled)

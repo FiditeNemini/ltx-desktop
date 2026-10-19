@@ -3,6 +3,7 @@ import { useState } from "react";
 import { Text } from "@/ds/Text/Text";
 
 import type { components } from "../../../generated/backend-openapi.ts";
+import { videoGenerationResolutionLabel } from "../../../lib/video-resolution.ts";
 
 import {
   DASHBOARD_INFO,
@@ -12,14 +13,29 @@ import {
   renderBand,
 } from "./dashboardFormat.ts";
 import { FilterMultiSelect } from "./RenderFilters.tsx";
+import {
+  RENDER_TABS,
+  aspectOptions,
+  applyFilters,
+  cellForRow,
+  cellKey,
+  groupAdjacent,
+  modelOptions,
+  renderCellLabel,
+  resolutionOptions,
+  rowLabel,
+  tabCells,
+  uniqueRows,
+  type GridCell,
+  type RenderRowData,
+  type RenderTab,
+  type RowGroup,
+} from "./renderGrid.ts";
 import { SectionTitle } from "./SectionTitle.tsx";
 import type { DashboardSelection } from "./useDashboardSelection.ts";
 import styles from "./DashboardScreen.module.scss";
 
 type Snapshot = components["schemas"]["DashboardSnapshot"];
-type RenderCell = components["schemas"]["RenderCell"];
-type FpsRenderCell = components["schemas"]["FpsRenderCell"];
-type GridCell = RenderCell | FpsRenderCell;
 
 export function RenderPanel({
   snapshot,
@@ -30,30 +46,57 @@ export function RenderPanel({
   selection: DashboardSelection;
   onSelectionChange: (patch: Partial<DashboardSelection>) => void;
 }) {
+  const [tab, setTab] = useState<RenderTab>("generate");
   const [selected, setSelected] = useState<string | null>(null);
-  const models = modelOptions(snapshot.render);
-  const resolutions = resolutionOptions(snapshot.render);
-  const aspects = snapshot.aspect_ratios;
+  const { lengthNoun } = RENDER_TABS.find((item) => item.id === tab) ?? RENDER_TABS[0];
+  const fpsFilter = selection.fps.map(Number);
+  const tabAll = tabCells(snapshot, tab, []);
+  const models = modelOptions(tabAll);
+  const resolutions = resolutionOptions(tabAll);
+  const aspects = tab === "generate" ? snapshot.aspect_ratios : aspectOptions(tabAll);
   const fpsOptions = snapshot.fps_values.map(String);
+  const showFps = tab === "generate";
   const hasRenderFilters =
     selection.models.length > 0 ||
     selection.resolutions.length > 0 ||
     selection.aspectRatios.length > 0 ||
-    selection.fps.length > 0;
+    (showFps && selection.fps.length > 0);
   // A saved value this range lacks still filters, so the chips and the grid agree.
-  const cells = visibleRenderCells(snapshot, {
+  const cells = applyFilters(tabCells(snapshot, tab, showFps ? fpsFilter : []), {
     models: selection.models,
     resolutions: selection.resolutions,
     aspectRatios: selection.aspectRatios,
-    fps: selection.fps.map(Number),
   });
   const durations = [...new Set(cells.map((cell) => cell.duration_s))].sort((a, b) => a - b);
-  const groups = groupAdjacent(uniqueRows(cells), "model");
+  const groups = groupAdjacent(uniqueRows(cells), "group");
   const selectedCell = cells.find((cell) => cellKey(cell) === selected) ?? null;
   const columnCount = durations.length + 1;
   return (
     <div>
       <SectionTitle title="Render time" info={DASHBOARD_INFO.render} />
+      <div className={`${styles.controls} ${styles.renderTabs}`}>
+        {RENDER_TABS.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            className={styles.control}
+            aria-pressed={tab === item.id}
+            onClick={() => {
+              setTab(item.id);
+              setSelected(null);
+            }}
+          >
+            <Text as="span" variant="label" size="md">
+              {item.label}
+            </Text>
+          </button>
+        ))}
+      </div>
+      {tab === "generate" ? null : (
+        <Text as="p" variant="body" size="md" className={`${styles.muted} ${styles.renderNote}`}>
+          {tab === "edit" ? DASHBOARD_INFO.renderEdit : DASHBOARD_INFO.renderIcLora}
+        </Text>
+      )}
       <div className={styles.filterRow}>
         <FilterMultiSelect
           label="Model"
@@ -64,6 +107,7 @@ export function RenderPanel({
         <FilterMultiSelect
           label="Resolution"
           options={resolutions}
+          formatOption={videoGenerationResolutionLabel}
           selected={selection.resolutions}
           onChange={(resolutions) => setSelection({ resolutions })}
         />
@@ -73,12 +117,14 @@ export function RenderPanel({
           selected={selection.aspectRatios}
           onChange={(aspectRatios) => setSelection({ aspectRatios })}
         />
-        <FilterMultiSelect
-          label="FPS"
-          options={fpsOptions}
-          selected={selection.fps}
-          onChange={(fps) => setSelection({ fps })}
-        />
+        {showFps ? (
+          <FilterMultiSelect
+            label="FPS"
+            options={fpsOptions}
+            selected={selection.fps}
+            onChange={(fps) => setSelection({ fps })}
+          />
+        ) : null}
         <button
           type="button"
           className={styles.clearFilters}
@@ -94,7 +140,7 @@ export function RenderPanel({
       </div>
       {groups.length === 0 ? (
         <Text as="p" variant="body" size="md" className={styles.muted}>
-          {snapshot.render.length === 0
+          {tabAll.length === 0
             ? "Not enough finished renders in this range yet."
             : "No finished renders for these filters."}
         </Text>
@@ -117,11 +163,12 @@ export function RenderPanel({
             </Text>
           ))}
           {groups.map((group) => (
-            <ModelGroup
+            <SeriesGroup
               key={group.id}
               group={group}
               durations={durations}
               cells={cells}
+              lengthNoun={lengthNoun}
               selected={selected}
               onSelect={setSelected}
             />
@@ -140,11 +187,11 @@ export function RenderPanel({
       </div>
       {selectedCell ? (
         <Text as="p" variant="body" size="md" className={styles.detail}>
-          {selectedCell.model ? `${selectedCell.model} · ` : ""}
-          {selectedCell.resolution}
+          {selectedCell.group ? `${selectedCell.group} · ` : ""}
+          {videoGenerationResolutionLabel(selectedCell.resolution)}
           {selectedCell.aspect_ratio ? ` · ${selectedCell.aspect_ratio}` : ""}
-          {"fps" in selectedCell ? ` · ${selectedCell.fps} fps` : ""} ·{" "}
-          {formatSeconds(selectedCell.duration_s)} long · median{" "}
+          {selectedCell.fps == null ? "" : ` · ${selectedCell.fps} fps`} ·{" "}
+          {formatSeconds(selectedCell.duration_s)} {lengthNoun} · median{" "}
           {formatDuration(selectedCell.median_ms)} · 90th percentile{" "}
           {formatDuration(selectedCell.p90_ms)} · {selectedCell.count} runs
         </Text>
@@ -153,16 +200,18 @@ export function RenderPanel({
   );
 }
 
-function ModelGroup({
+function SeriesGroup({
   group,
   durations,
   cells,
+  lengthNoun,
   selected,
   onSelect,
 }: {
   group: RowGroup;
   durations: number[];
   cells: GridCell[];
+  lengthNoun: string;
   selected: string | null;
   onSelect: (key: string) => void;
 }) {
@@ -177,6 +226,7 @@ function ModelGroup({
           block={block}
           durations={durations}
           cells={cells}
+          lengthNoun={lengthNoun}
           selected={selected}
           onSelect={onSelect}
         />
@@ -189,19 +239,21 @@ function ResolutionGroup({
   block,
   durations,
   cells,
+  lengthNoun,
   selected,
   onSelect,
 }: {
   block: RowGroup;
   durations: number[];
   cells: GridCell[];
+  lengthNoun: string;
   selected: string | null;
   onSelect: (key: string) => void;
 }) {
   return (
     <>
       <Text as="p" variant="label" size="md" className={styles.renderResolution}>
-        {block.id}
+        {videoGenerationResolutionLabel(block.id)}
       </Text>
       {block.rows.map((row) => (
         <RenderRow
@@ -209,6 +261,7 @@ function ResolutionGroup({
           row={row}
           durations={durations}
           cells={cells}
+          lengthNoun={lengthNoun}
           selected={selected}
           onSelect={onSelect}
         />
@@ -221,12 +274,14 @@ function RenderRow({
   row,
   durations,
   cells,
+  lengthNoun,
   selected,
   onSelect,
 }: {
   row: RenderRowData;
   durations: number[];
   cells: GridCell[];
+  lengthNoun: string;
   selected: string | null;
   onSelect: (key: string) => void;
 }) {
@@ -236,14 +291,7 @@ function RenderRow({
         {rowLabel(row)}
       </Text>
       {durations.map((duration) => {
-        const cell = cells.find(
-          (candidate) =>
-            candidate.model === row.model &&
-            candidate.resolution === row.resolution &&
-            candidate.aspect_ratio === row.aspectRatio &&
-            candidate.duration_s === duration &&
-            (row.fps == null || ("fps" in candidate && candidate.fps === row.fps)),
-        );
+        const cell = cellForRow(cells, row, duration);
         if (!cell) {
           return (
             <span key={duration} className={styles.renderEmpty} title="Not tried">
@@ -259,7 +307,7 @@ function RenderRow({
             className={styles.renderCell}
             data-band={renderBand(cell.median_ms)}
             aria-pressed={selected === key}
-            aria-label={renderCellLabel(row, duration, cell.median_ms)}
+            aria-label={renderCellLabel(row, duration, cell.median_ms, lengthNoun)}
             title={`Median ${formatDuration(cell.median_ms)}`}
             onClick={() => onSelect(key)}
           >
@@ -279,122 +327,3 @@ const RENDER_LEGEND = [
   { band: "slow", label: "Over 3 min" },
   { band: "none", label: "Not tried" },
 ] as const;
-
-type RenderRowData = {
-  model: string;
-  resolution: string;
-  aspectRatio: string;
-  fps: number | null;
-};
-
-function rowLabel(row: RenderRowData): string {
-  const aspect = row.aspectRatio || row.resolution;
-  return row.fps == null ? aspect : `${aspect} · ${row.fps} fps`;
-}
-
-function modelOptions(cells: RenderCell[]): string[] {
-  return [...new Set(cells.map((cell) => cell.model).filter(Boolean))].sort();
-}
-
-function resolutionOptions(cells: RenderCell[]): string[] {
-  return [...new Set(cells.map((cell) => cell.resolution).filter(Boolean))].sort(
-    compareResolutions,
-  );
-}
-
-type RowGroup = { id: string; rows: RenderRowData[] };
-
-function groupAdjacent(rows: RenderRowData[], key: "model" | "resolution"): RowGroup[] {
-  const groups: RowGroup[] = [];
-  for (const row of rows) {
-    const id = row[key];
-    const current = groups.at(-1);
-    if (current?.id === id) current.rows.push(row);
-    else groups.push({ id, rows: [row] });
-  }
-  return groups;
-}
-
-function uniqueRows(cells: GridCell[]): RenderRowData[] {
-  const splitFps = distinctFps(cells).length > 1;
-  const seen = new Set<string>();
-  const rows: RenderRowData[] = [];
-  for (const cell of cells) {
-    const fps = splitFps && "fps" in cell ? cell.fps : null;
-    const key = `${cell.model}:${cell.resolution}:${cell.aspect_ratio}:${fps ?? ""}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    rows.push({
-      model: cell.model,
-      resolution: cell.resolution,
-      aspectRatio: cell.aspect_ratio,
-      fps,
-    });
-  }
-  return rows.sort(compareRows);
-}
-
-function distinctFps(cells: GridCell[]): number[] {
-  return [...new Set(cells.flatMap((cell) => ("fps" in cell ? [cell.fps] : [])))];
-}
-
-function compareRows(a: RenderRowData, b: RenderRowData): number {
-  const model = a.model.localeCompare(b.model);
-  if (model !== 0) return model;
-  const resolution = compareResolutions(a.resolution, b.resolution);
-  if (resolution !== 0) return resolution;
-  const aspect = a.aspectRatio.localeCompare(b.aspectRatio);
-  if (aspect !== 0) return aspect;
-  return (a.fps ?? 0) - (b.fps ?? 0);
-}
-
-function compareResolutions(left: string, right: string): number {
-  return resolutionRank(left) - resolutionRank(right) || left.localeCompare(right);
-}
-
-function resolutionRank(label: string): number {
-  const match = /^(\d+)/.exec(label);
-  return match ? Number(match[1]) : Number.POSITIVE_INFINITY;
-}
-
-function renderCellLabel(row: RenderRowData, duration: number, medianMs: number): string {
-  const place = [
-    row.resolution,
-    row.aspectRatio,
-    row.fps == null ? "" : `${row.fps} fps`,
-    row.model,
-  ]
-    .filter(Boolean)
-    .join(" ");
-  return `${place}, ${formatSeconds(duration)} long, median ${formatDuration(medianMs)}`;
-}
-
-function cellKey(cell: GridCell): string {
-  const fps = "fps" in cell ? cell.fps : "";
-  return `${cell.model}:${cell.resolution}:${cell.aspect_ratio}:${cell.duration_s}:${fps}`;
-}
-
-function visibleRenderCells(
-  snapshot: Snapshot,
-  filters: {
-    models: string[];
-    resolutions: string[];
-    aspectRatios: string[];
-    fps: number[];
-  },
-): GridCell[] {
-  const source =
-    filters.fps.length === 0
-      ? snapshot.render
-      : snapshot.render_by_fps.filter((cell) => filters.fps.includes(cell.fps));
-  return source.filter(
-    (cell) =>
-      chosen(cell.model, filters.models) &&
-      chosen(cell.resolution, filters.resolutions) &&
-      chosen(cell.aspect_ratio, filters.aspectRatios),
-  );
-}
-
-function chosen(value: string, selected: string[]): boolean {
-  return selected.length === 0 || selected.includes(value);
-}

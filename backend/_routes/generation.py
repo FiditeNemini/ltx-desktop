@@ -1,4 +1,4 @@
-"""Route handlers for /api/generate, /api/generate/cancel, /api/generation/progress."""
+"""Route handlers for /api/generate, /api/generate/estimate, /api/generate/cancel, /api/generation/progress."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from _routes._analytics import (
 from api_model_specs import video_generation_feature
 from api_types import (
     CancelResponse,
+    EstimateVideoRequest,
+    EstimateVideoResponse,
     GenerateVideoModelsSpecsResponse,
     GenerateVideoRequest,
     GenerateVideoResponse,
@@ -97,6 +99,19 @@ def route_generate_model_specs(
 def route_generate_cancel(handler: AppHandler = Depends(get_state_service)) -> CancelResponse:
     """POST /api/generate/cancel."""
     return handler.generation.cancel_generation()
+
+
+@router.post("/generate/estimate", response_model=EstimateVideoResponse)
+def route_generate_estimate(
+    req: EstimateVideoRequest,
+    handler: AppHandler = Depends(get_state_service),
+) -> EstimateVideoResponse:
+    """POST /api/generate/estimate — pre-generate wall-time estimate for one cell.
+
+    Kept intentionally: no current in-repo callers, but this is the
+    foundation for post-V1 ETA work. Do not remove as dead surface.
+    """
+    return handler.video_generation.estimate_local_fast(req)
 
 
 @router.get("/generation/progress", response_model=GenerationProgressResponse)

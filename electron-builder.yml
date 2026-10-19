@@ -47,12 +47,15 @@ extraResources:
       - "!outputs/**"
       - "!models/**"
       - "!tests/**"
-  # The backend reads this file at import time (services/features/ic_lora_recipes.py).
+  # The backend reads these files at import time (services/features/ic_lora_recipes.py,
+  # services/features/video/motion_path.py, runtime_config/ic_lora_local_envelope.py).
   # Name each file. Do not use a glob.
   - from: shared
     to: shared
     filter:
       - ic-lora-input-cap.json
+      - motion-path.json
+      - ic-lora-stage-2-upscale.json
   - from: python-deps-hash.txt
     to: python-deps-hash.txt
 
@@ -82,6 +85,11 @@ nsis:
   shortcutName: LTX Desktop
 
 mac:
+  # Bundled numpy, scipy, and av wheels are built for macOS 14. On macOS 13 the
+  # backend dies at import with a dyld error. This sets LSMinimumSystemVersion so
+  # macOS 13 shows a clear OS message at launch. Local generation needs macOS 26
+  # (see DARWIN_MIN_MACOS_MAJOR in backend/runtime_config/runtime_policy.py).
+  minimumSystemVersion: "14.0"
   hardenedRuntime: true
   entitlements: resources/entitlements.mac.plist
   entitlementsInherit: resources/entitlements.mac.plist
@@ -144,6 +152,7 @@ deb:
     - libxtst6
     - xdg-utils
     - libatspi2.0-0
+    - libvulkan1
     - libuuid1
     - libsecret-1-0
 

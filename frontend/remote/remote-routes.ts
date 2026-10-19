@@ -16,7 +16,7 @@ export function createRemoteAppRoutes(options: {
   errorElement: ReactNode;
   pairing: ReactNode;
   pairedLayout: ReactNode;
-  homeLayoutPages: Record<"home" | "assets" | "dashboard", ReactNode>;
+  homeLayoutPages: Record<"home" | "assistant" | "assets" | "dashboard", ReactNode>;
   screens: Partial<Record<HomeFeatureId, ComponentType>>;
   featureLayout: ComponentType;
 }): RouteObject[] {
@@ -29,7 +29,12 @@ export function createRemoteAppRoutes(options: {
           element: options.pairedLayout,
           children: [
             ...homeLayoutRouteSpecs("remote").map((spec) => {
-              if (spec.id !== "home" && spec.id !== "assets" && spec.id !== "dashboard") {
+              if (
+                spec.id !== "home" &&
+                spec.id !== "assistant" &&
+                spec.id !== "assets" &&
+                spec.id !== "dashboard"
+              ) {
                 throw new Error(`Remote host does not render ${spec.id}`);
               }
               return {

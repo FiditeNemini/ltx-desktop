@@ -77,11 +77,11 @@ def correct_resolution(
     return width, height
 
 
-# Home/queued Retake and Extend fit inside the local 1080p cell (1920×1088).
-# 1088 (not 1080) is the box so a clip that is already on the ÷32 grid is not shrunk.
-# A 1920×1080 picture is letterboxed up to 1920×1088, then cropped back.
-_1080P_LONG_EDGE = 1920
-_1080P_SHORT_EDGE = 1088
+# Home/queued Retake and Extend fit inside the 1080p cell (1920×1088), or the 4K cell while
+# ``highResVideoToVideo`` is on. The short edge is on the ÷32 grid, so a clip that is already on it
+# is not shrunk. A 3840×2160 picture is letterboxed up to 3840×2176, then cropped back.
+_1080P_EDIT_BOX = (1920, 1088)
+_2160P_EDIT_BOX = (3840, 2176)
 
 
 @dataclass(frozen=True)
@@ -123,17 +123,14 @@ def generation_letterbox(width: int, height: int) -> SpatialLetterbox:
     )
 
 
-def cap_to_1080p(width: int, height: int) -> tuple[int, int]:
-    """Fit inside local 1080p without upscaling or changing aspect.
+def cap_edit_size(width: int, height: int, *, high_res: bool = False) -> tuple[int, int]:
+    """Fit inside local 1080p (4K with ``high_res``) without upscaling or changing aspect.
 
     Home/queued Retake and Extend opt into this. GenSpace ``resolve_target_resolution``
     does not — it keeps the requested (or source) size after the ÷32 snap.
     """
-    max_w, max_h = (
-        (_1080P_LONG_EDGE, _1080P_SHORT_EDGE)
-        if width >= height
-        else (_1080P_SHORT_EDGE, _1080P_LONG_EDGE)
-    )
+    long_edge, short_edge = _2160P_EDIT_BOX if high_res else _1080P_EDIT_BOX
+    max_w, max_h = (long_edge, short_edge) if width >= height else (short_edge, long_edge)
     scale = min(max_w / width, max_h / height, 1.0)
     if scale >= 1.0:
         return width, height
@@ -145,17 +142,41 @@ def resolve_home_edit_size(
     requested_height: int | None,
     source_width: int,
     source_height: int,
+    *,
+    high_res: bool = False,
 ) -> tuple[int, int]:
     """Home Retake/Extend picture size, before the ÷32 letterbox.
 
-    A missing request keeps the source. The 1080p cap still applies, and the
+    A missing request keeps the source. The size cap still applies, and the
     result is never larger than the source. Callers pad this with
     ``generation_letterbox`` for the model and crop back to this size.
     """
     width = source_width if requested_width is None or requested_height is None else requested_width
     height = source_height if requested_width is None or requested_height is None else requested_height
-    width, height = cap_to_1080p(width, height)
+    width, height = cap_edit_size(width, height, high_res=high_res)
     return min(width, source_width), min(height, source_height)
+
+
+def resolve_requested_home_edit_size(
+    requested: TargetResolution | None,
+    source_width: int,
+    source_height: int,
+    *,
+    high_res: bool = False,
+) -> tuple[int, int]:
+    """Home size for an optional request resolution (None keeps the source).
+
+    Object-typed twin of ``resolve_home_edit_size`` for params-carrying
+    callers (executors, create-time preflights); the matrix passes candidate
+    ints to ``resolve_home_edit_size`` directly.
+    """
+    return resolve_home_edit_size(
+        None if requested is None else requested.width,
+        None if requested is None else requested.height,
+        source_width,
+        source_height,
+        high_res=high_res,
+    )
 
 
 def resolve_target_resolution(

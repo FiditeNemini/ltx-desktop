@@ -12,7 +12,9 @@ import numpy as np
 
 from api_types import PreprocessingStep
 from frame_math import snap_to_frame_grid
+from runtime_config.ic_lora_loop_fps import resolve_loop_fps
 from services.interfaces import VideoProcessor
+from services.services_utils import FrameArray
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +43,11 @@ class PreprocessingContext:
     outputs_dir: Path
     video_processor: VideoProcessor
     outpaint: OutpaintParams | None = None
+    # Rate of a looped image. Set by a queued recipe, it wins over the step's own ``fps`` param.
+    loop_fps: int | None = None
     on_frame: Callable[[], None] | None = None
+    # Turns one frame into its pose, depth or Canny guide frame. Set for a ``video_control`` entry.
+    control_frame: Callable[[FrameArray], FrameArray] | None = None
 
 
 PreprocessingUtility = Callable[[MediaArtifact, dict[str, object], PreprocessingContext], MediaArtifact]
@@ -57,7 +63,7 @@ def _image_to_frames(
 ) -> MediaArtifact:
     if artifact.kind != "image":
         raise ValueError("image_to_frames requires an image input")
-    fps = float(params.get("fps", 24))  # type: ignore[arg-type]
+    fps = float(resolve_loop_fps(params.get("fps"), ctx.loop_fps))
     count = _coerce_frame_count(ctx.num_frames)
     frame = ctx.video_processor.read_image(artifact.path)
     h, w = frame.shape[0], frame.shape[1]
@@ -153,9 +159,47 @@ def _outpaint_canvas(
             ctx.video_processor.release(mask_writer)
 
 
+def _video_control(
+    artifact: MediaArtifact, params: dict[str, object], ctx: PreprocessingContext
+) -> MediaArtifact:
+    """Replace every frame of the clip with its guide frame. Size, rate and length stay."""
+    del params  # the control type picks ``ctx.control_frame``
+    if artifact.kind != "video":
+        raise ValueError("video_control requires a video input")
+    if ctx.control_frame is None:
+        raise ValueError("video_control requires a control frame processor on the context")
+    cap = ctx.video_processor.open_video(artifact.path)
+    writer = None
+    out_path = ctx.outputs_dir / f"_video_control_{uuid.uuid4().hex[:8]}.mp4"
+    finished = False
+    try:
+        info = ctx.video_processor.get_video_info(cap)
+        fps = float(info["fps"]) or 24.0
+        writer = ctx.video_processor.create_writer(
+            str(out_path), fourcc="mp4v", fps=fps, size=(int(info["width"]), int(info["height"]))
+        )
+        for _ in range(int(info["frame_count"])):
+            if ctx.on_frame is not None:
+                ctx.on_frame()
+            frame = ctx.video_processor.read_frame(cap)
+            if frame is None:
+                break
+            writer.write(ctx.control_frame(frame))
+        finished = True
+        return MediaArtifact(path=str(out_path), kind="video", fps=fps)
+    finally:
+        ctx.video_processor.release(cap)
+        if writer is not None:
+            ctx.video_processor.release(writer)
+        if not finished:
+            # A cancel or an error leaves a partial clip. Nothing else knows its path.
+            out_path.unlink(missing_ok=True)
+
+
 PREPROCESSING_UTILITIES: dict[str, PreprocessingUtility] = {
     "image_to_frames": _image_to_frames,
     "outpaint_canvas": _outpaint_canvas,
+    "video_control": _video_control,
 }
 
 

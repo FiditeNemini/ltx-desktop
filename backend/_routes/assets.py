@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import os
+import shutil
 import tempfile
 from collections.abc import Callable, Coroutine
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Annotated, Any, BinaryIO
 
 from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
@@ -36,7 +36,7 @@ from services.media_probe import (
     ALLOWED_VIDEO_SUFFIXES,
     MAX_AUDIO_BYTES,
     MAX_IMAGE_BYTES,
-    MAX_VIDEO_BYTES,
+    MAX_VIDEO_UPLOAD_BYTES,
 )
 from state import get_state_service
 
@@ -52,7 +52,7 @@ _MULTIPART_OVERHEAD_BYTES = 64 * 1024
 # Remote-only ASGI body cap: largest permitted file plus multipart framing.
 # Enforced on actual receive bytes before Starlette parses/spools multipart.
 MAX_REMOTE_UPLOAD_BODY_BYTES = (
-    max(MAX_IMAGE_BYTES, MAX_AUDIO_BYTES, MAX_VIDEO_BYTES)
+    max(MAX_IMAGE_BYTES, MAX_AUDIO_BYTES, MAX_VIDEO_UPLOAD_BYTES)
     + _MULTIPART_OVERHEAD_BYTES
 )
 
@@ -332,6 +332,26 @@ def route_phone_extract_audio(
     return remote.asset(handler.assets.extract_audio(asset_id))
 
 
+def _upload_name(filename: str | None, suffix: str) -> str:
+    """The client's base name (either path separator), or a generic one if it is not a plain name."""
+    name = PureWindowsPath(filename or "").name.strip()
+    stem = name[: -len(suffix)] if name.lower().endswith(suffix) else ""
+    if (
+        not stem.strip(". ")
+        or any(ord(char) < 32 or char in '<>:"|?*' for char in name)
+        or len(name.encode()) > 200
+        or name.split(".")[0].rstrip(" ").upper() in _WINDOWS_DEVICE_NAMES
+    ):
+        return f"upload{suffix}"
+    return name
+
+
+# Windows opens these as devices, whatever the extension.
+_WINDOWS_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", *(f"{port}{n}" for port in ("COM", "LPT") for n in "123456789¹²³")}
+)
+
+
 def _upload_suffix(filename: str | None) -> str:
     suffix = Path(filename or "").suffix.lower()
     if suffix not in (
@@ -345,7 +365,7 @@ def _upload_max_bytes(suffix: str) -> int:
     if suffix in ALLOWED_AUDIO_SUFFIXES:
         return MAX_AUDIO_BYTES
     if suffix in ALLOWED_VIDEO_SUFFIXES:
-        return MAX_VIDEO_BYTES
+        return MAX_VIDEO_UPLOAD_BYTES
     return MAX_IMAGE_BYTES
 
 
@@ -400,16 +420,17 @@ async def route_upload_asset(
     suffix = _upload_suffix(file.filename)
     max_bytes = _upload_max_bytes(suffix)
     _reject_declared_oversize(file, request, max_bytes=max_bytes)
-    fd, tmp_name = tempfile.mkstemp(prefix=_UPLOAD_TEMP_PREFIX, suffix=suffix)
-    tmp_path = Path(tmp_name)
+    # The asset is named after the ingested file, so it keeps the upload's own name.
+    tmp_dir = Path(tempfile.mkdtemp(prefix=_UPLOAD_TEMP_PREFIX))
+    tmp_path = tmp_dir / _upload_name(file.filename, suffix)
     try:
-        with os.fdopen(fd, "wb") as handle:
+        with tmp_path.open("xb") as handle:
             await _write_bounded_upload(file, handle, max_bytes)
         return remote.asset(
             handler.assets.ingest_asset(IngestAssetRequest(path=str(tmp_path))),
         )
     finally:
-        tmp_path.unlink(missing_ok=True)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _file_response_for(

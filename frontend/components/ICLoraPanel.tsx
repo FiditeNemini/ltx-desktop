@@ -40,6 +40,9 @@ interface ICLoraPanelProps {
   conditioningStrength?: number
   onConditioningStrengthChange?: (strength: number) => void
   outputVideoPath?: string | null
+  // Advisory upload-preflight refusal for this input (spatial over-cap, whole
+  // clip too large, or no duration fits). Null while passing or unknown.
+  preflightWarning?: string | null
   onChange?: (data: {
     videoPath: string | null
     conditioningType: ICLoraConditioningType
@@ -83,6 +86,7 @@ export function ICLoraPanel({
   conditioningStrength: conditioningStrengthProp,
   onConditioningStrengthChange,
   outputVideoPath: _outputVideoPath,
+  preflightWarning = null,
   onChange,
 }: ICLoraPanelProps) {
   const inputVideoRef = useRef<HTMLVideoElement>(null)
@@ -739,6 +743,15 @@ export function ICLoraPanel({
                 </div>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {preflightWarning && (
+        <div className="px-4 py-3 border-t border-separator flex-shrink-0">
+          <div className="flex items-center gap-2 text-xs text-fg-warning">
+            <AlertCircle className="h-3.5 w-3.5 flex-shrink-0" />
+            <span>{preflightWarning}</span>
           </div>
         </div>
       )}

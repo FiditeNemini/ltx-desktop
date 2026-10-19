@@ -139,6 +139,27 @@ Ship `mpsgraph_zc` as a **pre-compiled binary wheel** (a normal importable
 extension, not torch JIT `load()`). Then no `ninja`, no clang, no Metal SDK at
 runtime — the cleanest fix for every downstream consumer.
 
+## macOS version requirement
+
+- The prebuilt `mps_sdpa_zc_ext.so` gets its minimum macOS (`minos`) from the
+  build machine, because `prebuild-mps-sdpa-ext.sh` sets no
+  `MACOSX_DEPLOYMENT_TARGET`. CI builds on macOS 26, so the shipped file says
+  `minos 26.0`. dyld refuses to load it on an older macOS.
+- On macOS below 26, `mpsgraph_zc` does not load from the bundle. The app then
+  falls back to the leaking backend described above. A JIT build is possible
+  only with Xcode tools.
+- So local generation is gated to macOS 26 or later
+  (`DARWIN_MIN_MACOS_MAJOR` in `backend/runtime_config/runtime_policy.py`).
+  macOS 14 and 15 run the app but show the "Coming soon to your device" notice.
+- Apple's fused attention op needs macOS 15 (`MPS_AVAILABLE_STARTING(macos(15.0))`),
+  so macOS 15 is the lowest version that can ever work. macOS 14 cannot.
+- To lower the floor to macOS 15: build the extension with
+  `MACOSX_DEPLOYMENT_TARGET=15.0`, fail the build if the `.so` has a `minos`
+  above 15.0, gate local generation on `mpsgraph_zc` being the picked backend,
+  and test on a real macOS 15 Mac. Check attention output at LTX shapes (32 heads,
+  sequences above 11.6k tokens, where the score matrix passes 2^32 elements)
+  and run one full generation.
+
 ## Status / next steps
 
 - [x] Root cause identified and fix validated in dev (flat memory at 5 s).
@@ -147,4 +168,5 @@ runtime — the cleanest fix for every downstream consumer.
 - [x] `uv.lock` regenerated so `ninja` is locked.
 - [ ] Test-release and verify on a clean, Xcode-less Mac (see "Must-verify" above).
 - [ ] File the upstream request for prebuilt `mps-sdpa` wheels.
+- [ ] Lower the local generation floor from macOS 26 to macOS 15 (see "macOS version requirement"). Needs a test on a real macOS 15 Mac.
 - [ ] (CI repo `Lightricks/ltx-desktop-ci`, optional) add `scripts/prebuild-mps-sdpa-ext.sh` to the `python-embed` cache-key `hashFiles` so edits to it also bust the cache. Not required now — the `uv.lock` + `prepare-python.sh` changes already bust it for this release.

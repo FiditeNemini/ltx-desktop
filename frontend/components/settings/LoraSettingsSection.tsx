@@ -16,7 +16,6 @@ import {
   type LibraryEntry,
 } from '../../lib/lora-library'
 import { formatBytes } from '../../lib/format'
-import { isHomeFeatureEnabled } from '../../lib/home-features'
 import { Button as DsButton } from '@/ds/Button/Button'
 import { Text } from '@/ds/Text/Text'
 import {
@@ -345,13 +344,7 @@ export function LoraSettingsSection({
   } = useIcLoras(true)
 
   const styleEntries = useMemo(() => loras.map(loraListItemToEntry), [loras])
-  const icEntries = useMemo(
-    () =>
-      icLoras
-        .filter((item) => isHomeFeatureEnabled(item.ic_lora.id))
-        .map(icListItemToEntry),
-    [icLoras],
-  )
+  const icEntries = useMemo(() => icLoras.map(icListItemToEntry), [icLoras])
 
   const searchMatchCount = useMemo(() => {
     if (!searchQuery) return 1

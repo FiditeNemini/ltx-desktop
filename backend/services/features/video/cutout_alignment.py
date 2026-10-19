@@ -20,9 +20,11 @@ from pathlib import Path
 
 from services.ffmpeg import (
     FFMPEG_PROTOCOL_WHITELIST,
+    FFMPEG_TIMEOUT_SECONDS,
     FfmpegCancelledError,
     ffmpeg_seconds,
     run_ffmpeg,
+    timeout_for_pixels,
 )
 from services.generation_interrupt import GenerationCancelledError, is_requested
 from services.media_probe import video_frame_count
@@ -85,9 +87,12 @@ def _fit_filter(fit: CanvasFit) -> str:
     )
 
 
-def _run(args: list[str], failure: str) -> None:
+def run_media_ffmpeg(
+    args: list[str], failure: str, *, timeout: float = FFMPEG_TIMEOUT_SECONDS
+) -> None:
+    """Run ffmpeg. A cancel stops the job, and a failed run is a media error."""
     try:
-        run_ffmpeg(args, should_cancel=is_requested)
+        run_ffmpeg(args, timeout=timeout, should_cancel=is_requested)
     except FfmpegCancelledError:
         raise GenerationCancelledError() from None
     except subprocess.CalledProcessError as exc:
@@ -125,7 +130,11 @@ def prepare_clip_for_model(
     else:
         args += ["-an"]
     args += ["-protocol_whitelist", FFMPEG_PROTOCOL_WHITELIST, str(dest)]
-    _run(args, "clip preparation failed")
+    run_media_ffmpeg(
+        args,
+        "clip preparation failed",
+        timeout=timeout_for_pixels(fit.canvas_width, fit.canvas_height, video_frame_count(source)),
+    )
     return dest
 
 
@@ -173,7 +182,11 @@ def conform_matte_to_clip(matte: Path, *, frames: int, fps: float, fit: CanvasFi
         str(conformed),
     ]
     try:
-        _run(args, "matte alignment failed")
+        run_media_ffmpeg(
+            args,
+            "matte alignment failed",
+            timeout=timeout_for_pixels(fit.canvas_width, fit.canvas_height, frames),
+        )
         os.replace(conformed, matte)
     finally:
         conformed.unlink(missing_ok=True)

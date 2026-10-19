@@ -1,13 +1,11 @@
 import { ActivityCircular } from "@ds/ActivityCircular/ActivityCircular";
-import { Button } from "@ds/Button/Button";
-import { Tooltip } from "@ds/Tooltip/Tooltip";
 import TrimIcon from "@ds/assets/Icons/FullEditor.svg?react";
 import MediaReplaceIcon from "@ds/assets/Icons/MediaReplace.svg?react";
 import PauseIcon from "@ds/assets/Icons/Pause.svg?react";
 import PlayIcon from "@ds/assets/Icons/Play.svg?react";
 import RemoveIcon from "@ds/assets/Icons/Remove.svg?react";
 import { clsx } from "clsx";
-import { type DragEventHandler, type ReactNode, type RefObject } from "react";
+import { type DragEventHandler, type RefObject } from "react";
 
 import {
   INPUT_PREVIEW_CONTROLS,
@@ -16,38 +14,8 @@ import {
 import { useVideoTimeline } from "../../../components/VideoView/useVideoTimeline";
 import { useFeatureFormMuteStore } from "../../../stores/featureFormMuteStore";
 
+import { OverlayButton } from "./OverlayButton";
 import styles from "./VideoAssetField.module.scss";
-
-function OverlayButton({
-  label,
-  ariaLabel,
-  icon,
-  onClick,
-}: {
-  label: string;
-  ariaLabel: string;
-  icon: ReactNode;
-  onClick: () => void;
-}) {
-  return (
-    <Tooltip content={label}>
-      <span>
-        <Button
-          appearance="overlay"
-          hierarchy="secondary"
-          size="md"
-          isIconOnly
-          leftIcon={icon}
-          aria-label={ariaLabel}
-          onClick={(event) => {
-            event.stopPropagation();
-            onClick();
-          }}
-        />
-      </span>
-    </Tooltip>
-  );
-}
 
 export function VideoMonitor({
   src,

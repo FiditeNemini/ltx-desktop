@@ -1,9 +1,15 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { resetBackendCredentials } from '../lib/backend'
 import { ApiClient, type ApiSuccessOf } from '../lib/api-client'
+
+type AssistantSelection = ApiSuccessOf<'getAssistantSelection'>
 import { useRemoteStatus } from '../hooks/use-remote-status'
 import { isRemoteExposureEnabled, type RemoteExposure } from '../lib/remote-exposure'
 import { shouldNotifyRemoteKeepAwake } from '../lib/remote-keep-awake-signal'
+import { readBudgetMode, type BudgetMode } from '../lib/budget-risk'
+import { RECKLESS_OFF_SAVE_ERROR, RECKLESS_ON_SAVE_ERROR } from '../lib/settings-sync'
+
+type BackendSettings = ApiSuccessOf<'getSettings'>
 
 // promptEnhancerEnabled gates LTX API enhance_prompt (remote video and API text encoding) for
 // every conditioning, including Gen Space. exploreAutoEnhancePrompts gates automatic rewrite on
@@ -17,6 +23,8 @@ export interface AppSettings {
   userPrefersFalApiImageGenerations: boolean
   hasGeminiApiKey: boolean
   geminiModel: string
+  assistantProvider: BackendSettings['assistantProvider']
+  assistantLocalModel: BackendSettings['assistantLocalModel']
   useLocalTextEncoder: boolean
   promptCacheSize: number
   promptEnhancerEnabled: boolean
@@ -33,9 +41,11 @@ export interface AppSettings {
   modelsDir: string
   useConvVae: boolean
   remoteExposure: RemoteExposure
+  /** Echoed by the backend, which always runs reckless. Standard is a test-only mode. */
+  budgetMode: 'standard' | 'reckless'
 }
 
-export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite'
+export { DEFAULT_GEMINI_MODEL } from '../lib/gemini-model'
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   useTorchCompile: false,
@@ -46,6 +56,8 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   userPrefersFalApiImageGenerations: false,
   hasGeminiApiKey: false,
   geminiModel: '',
+  assistantProvider: 'gemini',
+  assistantLocalModel: 'qwen3.5:9b',
   useLocalTextEncoder: false,
   promptCacheSize: 1,
   promptEnhancerEnabled: true,
@@ -54,9 +66,12 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   modelsDir: '',
   useConvVae: false,
   remoteExposure: 'off',
+  budgetMode: 'reckless',
 }
 
 type BackendProcessStatus = 'alive' | 'restarting' | 'dead'
+
+const ASSISTANT_SELECTION_REFRESH_MS = 10_000
 
 interface AppSettingsContextValue {
   settings: AppSettings
@@ -64,6 +79,10 @@ interface AppSettingsContextValue {
   runtimePolicyLoaded: boolean
   updateSettings: (patch: Partial<AppSettings> | ((prev: AppSettings) => AppSettings)) => void
   refreshSettings: () => Promise<void>
+  /** Sets the assistant model Desktop Settings and both composers share. */
+  selectAssistant: (provider: AppSettings['assistantProvider'], localModel?: AppSettings['assistantLocalModel']) => Promise<void>
+  /** True while a selectAssistant save is in flight; a send now would use the previous model. */
+  assistantSelectionPending: boolean
   saveLtxApiKey: (value: string) => Promise<void>
   saveFalApiKey: (value: string) => Promise<void>
   saveGeminiApiKey: (value: string) => Promise<void>
@@ -80,6 +99,13 @@ interface AppSettingsContextValue {
   // without this they stay pinned to whatever was installed at app start.
   modelsVersion: number
   notifyModelsChanged: () => void
+  // Saves Reckless mode on its own and updates `settings.budgetMode` only after
+  // the server accepts it. The document sync does not write this field.
+  setBudgetMode: (mode: BudgetMode) => Promise<void>
+  budgetModeSaving: boolean
+  settingsSyncError: string | null
+  // Gemini model has its own save, like an API key. The document sync does not write it.
+  saveGeminiModel: (model: string) => Promise<boolean>
 }
 
 const AppSettingsContext = createContext<AppSettingsContextValue | null>(null)
@@ -106,6 +132,8 @@ function normalizeAppSettings(data: Partial<AppSettings>): AppSettings {
     userPrefersFalApiImageGenerations: data.userPrefersFalApiImageGenerations ?? DEFAULT_APP_SETTINGS.userPrefersFalApiImageGenerations,
     hasGeminiApiKey: data.hasGeminiApiKey ?? DEFAULT_APP_SETTINGS.hasGeminiApiKey,
     geminiModel: data.geminiModel ?? DEFAULT_APP_SETTINGS.geminiModel,
+    assistantProvider: data.assistantProvider ?? DEFAULT_APP_SETTINGS.assistantProvider,
+    assistantLocalModel: data.assistantLocalModel ?? DEFAULT_APP_SETTINGS.assistantLocalModel,
     useLocalTextEncoder: data.useLocalTextEncoder ?? DEFAULT_APP_SETTINGS.useLocalTextEncoder,
     promptCacheSize: data.promptCacheSize ?? DEFAULT_APP_SETTINGS.promptCacheSize,
     promptEnhancerEnabled: data.promptEnhancerEnabled ?? DEFAULT_APP_SETTINGS.promptEnhancerEnabled,
@@ -115,6 +143,7 @@ function normalizeAppSettings(data: Partial<AppSettings>): AppSettings {
     modelsDir: data.modelsDir ?? DEFAULT_APP_SETTINGS.modelsDir,
     useConvVae: data.useConvVae ?? DEFAULT_APP_SETTINGS.useConvVae,
     remoteExposure: data.remoteExposure === 'lan' ? 'lan' : DEFAULT_APP_SETTINGS.remoteExposure,
+    budgetMode: readBudgetMode(data.budgetMode),
   }
 }
 
@@ -123,7 +152,14 @@ type GpuInfoPayload = ApiSuccessOf<'getGpuInfo'>
 
 export function AppSettingsProvider({ children }: { children: ReactNode }) {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS)
+  const settingsRef = useRef(settings)
+  settingsRef.current = settings
+  const budgetModeSavingRef = useRef(false)
+  const budgetModeRevisionRef = useRef(0)
+  const [budgetModeSaving, setBudgetModeSaving] = useState(false)
+  const [settingsSyncError, setSettingsSyncError] = useState<string | null>(null)
   const [isLoaded, setIsLoaded] = useState(false)
+  const isLoadedRef = useRef(false)
   const [runtimePolicyLoaded, setRuntimePolicyLoaded] = useState(false)
   const [forceApiGenerations, setForceApiGenerations] = useState(true)
   const [localViable, setLocalViable] = useState(false)
@@ -232,12 +268,38 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const refreshSettings = useCallback(async () => {
+    const revision = budgetModeRevisionRef.current
+    const loaded = isLoadedRef.current
     const result = await ApiClient.getSettings()
     if (!result.ok) {
       throw new Error(result.error.message)
     }
-    setSettings(normalizeAppSettings(result.data))
+    const server = normalizeAppSettings(result.data)
+    isLoadedRef.current = true
     setIsLoaded(true)
+    setSettings((prev) => {
+      // After the first load, a reload only copies fields that have their own
+      // writer. Document edits stay put, so this GET cannot put an older
+      // checkbox or an older Gemini model back.
+      const next = loaded
+        ? {
+            ...prev,
+            hasLtxApiKey: server.hasLtxApiKey,
+            hasFalApiKey: server.hasFalApiKey,
+            hasGeminiApiKey: server.hasGeminiApiKey,
+            modelsDir: server.modelsDir,
+            geminiModel: server.geminiModel,
+            budgetMode: server.budgetMode,
+          }
+        : server
+      // A reload that overlaps the budget-mode request, or that started before
+      // that request finished, must not move the switch.
+      if (budgetModeSavingRef.current || budgetModeRevisionRef.current !== revision) {
+        next.budgetMode = prev.budgetMode
+      }
+      settingsRef.current = next
+      return next
+    })
   }, [])
 
   useEffect(() => {
@@ -282,25 +344,104 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!isLoaded || backendProcessStatus !== 'alive') return
-    const syncTimer = setTimeout(async () => {
-      // Key fields are omitted: this sync must not write credentials. A key save
-      // goes through writeApiKey, which already persisted the trimmed value.
-      const { hasLtxApiKey: _a, hasFalApiKey: _b, hasGeminiApiKey: _c, modelsDir: _d, ...syncPayload } = settings
-      const result = await ApiClient.updateSettings(syncPayload)
-      if (!result.ok) {
-        // Best-effort settings sync.
-      }
+    const syncTimer = setTimeout(() => {
+      // Omitted fields have their own writer. A document save must not put an
+      // older key flag, models dir, budget mode, or Gemini model back. The assistant
+      // choice is omitted too: Remote can change it, and this would write a stale copy back.
+      const {
+        hasLtxApiKey: _a,
+        hasFalApiKey: _b,
+        hasGeminiApiKey: _c,
+        modelsDir: _d,
+        budgetMode: _e,
+        geminiModel: _f,
+        assistantProvider: _g,
+        assistantLocalModel: _h,
+        ...syncPayload
+      } = settings
+      void ApiClient.updateSettings(syncPayload)
     }, 150)
     return () => clearTimeout(syncTimer)
   }, [backendProcessStatus, isLoaded, settings])
 
   const updateSettings = useCallback((patch: Partial<AppSettings> | ((prev: AppSettings) => AppSettings)) => {
-    if (typeof patch === 'function') {
-      setSettings((prev) => patch(prev))
+    setSettings((prev) => {
+      const next = typeof patch === 'function' ? patch(prev) : { ...prev, ...patch }
+      // Reckless mode has its own save. A document edit must not move the switch.
+      const settled = next.budgetMode === prev.budgetMode ? next : { ...next, budgetMode: prev.budgetMode }
+      settingsRef.current = settled
+      return settled
+    })
+  }, [])
+
+  const setBudgetMode = useCallback(async (mode: BudgetMode) => {
+    if (budgetModeSavingRef.current) return
+    if (settingsRef.current.budgetMode === mode) return
+    budgetModeSavingRef.current = true
+    setBudgetModeSaving(true)
+    setSettingsSyncError(null)
+    const result = await ApiClient.updateSettings({ budgetMode: mode })
+    budgetModeSavingRef.current = false
+    setBudgetModeSaving(false)
+    if (!result.ok) {
+      setSettingsSyncError(mode === 'reckless' ? RECKLESS_ON_SAVE_ERROR : RECKLESS_OFF_SAVE_ERROR)
       return
     }
-    setSettings((prev) => ({ ...prev, ...patch }))
+    budgetModeRevisionRef.current += 1
+    setSettings((prev) => {
+      const next = { ...prev, budgetMode: mode }
+      settingsRef.current = next
+      return next
+    })
   }, [])
+
+  const applyAssistantSelection = useCallback((selection: AssistantSelection) => {
+    setSettings((prev) =>
+      prev.assistantProvider === selection.provider && prev.assistantLocalModel === selection.local_model
+        ? prev
+        : { ...prev, assistantProvider: selection.provider, assistantLocalModel: selection.local_model },
+    )
+  }, [])
+
+  // Bumped when a select starts and ends: a read that overlaps a select could return the old choice.
+  const assistantSelectionVersion = useRef(0)
+  const assistantSelectsPending = useRef(0)
+  const [assistantSelectionPending, setAssistantSelectionPending] = useState(false)
+  const latestAssistantSelect = useRef(0)
+
+  const selectAssistant = useCallback(async (provider: AppSettings['assistantProvider'], localModel?: AppSettings['assistantLocalModel']) => {
+    const id = ++latestAssistantSelect.current
+    assistantSelectionVersion.current += 1
+    assistantSelectsPending.current += 1
+    setAssistantSelectionPending(true)
+    try {
+      const result = await ApiClient.setAssistantSelection({ provider, local_model: localModel ?? null })
+      if (!result.ok) throw new Error(result.error.message)
+      if (id === latestAssistantSelect.current) applyAssistantSelection(result.data)
+    } finally {
+      assistantSelectsPending.current -= 1
+      assistantSelectionVersion.current += 1
+      setAssistantSelectionPending(assistantSelectsPending.current > 0)
+    }
+  }, [applyAssistantSelection])
+
+  // Remote can change the shared assistant choice; every Desktop screen reads it from here.
+  useEffect(() => {
+    if (!isLoaded || backendProcessStatus !== 'alive') return
+    const refresh = async () => {
+      if (assistantSelectsPending.current > 0) return
+      const version = assistantSelectionVersion.current
+      const result = await ApiClient.getAssistantSelection()
+      if (result.ok && version === assistantSelectionVersion.current) applyAssistantSelection(result.data)
+    }
+    const timer = setInterval(() => void refresh(), ASSISTANT_SELECTION_REFRESH_MS)
+    const onFocus = () => void refresh()
+    window.addEventListener('focus', onFocus)
+    return () => {
+      clearInterval(timer)
+      window.removeEventListener('focus', onFocus)
+    }
+  }, [applyAssistantSelection, backendProcessStatus, isLoaded])
 
   type ApiKeyField = 'ltxApiKey' | 'falApiKey' | 'geminiApiKey'
 
@@ -330,6 +471,11 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
   const clearFalApiKey = useCallback(() => writeApiKey('falApiKey', ''), [writeApiKey])
   const clearGeminiApiKey = useCallback(() => writeApiKey('geminiApiKey', ''), [writeApiKey])
 
+  const saveGeminiModel = useCallback(async (geminiModel: string) => {
+    const result = await ApiClient.updateSettings({ geminiModel })
+    return result.ok
+  }, [])
+
   const shouldVideoGenerateWithLtxApi =
     settings.hasLtxApiKey &&
     (forceApiGenerations || settings.userPrefersLtxApiVideoGenerations)
@@ -344,6 +490,8 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
       runtimePolicyLoaded,
       updateSettings,
       refreshSettings,
+      selectAssistant,
+      assistantSelectionPending,
       saveLtxApiKey,
       saveFalApiKey,
       saveGeminiApiKey,
@@ -357,11 +505,24 @@ export function AppSettingsProvider({ children }: { children: ReactNode }) {
       cudaAvailable,
       modelsVersion,
       notifyModelsChanged,
+      setBudgetMode,
+      budgetModeSaving,
+      settingsSyncError,
+      saveGeminiModel,
     }),
-    [cudaAvailable, forceApiGenerations, isLoaded, localViable, modelsVersion, notifyModelsChanged, refreshSettings, runtimePolicyLoaded, clearFalApiKey, clearGeminiApiKey, clearLtxApiKey, saveFalApiKey, saveGeminiApiKey, saveLtxApiKey, settings, shouldVideoGenerateWithLtxApi, shouldImageGenerateWithFalApi, updateSettings],
+    [assistantSelectionPending, budgetModeSaving, cudaAvailable, forceApiGenerations, isLoaded, localViable, modelsVersion, notifyModelsChanged, refreshSettings, runtimePolicyLoaded, selectAssistant, clearFalApiKey, clearGeminiApiKey, clearLtxApiKey, saveFalApiKey, saveGeminiApiKey, saveGeminiModel, saveLtxApiKey, setBudgetMode, settings, settingsSyncError, shouldVideoGenerateWithLtxApi, shouldImageGenerateWithFalApi, updateSettings],
   )
 
-  return <AppSettingsContext.Provider value={contextValue}>{children}</AppSettingsContext.Provider>
+  return (
+    <AppSettingsContext.Provider value={contextValue}>
+      {settingsSyncError ? (
+        <span className="sr-only" role="alert">
+          {settingsSyncError}
+        </span>
+      ) : null}
+      {children}
+    </AppSettingsContext.Provider>
+  )
 }
 
 export function useAppSettings() {

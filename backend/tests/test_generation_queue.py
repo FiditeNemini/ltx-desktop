@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import sys
@@ -25,6 +26,12 @@ from api_types import (
     GenerationErrorCode,
 )
 from frame_math import compute_num_frames
+from runtime_config.ic_lora_local_envelope import IC_LORA_SOURCE_TOO_LARGE
+from runtime_config.video_job_budget import (
+    LOCAL_GENERATION_RAM_SHORTFALL,
+    LOCAL_GENERATION_UNSUPPORTED,
+    VIDEO_JOB_TOO_LARGE,
+)
 from services.analytics import AnalyticsService
 from services.features.video import TextToVideoExecutor
 from services.features.video.audio_to_video import AudioToVideoExecutor
@@ -36,7 +43,9 @@ from services.generation_queue.control import (
 )
 from services.generation_queue.registry import ExecutorRegistry
 from services.generation_queue.runner import QueueRunner
+from services.patches import diffusion_stage_cache
 from services.generation_queue.types import (
+    ExecutionOutcome,
     GenerationExecutor,
     OutputAllocation,
     OutputPlan,
@@ -50,6 +59,7 @@ from services.generation_interrupt import (
     request,
 )
 from tests.fakes import FakeResponse
+from tests.fakes.fake_gpu_info import FakeGpuInfo
 from tests.fakes.generation import FakeGenerationExecutor
 from tests.fakes.services import FakeHTTPClient, FakeTaskRunner
 
@@ -193,7 +203,7 @@ class _PartialFailureExecutor(_SkipParamValidation):
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome:
         del generation
         self.output_path = outputs[0].dest_path
         path = Path(self.output_path)
@@ -217,13 +227,13 @@ class _DelayedSuccessExecutor(_SkipParamValidation):
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome:
         self.output_path = outputs[0].dest_path
         self.started.set()
         try:
             if not self.release.wait(timeout=3.0):
                 raise RuntimeError("delayed executor was not released")
-            FakeGenerationExecutor().execute(generation, outputs)
+            return FakeGenerationExecutor().execute(generation, outputs)
         finally:
             self.finished.set()
 
@@ -243,7 +253,7 @@ class _BlockingFileWritingExecutor(_SkipParamValidation):
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome:
         del generation
         self.output_path = outputs[0].dest_path
         path = Path(self.output_path)
@@ -328,9 +338,9 @@ class _ExecuteRecorder(_SkipParamValidation):
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome:
         self.executed.set()
-        FakeGenerationExecutor().execute(generation, outputs)
+        return FakeGenerationExecutor().execute(generation, outputs)
 
 
 class _FailingFinalizationDb(SqliteStore):
@@ -387,11 +397,11 @@ class _FailFirstExecutor(_SkipParamValidation):
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome:
         self.execution_ids.append(generation.id)
         if _prompt(generation) == "first":
             raise RuntimeError("executor failed")
-        FakeGenerationExecutor().execute(generation, outputs)
+        return FakeGenerationExecutor().execute(generation, outputs)
 
 
 class _DirectoryFailureExecutor(_SkipParamValidation):
@@ -406,13 +416,13 @@ class _DirectoryFailureExecutor(_SkipParamValidation):
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome:
         path = Path(outputs[0].dest_path)
         if _prompt(generation) == "first":
             path.mkdir()
             self.partial_paths[generation.id] = str(path)
             raise RuntimeError("executor failed after creating a directory")
-        FakeGenerationExecutor().execute(generation, outputs)
+        return FakeGenerationExecutor().execute(generation, outputs)
 
 
 class _DeleteGenerationExecutor(_SkipParamValidation):
@@ -428,10 +438,10 @@ class _DeleteGenerationExecutor(_SkipParamValidation):
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
-        FakeGenerationExecutor().execute(generation, outputs)
+    ) -> ExecutionOutcome:
+        result = FakeGenerationExecutor().execute(generation, outputs)
         if _prompt(generation) != "vanish":
-            return
+            return result
         self.output_path = outputs[0].dest_path
         conn = sqlite3.connect(str(self._db_path))
         try:
@@ -439,9 +449,69 @@ class _DeleteGenerationExecutor(_SkipParamValidation):
             conn.commit()
         finally:
             conn.close()
+        return result
 
 
 def test_runner_claims_and_succeeds_one_generation(test_state) -> None:
+    db = SqliteStore(test_state.config.app_data_dir)
+    runner = make_runner(test_state, db, FakeGenerationExecutor())
+    generation = db.insert_generation("text-to-video", _spec("fox"))
+    runner.start()
+    try:
+        runner.wake()
+        assert wait_until(
+            lambda: db.get_generation(generation.id).status == "succeeded"
+        )
+    finally:
+        runner.stop()
+
+
+class _CacheObservingExecutor(FakeGenerationExecutor):
+    """Records whether a cached transformer was still resident when execute ran."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cache_resident_at_execute: bool | None = None
+
+    def execute(
+        self,
+        generation: GenerationRecord,
+        outputs: tuple[OutputAllocation, ...],
+    ) -> ExecutionOutcome:
+        self.cache_resident_at_execute = diffusion_stage_cache._cached_model is not None  # noqa: SLF001
+        return super().execute(generation, outputs)
+
+
+class _MetaMovable:
+    def to(self, device: str) -> _MetaMovable:
+        del device
+        return self
+
+
+def test_runner_releases_before_execute_sample(test_state, monkeypatch) -> None:
+    # The execute-time budget samples free inside execute; a still-resident cache charges D.
+    monkeypatch.setattr(diffusion_stage_cache, "_cached_model", _MetaMovable())
+    monkeypatch.setattr(diffusion_stage_cache, "_cached_key", ("previous-job",))
+    db = SqliteStore(test_state.config.app_data_dir)
+    executor = _CacheObservingExecutor()
+    runner = make_runner(test_state, db, executor)
+    generation = db.insert_generation("text-to-video", _spec("fox"))
+    runner.start()
+    try:
+        runner.wake()
+        assert wait_until(
+            lambda: db.get_generation(generation.id).status == "succeeded"
+        )
+    finally:
+        runner.stop()
+    assert executor.cache_resident_at_execute is False
+
+
+def test_runner_reclaim_failure_does_not_fail_job(test_state, monkeypatch) -> None:
+    def _failing_evict() -> None:
+        raise RuntimeError("reclaim failed")
+
+    monkeypatch.setattr(diffusion_stage_cache, "evict", _failing_evict)
     db = SqliteStore(test_state.config.app_data_dir)
     runner = make_runner(test_state, db, FakeGenerationExecutor())
     generation = db.insert_generation("text-to-video", _spec("fox"))
@@ -478,10 +548,11 @@ class _OptionalOutputExecutor(_SkipParamValidation):
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome:
         del generation
         for output in outputs[: 2 if self._write_optional else 1]:
             _png(Path(output.dest_path))
+        return ExecutionOutcome()
 
 
 @pytest.mark.parametrize(("write_optional", "expected_outputs"), [(True, 2), (False, 1)])
@@ -511,8 +582,9 @@ def test_runner_leaves_out_an_optional_output_the_executor_did_not_write(
 
 def test_runner_fails_when_a_required_output_is_missing(tmp_path: Path) -> None:
     class _WritesNothing(_OptionalOutputExecutor):
-        def execute(self, generation, outputs) -> None:
+        def execute(self, generation, outputs) -> ExecutionOutcome:
             del generation, outputs
+            return ExecutionOutcome()
 
     db = SqliteStore(tmp_path / "app_data")
     runner = QueueRunner(
@@ -1092,6 +1164,103 @@ def test_runner_persists_prompt_embedding_failure(test_state) -> None:
 
 
 @pytest.mark.parametrize(
+    "code",
+    [
+        VIDEO_JOB_TOO_LARGE,
+        LOCAL_GENERATION_RAM_SHORTFALL,
+        LOCAL_GENERATION_UNSUPPORTED,
+        IC_LORA_SOURCE_TOO_LARGE,
+    ],
+)
+def test_runner_maps_execute_time_http_budget_error_to_job_too_large(
+    test_state, code: str
+) -> None:
+    """A job that stops fitting between create and execute must read as a
+    budget miss, not a generic executor failure."""
+    db = SqliteStore(test_state.config.app_data_dir)
+    runner = make_runner(
+        test_state,
+        db,
+        FakeGenerationExecutor(error=HTTPError(422, "no longer fits", code=code)),
+    )
+    generation = db.insert_generation("text-to-video", _spec("budget-drift"))
+    runner.start()
+    try:
+        runner.wake()
+        assert wait_until(lambda: db.get_generation(generation.id).status == "failed")
+        loaded = db.get_generation(generation.id)
+        assert loaded is not None
+        assert loaded.error_code == "JOB_TOO_LARGE"
+    finally:
+        runner.stop()
+
+
+def test_budget_miss_codes_match_shared_contract() -> None:
+    """The execute-time budget family must not drift from shared/budget-miss-codes.json."""
+    from runtime_config.reject_reasons import BUDGET_MISS_CODES
+
+    contract_path = Path(__file__).resolve().parents[2] / "shared" / "budget-miss-codes.json"
+    contract = json.loads(contract_path.read_text())
+    assert sorted(BUDGET_MISS_CODES) == sorted(contract)
+    # The set's literals must track the budget constants they stand in for.
+    assert BUDGET_MISS_CODES == frozenset(
+        {
+            VIDEO_JOB_TOO_LARGE,
+            LOCAL_GENERATION_RAM_SHORTFALL,
+            LOCAL_GENERATION_UNSUPPORTED,
+            IC_LORA_SOURCE_TOO_LARGE,
+        }
+    )
+
+
+def test_runner_keeps_non_budget_http_error_as_executor_failed(test_state) -> None:
+    db = SqliteStore(test_state.config.app_data_dir)
+    runner = make_runner(
+        test_state,
+        db,
+        FakeGenerationExecutor(
+            error=HTTPError(422, "bad spec", code="INVALID_GENERATION_SPEC")
+        ),
+    )
+    generation = db.insert_generation("text-to-video", _spec("bad-spec"))
+    runner.start()
+    try:
+        runner.wake()
+        assert wait_until(lambda: db.get_generation(generation.id).status == "failed")
+        loaded = db.get_generation(generation.id)
+        assert loaded is not None
+        assert loaded.error_code == "EXECUTOR_FAILED"
+    finally:
+        runner.stop()
+
+
+def test_runner_maps_capability_budget_miss_to_job_too_large(test_state) -> None:
+    """Retake's window-too-large (CapabilityFailedError with the budget code)
+    must not hide as a generic capability failure."""
+    db = SqliteStore(test_state.config.app_data_dir)
+    runner = make_runner(
+        test_state,
+        db,
+        FakeGenerationExecutor(
+            error=CapabilityFailedError(
+                "Retake selection is too long for this machine.",
+                code=VIDEO_JOB_TOO_LARGE,
+            )
+        ),
+    )
+    generation = db.insert_generation("text-to-video", _spec("window-drift"))
+    runner.start()
+    try:
+        runner.wake()
+        assert wait_until(lambda: db.get_generation(generation.id).status == "failed")
+        loaded = db.get_generation(generation.id)
+        assert loaded is not None
+        assert loaded.error_code == "JOB_TOO_LARGE"
+    finally:
+        runner.stop()
+
+
+@pytest.mark.parametrize(
     "failure",
     [
         sqlite3.OperationalError("database unavailable"),
@@ -1236,6 +1405,7 @@ class _ReservedVideoCall:
     output_path: Path | None
     prompt_wrap: Callable[[str], str] | None = None
     local_model_id: str | None = None
+    risk_allowance: bool | None = None
 
 
 class _RecordingReservedVideoGenerator:
@@ -1265,6 +1435,8 @@ class _RecordingReservedVideoGenerator:
         a2v_num_frames: int | None = None,
         a2v_audio_duration_seconds: float | None = None,
         local_model_id: str | None = None,
+        risk_allowance: bool | None = None,
+        unmeasured_bet: bool = False,
     ) -> GenerateVideoResponse:
         self.calls.append(
             _ReservedVideoCall(
@@ -1273,6 +1445,7 @@ class _RecordingReservedVideoGenerator:
                 output_path=output_path,
                 prompt_wrap=prompt_wrap,
                 local_model_id=local_model_id,
+                risk_allowance=risk_allowance,
             )
         )
         return self._inner.generate_local_reserved(
@@ -1283,6 +1456,8 @@ class _RecordingReservedVideoGenerator:
             a2v_num_frames=a2v_num_frames,
             a2v_audio_duration_seconds=a2v_audio_duration_seconds,
             local_model_id=local_model_id,
+            risk_allowance=risk_allowance,
+            unmeasured_bet=unmeasured_bet,
         )
 
 
@@ -1312,8 +1487,10 @@ class _RecordingReservedVideoGeneratorStub:
         a2v_num_frames: int | None = None,
         a2v_audio_duration_seconds: float | None = None,
         local_model_id: str | None = None,
+        risk_allowance: bool | None = None,
+        unmeasured_bet: bool = False,
     ) -> GenerateVideoCompleteResponse:
-        del a2v_num_frames, a2v_audio_duration_seconds
+        del a2v_num_frames, a2v_audio_duration_seconds, unmeasured_bet
         self.calls.append(
             _ReservedVideoCall(
                 request=req,
@@ -1321,6 +1498,7 @@ class _RecordingReservedVideoGeneratorStub:
                 output_path=output_path,
                 prompt_wrap=prompt_wrap,
                 local_model_id=local_model_id,
+                risk_allowance=risk_allowance,
             )
         )
         if self._error is not None:
@@ -1409,7 +1587,7 @@ def test_text_to_video_rejects_capability_invalid_params_before_pipeline(
             "prompt": "a red fox",
             "model": "ltx-2.5-fast",
             "resolution": "1080p",
-            "duration": 8,
+            "duration": 12,
             "fps": 24,
         }
     )
@@ -1426,7 +1604,7 @@ def test_text_to_video_rejects_capability_invalid_params_before_pipeline(
 
     assert exc_info.value.code == "INVALID_VIDEO_GENERATION_SPEC"
     assert exc_info.value.detail == (
-        "Unsupported local text-to-video duration '8' for pipeline 'fast' "
+        "Unsupported local text-to-video duration '12' for pipeline 'fast' "
         "at resolution '1080p' and fps '24'"
     )
     assert fake_services.fast_video_pipeline.create_loras == []
@@ -1829,8 +2007,15 @@ def test_image_to_video_resolves_auto_aspect_ratio_from_start_frame(
 
 
 def test_image_to_video_auto_on_api_only_resolution_is_a_capability_failure(
-    test_state, tmp_path: Path
+    test_state, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Every API resolution has a local cell now, so simulate a resolution without one.
+    def no_local_cell(resolution: str, *, is_a2v: bool) -> list[str]:
+        raise KeyError(resolution)
+
+    monkeypatch.setattr(
+        "services.features.video.image_to_video.local_aspect_ratios", no_local_cell
+    )
     db = SqliteStore(test_state.config.app_data_dir)
     start = db.ingest_upload(str(_png(tmp_path / "start.png", (32, 32))))
     recorder = _RecordingReservedVideoGeneratorStub()
@@ -1841,7 +2026,7 @@ def test_image_to_video_auto_on_api_only_resolution_is_a_capability_failure(
             "prompt": "fox",
             "model": "ltx-2.5-fast",
             "aspectRatio": "auto",
-            "resolution": "1440p",
+            "resolution": "1080p",
         },
         inputs={"startFrame": {"assetId": start.id}},
     )
@@ -2050,10 +2235,16 @@ def test_audio_to_video_executes_advertised_1080p(
     assert call["num_frames"] == 185
 
 
-def test_audio_to_video_hears_only_the_1080p_prefix_of_a_longer_clip(
+def test_audio_to_video_hears_a_20s_clip_at_1080p_instead_of_the_kept_10s_prefix(
     test_state, fake_services, create_fake_model_files, tmp_path: Path
 ) -> None:
+    # 20s is the static 1080p ceiling. The budget filter used to shorten that
+    # cell to 10s and the run heard only the prefix. The card has to be able
+    # to run the static shape, or the budget gate refuses before inference.
     create_fake_model_files()
+    test_state.config.vram_gb = 80
+    test_state.config.vram_bytes = 80 * 1024**3
+    fake_services.gpu_info.free_vram_bytes = 80 * 1024**3
     test_state.state.app_settings.use_local_text_encoder = True
     db = SqliteStore(test_state.config.app_data_dir)
     audio = db.ingest_upload(str(_wav(tmp_path / "line.wav", duration_seconds=20.0)))
@@ -2062,7 +2253,7 @@ def test_audio_to_video_hears_only_the_1080p_prefix_of_a_longer_clip(
     generation = _generation(
         generation_id="a2v-1080p-prefix",
         feature="audio-to-video",
-        params=_a2v_params(resolution="1080p", numFrames=233),
+        params=_a2v_params(resolution="1080p", numFrames=473),
         inputs={"audio": {"assetId": audio.id}},
     )
     dest = tmp_path / "assets" / "a2v-1080p-prefix.mp4"
@@ -2077,8 +2268,8 @@ def test_audio_to_video_hears_only_the_1080p_prefix_of_a_longer_clip(
 
     call = fake_services.a2v_pipeline.generate_calls[0]
     assert call["audio_start_time"] == 0.0
-    assert call["num_frames"] == 233
-    assert call["audio_max_duration"] == 10.0
+    assert call["num_frames"] == 473
+    assert call["audio_max_duration"] == 20.0
 
 
 def test_audio_to_video_maps_2_3_offering_without_changing_active_settings(
@@ -2632,3 +2823,124 @@ def test_fake_generation_executor_block_raises_after_interrupt() -> None:
     thread.join(timeout=2.0)
     assert not thread.is_alive()
     assert isinstance(result.get("error"), GenerationCancelledError)
+
+
+class _OomExecutor(_SkipParamValidation):
+    """Fails with a torch-style OOM, bare or capability-wrapped (edit path)."""
+
+    def plan_outputs(self, generation: GenerationRecord) -> tuple[OutputPlan, ...]:
+        del generation
+        return (_RUNNER_VIDEO_PLAN,)
+
+    def execute(
+        self,
+        generation: GenerationRecord,
+        outputs: tuple[OutputAllocation, ...],
+    ) -> ExecutionOutcome:
+        del outputs
+        message = "CUDA out of memory. Tried to allocate 516.00 MiB."
+        if _prompt(generation) == "oom-wrapped":
+            raise CapabilityFailedError(message)
+        raise RuntimeError(message)
+
+
+def test_cuda_oom_records_cuda_oom_code_on_both_failure_paths(test_state) -> None:
+    """OOMs must not hide as generic failures — bare (torch) or
+    capability-wrapped (edit executors re-raise RuntimeError)."""
+    db = SqliteStore(test_state.config.app_data_dir)
+    http = FakeHTTPClient()
+    http.queue("post", FakeResponse(), FakeResponse(), FakeResponse(), FakeResponse())
+    analytics = AnalyticsService(
+        http=http,
+        task_runner=FakeTaskRunner(),
+        sink_url="http://127.0.0.1:9/analytics",
+        token="sink-token",
+    )
+    runner = QueueRunner(
+        db=db,
+        generation=test_state.generation,
+        executors=ExecutorRegistry({"text-to-video": _OomExecutor()}),
+        analytics=analytics,
+        gpu_info=FakeGpuInfo(),
+        checkpoint_drive_type="nvme",
+    )
+    generations: list[GenerationRecord] = []
+    for prompt in ("oom-generic", "oom-wrapped"):
+        spec = _spec(prompt)
+        spec["_analytics"] = {"client": "desktop"}
+        generations.append(db.insert_generation("text-to-video", spec))
+    runner.start()
+    try:
+        runner.wake()
+        assert wait_until(
+            lambda: all(
+                db.get_generation(g.id).status == "failed" for g in generations
+            )
+        )
+        for g in generations:
+            loaded = db.get_generation(g.id)
+            assert loaded is not None
+            assert loaded.error_code == "CUDA_OOM"
+        ended = [
+            call.json_payload["extraDetails"]
+            for call in http.calls
+            if call.json_payload is not None
+            and call.json_payload.get("eventName") == "generate_ended"
+        ]
+        assert len(ended) == 2
+        assert all(
+            isinstance(details, dict) and details.get("error_code") == "CUDA_OOM"
+            for details in ended
+        )
+    finally:
+        runner.stop()
+
+
+class _ThrowingGpuInfo(FakeGpuInfo):
+    def get_device_name(self) -> str | None:
+        raise RuntimeError("probe blew up")
+
+    def get_cuda_total_vram_bytes(self) -> int | None:
+        raise RuntimeError("probe blew up")
+
+
+def test_hardware_snapshot_failure_still_emits_start_and_succeeds(test_state) -> None:
+    """A throwing hardware probe must degrade the snapshot, never the run."""
+    db = SqliteStore(test_state.config.app_data_dir)
+    http = FakeHTTPClient()
+    http.queue("post", FakeResponse(), FakeResponse())
+    analytics = AnalyticsService(
+        http=http,
+        task_runner=FakeTaskRunner(),
+        sink_url="http://127.0.0.1:9/analytics",
+        token="sink-token",
+    )
+    runner = QueueRunner(
+        db=db,
+        generation=test_state.generation,
+        executors=ExecutorRegistry({"text-to-video": FakeGenerationExecutor()}),
+        analytics=analytics,
+        gpu_info=_ThrowingGpuInfo(),
+        checkpoint_drive_type="nvme",
+    )
+    spec = _spec("fox")
+    spec["_analytics"] = {"client": "desktop"}
+    generation = db.insert_generation("text-to-video", spec)
+    runner.start()
+    try:
+        runner.wake()
+        assert wait_until(
+            lambda: db.get_generation(generation.id).status == "succeeded"
+        )
+        started = [
+            call.json_payload["extraDetails"]
+            for call in http.calls
+            if call.json_payload is not None
+            and call.json_payload.get("eventName") == "generate_started"
+        ]
+        assert len(started) == 1
+        assert isinstance(started[0], dict)
+        assert "gpu_model" not in started[0]
+        assert started[0]["drive_type"] == "nvme"
+    finally:
+        runner.stop()

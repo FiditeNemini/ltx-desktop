@@ -214,11 +214,7 @@ export const electronAPISchemas = {
     input: z.object({ query: z.string().optional() }),
     output: logsResponse,
   },
-  getLogPath: {
-    input: z.object({}),
-    output: z.object({ logPath: z.string(), logDir: z.string() }),
-  },
-  openLogFolder: {
+  revealSessionLog: {
     input: z.object({}),
     output: z.boolean(),
   },

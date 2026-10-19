@@ -8,7 +8,7 @@ import pytest
 
 from _routes._errors import HTTPError
 from handlers.video_resolution import (
-    cap_to_1080p,
+    cap_edit_size,
     correct_frame_count,
     correct_resolution,
     generation_letterbox,
@@ -41,17 +41,25 @@ def test_resolve_target_resolution_keeps_1080p_after_div32(caplog):
     assert "Downscaling" not in caplog.text
 
 
-def test_cap_to_1080p_fits_4k_into_the_home_box():
-    assert cap_to_1080p(3840, 2160) == (1920, 1080)
-    assert cap_to_1080p(2160, 3840) == (1080, 1920)
+def test_cap_edit_size_fits_4k_into_the_home_box():
+    assert cap_edit_size(3840, 2160) == (1920, 1080)
+    assert cap_edit_size(2160, 3840) == (1080, 1920)
+    # Without highResVideoToVideo a 1440p clip also fits the 1080p box.
+    assert cap_edit_size(2560, 1440) == (1920, 1080)
+    # With highResVideoToVideo the box is 4K: a 4K clip keeps its size.
+    assert cap_edit_size(3840, 2160, high_res=True) == (3840, 2160)
+    # With highResVideoToVideo a 1440p clip keeps its size.
+    assert cap_edit_size(2560, 1440, high_res=True) == (2560, 1440)
     # Already at or below the local 1080p cell: no upscale.
-    assert cap_to_1080p(1920, 1088) == (1920, 1088)
-    assert cap_to_1080p(1280, 704) == (1280, 704)
+    assert cap_edit_size(1920, 1088) == (1920, 1088)
+    assert cap_edit_size(1280, 704) == (1280, 704)
 
 
 def test_home_edit_size_keeps_the_picture_and_leaves_padding_to_the_letterbox():
     # No request: 4K fits the 1080p cell. Height stays 1080; the letterbox pads it.
     assert resolve_home_edit_size(None, None, 3840, 2160) == (1920, 1080)
+    # With highResVideoToVideo the same source keeps its 4K size.
+    assert resolve_home_edit_size(None, None, 3840, 2160, high_res=True) == (3840, 2160)
     # 720p on a 1080p source stays 720. It is not snapped down to 704.
     assert resolve_home_edit_size(1280, 720, 1920, 1080) == (1280, 720)
     # A 4K request on a 1080p source cannot upscale past the source.
@@ -62,12 +70,15 @@ def test_home_edit_size_keeps_the_picture_and_leaves_padding_to_the_letterbox():
 
 def test_queued_home_path_still_caps_then_snaps():
     # 1920×1080 snaps height to ÷32. Local 1080p (1920×1088) is already on that grid.
-    capped = cap_to_1080p(3840, 2160)
+    capped = cap_edit_size(3840, 2160)
     assert resolve_target_resolution(None, *capped) == (1920, 1056)
-    local = cap_to_1080p(1920, 1088)
+    local = cap_edit_size(1920, 1088)
     assert resolve_target_resolution(None, *local) == (1920, 1088)
-    portrait = cap_to_1080p(2160, 3840)
+    portrait = cap_edit_size(2160, 3840)
     assert resolve_target_resolution(None, *portrait) == (1056, 1920)
+    # With highResVideoToVideo a 1440p clip keeps its size and is already on the grid.
+    high = cap_edit_size(2560, 1440, high_res=True)
+    assert resolve_target_resolution(None, *high) == (2560, 1440)
 
 
 def test_resolve_target_resolution_leaves_smaller_sources(caplog):

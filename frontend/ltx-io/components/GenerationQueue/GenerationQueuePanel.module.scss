@@ -511,3 +511,16 @@
     right: 12px;
   }
 }
+
+// Remote on a phone: the Queue button sits left of Contact Sales, so a panel
+// anchored to its right edge runs off the left of the screen. Center the panel
+// in the viewport. Top stays auto, so it opens just below the button.
+@media (max-width: shell.$shell-compact-breakpoint) {
+  :global([data-remote-shell]) .root[data-placement="header"] .panel {
+    position: fixed;
+    top: auto;
+    left: 0;
+    right: 0;
+    margin: var(--spacing-sm) auto 0;
+  }
+}

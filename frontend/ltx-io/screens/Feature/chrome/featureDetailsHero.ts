@@ -1,7 +1,9 @@
 import { HOME_FEATURE_MEDIA } from "@/components/home/home-media";
 import type { HomeFeatureId } from "@/lib/home-features";
+import { isIcLoraRecipeId } from "@/lib/ic-lora-recipes";
 import { isLoraRecipeId } from "@/lib/lora-recipes";
 
+import { IC_LORA_RECIPE_EXAMPLE_MEDIA } from "../icLoraRecipeExampleMedia";
 import { LORA_RECIPE_EXAMPLE_MEDIA } from "../loraRecipeExampleMedia";
 
 import type { FeatureDetailsHero } from "./featureChromeModel";
@@ -22,6 +24,10 @@ export function resolveFeatureDetailsHero(
       videoUrl: compare.result.videoUrl,
       compare,
     };
+  }
+
+  if (isIcLoraRecipeId(featureId)) {
+    return IC_LORA_RECIPE_EXAMPLE_MEDIA[featureId];
   }
 
   if (isLoraRecipeId(featureId)) {

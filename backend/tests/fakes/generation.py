@@ -13,7 +13,10 @@ from PIL import Image
 
 from api_types import (
     IcLoraRecipeInputs,
-    IcLoraRecipeStoredParams,
+    IcLoraVideoRecipeStoredParams,
+    IcLoraSheetInputs,
+    IcLoraSynthesizedStoredParams,
+    IcLoraTrackInputs,
     ExtendInputs,
     ExtendParams,
     ImageToVideoInputs,
@@ -25,7 +28,7 @@ from api_types import (
 from services.features.ic_lora_recipes import get_ic_lora_recipe
 from services.generation_interrupt import GenerationCancelledError, is_requested
 from services.features.video import require_supported_contract_version
-from services.generation_queue.types import OutputAllocation, OutputPlan
+from services.generation_queue.types import ExecutionOutcome, OutputAllocation, OutputPlan
 from services.records import GenerationRecord
 
 _VIDEO_PLAN = OutputPlan(
@@ -48,7 +51,8 @@ def _write_valid_mp4(path: Path) -> None:
         str(path), fps=8, codec="libx264", macro_block_size=None
     )
     frame = np.zeros((16, 16, 3), dtype=np.uint8)
-    for _ in range(8):
+    # 9 frames: the shortest clip extend accepts as a source.
+    for _ in range(9):
         writer.append_data(frame)
     writer.close()
 
@@ -92,9 +96,15 @@ class FakeGenerationExecutor:
         require_supported_contract_version(contract_version)
         inputs = spec.get("inputs")
         params = _spec_params(spec)
-        if isinstance(inputs, Mapping) and "video" in inputs:
+        if isinstance(inputs, Mapping) and "images" in inputs:
+            IcLoraSynthesizedStoredParams.model_validate(params)
+            IcLoraSheetInputs.model_validate(inputs)
+        elif isinstance(inputs, Mapping) and "paths" in inputs:
+            IcLoraSynthesizedStoredParams.model_validate(params)
+            IcLoraTrackInputs.model_validate(inputs)
+        elif isinstance(inputs, Mapping) and "video" in inputs:
             if get_ic_lora_recipe(self._feature or "") is not None:
-                IcLoraRecipeStoredParams.model_validate(params)
+                IcLoraVideoRecipeStoredParams.model_validate(params)
                 IcLoraRecipeInputs.model_validate(inputs)
             elif self._feature == "retake" or (
                 self._feature is None and "startTime" in params
@@ -120,7 +130,7 @@ class FakeGenerationExecutor:
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome:
         if self._seen_prompts is not None:
             prompt = _spec_params(generation.spec).get("prompt")
             self._seen_prompts.append(prompt if isinstance(prompt, str) else "")
@@ -132,3 +142,4 @@ class FakeGenerationExecutor:
             raise GenerationCancelledError()
         for allocation in outputs:
             _write_valid_output(allocation)
+        return ExecutionOutcome()

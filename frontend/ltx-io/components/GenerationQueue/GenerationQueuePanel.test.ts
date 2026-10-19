@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import { ApiResultError } from "../../lib/unwrapApiResult.ts";
 import {
   formatActiveQueueProgress,
+  formatActiveQueueProgressDetail,
   getQueuePanelState,
   isQueueReorderConflict,
   progressPercentByGenerationId,
@@ -118,15 +119,7 @@ describe("GenerationQueuePanel queue behavior", () => {
     );
   });
 
-  it("formats active progress as percent, derived from steps when available", () => {
-    assert.equal(
-      formatActiveQueueProgress({
-        progress: 42,
-        currentStep: null,
-        totalSteps: null,
-      }),
-      "42%",
-    );
+  it("formats active progress as a percent derived from denoise steps", () => {
     assert.equal(
       formatActiveQueueProgress({
         progress: 42,
@@ -135,6 +128,28 @@ describe("GenerationQueuePanel queue behavior", () => {
       }),
       "27%",
     );
+  });
+
+  it("shows no percent before a denoise step, the same as the result placeholder", () => {
+    const loading = { progress: 5, currentStep: null, totalSteps: null };
+    const encoding = { progress: 10, currentStep: null, totalSteps: null };
+    const stepZero = { progress: 15, currentStep: 0, totalSteps: 8 };
+
+    for (const phase of [loading, encoding, stepZero]) {
+      assert.equal(formatActiveQueueProgress(phase), null);
+      assert.equal(formatActiveQueueProgressDetail(phase), "Waiting for progress…");
+    }
+  });
+
+  it("shows the same percent as the placeholder once a step has run", () => {
+    const progress = { progress: 10, currentStep: 3, totalSteps: 10 };
+    const placeholder = progressPercentByGenerationId({
+      active: { generation: { id: "a" }, progress },
+      queued: [],
+    }).get("a");
+
+    assert.equal(formatActiveQueueProgress(progress), `${placeholder}%`);
+    assert.equal(formatActiveQueueProgressDetail(progress), "Step 3 of 10 (30%)");
   });
 
   it("caps a completed step count at 95 percent", () => {
@@ -182,7 +197,7 @@ describe("GenerationQueuePanel queue behavior", () => {
     );
   });
 
-  it("opens a finished job on its feature result", () => {
+  it("opens any queue job on its feature result, or returns null for an unknown feature", () => {
     assert.deepEqual(
       resultLocationForFeature("text-to-video", "job-a", [
         { id: "text-to-video", path: "/text-to-video" },

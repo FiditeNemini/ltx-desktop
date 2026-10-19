@@ -50,6 +50,13 @@ const videoRequest = {
   fileInput: null,
 };
 
+const anyMediaRequest = {
+  title: "Attach media",
+  accept: `${IMAGE_ACCEPT},${AUDIO_OR_VIDEO_ACCEPT}`,
+  extensions: [...IMAGE_EXTENSIONS, ...AUDIO_OR_VIDEO_EXTENSIONS],
+  fileInput: null,
+};
+
 describe("isAcceptedMediaFile", () => {
   it("accepts a listed image mime for an image request", () => {
     assert.equal(
@@ -162,6 +169,7 @@ describe("requestExtractsAudioFromVideo", () => {
     assert.equal(requestExtractsAudioFromVideo(videoRequest), false);
     assert.equal(requestExtractsAudioFromVideo(audioRequest), false);
     assert.equal(requestExtractsAudioFromVideo(imageRequest), false);
+    assert.equal(requestExtractsAudioFromVideo(anyMediaRequest), false);
   });
 });
 
@@ -171,6 +179,7 @@ describe("describeMediaFilter", () => {
     assert.equal(describeMediaFilter(audioRequest), "Audio");
     assert.equal(describeMediaFilter(audioOrVideoRequest), "Audio or video");
     assert.equal(describeMediaFilter(videoRequest), "Video");
+    assert.equal(describeMediaFilter(anyMediaRequest), "Media");
   });
 
   it("falls back to a generic name for unknown accept lists", () => {

@@ -23,6 +23,7 @@ import { ApiClient, type ApiSuccessOf } from "../lib/api-client";
 import { LtxApiKeyInput } from "./LtxApiKeyInput";
 import { ApiKeySettingsBlock } from "./settings/ApiKeySettingsBlock";
 import { AboutSettingsSection } from "./settings/AboutSettingsSection";
+import { AssistantSettingsSection } from "./settings/AssistantSettingsSection";
 import { CudaPerformanceSection } from "./settings/CudaPerformanceSection";
 import { EnhanceSettingsSection } from "./settings/EnhanceSettingsSection";
 import { LegacyTextEncodingSection } from "./settings/LegacyTextEncodingSection";
@@ -204,6 +205,7 @@ export function SettingsScreen({
     refreshSettings,
     forceApiGenerations,
     cudaAvailable,
+    saveGeminiModel,
   } = useAppSettings();
   const onSettingsChange = (next: AppSettings) => updateSettings(next);
   const [activeTab, setActiveTab] = useState<TabId>("general");
@@ -350,13 +352,7 @@ export function SettingsScreen({
   const tabBodyClassName = pageLayoutStyles.modalMainPane;
 
   useEffect(() => {
-    if (
-      !active ||
-      (initialScrollAnchor !== "promptEnhancer" &&
-        initialScrollAnchor !== "textEncoding")
-    ) {
-      return;
-    }
+    if (!active || !initialScrollAnchor) return;
     setActiveTab("general");
     // Let General paint before measuring: the row's host div only exists once the tab
     // renders, and a same-tick scroll would land on the previous tab's layout.
@@ -492,6 +488,12 @@ export function SettingsScreen({
                   active={active}
                   settings={settings}
                   onOpenLtxApiKeys={() => ltxApiKey.openAndFocus()}
+                />
+              </div>
+
+              <div id={settingsSectionElementId("assistant")}>
+                <AssistantSettingsSection
+                  onOpenGeminiApiKeys={() => geminiApiKey.openAndFocus()}
                 />
               </div>
 
@@ -698,9 +700,9 @@ export function SettingsScreen({
                       const requestId = ++geminiModelSaveSeq.current;
                       setResolvedGeminiModel(geminiModel);
                       void (async () => {
-                        const result = await ApiClient.updateSettings({ geminiModel });
+                        const ok = await saveGeminiModel(geminiModel);
                         if (requestId !== geminiModelSaveSeq.current) return;
-                        if (!result.ok) {
+                        if (!ok) {
                           setResolvedGeminiModel(previous);
                           return;
                         }

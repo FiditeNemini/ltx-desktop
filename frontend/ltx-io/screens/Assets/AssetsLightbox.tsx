@@ -165,23 +165,23 @@ function LightboxDeleteButton({
 export function AssetsLightbox({
   items,
   activeAssetId,
-  hasNextPage,
-  isFetchingNextPage,
-  onFetchNextPage,
-  onActiveAssetIdChange,
+  hasNextPage = false,
+  isFetchingNextPage = false,
+  onFetchNextPage = async () => undefined,
+  onActiveAssetIdChange = () => undefined,
   onClose,
   onDeleteAsset,
   pendingDeleteAssetIds,
 }: {
   items: ExploreListedAsset[];
   activeAssetId: string;
-  hasNextPage: boolean;
-  isFetchingNextPage: boolean;
-  onFetchNextPage: () => Promise<unknown>;
-  onActiveAssetIdChange: (assetId: string) => void;
+  hasNextPage?: boolean;
+  isFetchingNextPage?: boolean;
+  onFetchNextPage?: () => Promise<unknown>;
+  onActiveAssetIdChange?: (assetId: string) => void;
   onClose: () => void;
-  onDeleteAsset: (assetId: string) => Promise<void>;
-  pendingDeleteAssetIds: ReadonlySet<string>;
+  onDeleteAsset?: (assetId: string) => Promise<void>;
+  pendingDeleteAssetIds?: ReadonlySet<string>;
 }) {
   const runtime = useExploreRuntime();
   const download = useAssetDownload();
@@ -364,11 +364,11 @@ export function AssetsLightbox({
               Fullscreen preview of {asset.name}
             </Dialog.Description>
             <div className={styles.header} data-lightbox-chrome>
-              {runtime.deleteAsset !== null ? (
+              {runtime.deleteAsset !== null && onDeleteAsset ? (
                 <LightboxDeleteButton
                   asset={asset}
                   onDelete={onDeleteAsset}
-                  isDeletePending={pendingDeleteAssetIds.has(asset.id)}
+                  isDeletePending={pendingDeleteAssetIds?.has(asset.id) ?? false}
                 />
               ) : null}
               {fileAction.kind === "reveal" ? (

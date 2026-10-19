@@ -1,28 +1,47 @@
 import { useEffect, useRef, type RefObject } from "react";
 
-import { getScrollParent, scrollTopToCenter } from "./useResultsFeedScroll";
+import {
+  getScrollParent,
+  isResultMissing,
+  scrollTopToCenter,
+} from "./useResultsFeedScroll";
 
 export function useScrollToResultParam(
   feedRootRef: RefObject<HTMLElement | null>,
   generations: readonly unknown[],
   resultId: string | null,
   reduceMotion: boolean | null,
+  listSettled: boolean,
   onSettled: (resultId: string) => void,
+  onMissing: (resultId: string) => void,
 ): void {
   const scrolledResultIdRef = useRef<string | null>(null);
+  const missingResultIdRef = useRef<string | null>(null);
   const onSettledRef = useRef(onSettled);
   onSettledRef.current = onSettled;
+  const onMissingRef = useRef(onMissing);
+  onMissingRef.current = onMissing;
 
   useEffect(() => {
     if (resultId == null) {
       scrolledResultIdRef.current = null;
+      missingResultIdRef.current = null;
       return;
     }
     if (scrolledResultIdRef.current === resultId) return;
     const match = feedRootRef.current?.querySelector(
       `[data-generation-id="${CSS.escape(resultId)}"]`,
     );
-    if (!(match instanceof HTMLElement)) return;
+    if (!(match instanceof HTMLElement)) {
+      if (
+        isResultMissing({ resultId, found: false, listSettled }) &&
+        missingResultIdRef.current !== resultId
+      ) {
+        missingResultIdRef.current = resultId;
+        onMissingRef.current(resultId);
+      }
+      return;
+    }
     const scroller = getScrollParent(match);
     scrolledResultIdRef.current = resultId;
     const settle = () => onSettledRef.current(resultId);
@@ -55,5 +74,5 @@ export function useScrollToResultParam(
     }
     scroller.addEventListener("scrollend", settle, { once: true });
     return () => scroller.removeEventListener("scrollend", settle);
-  }, [feedRootRef, generations, reduceMotion, resultId]);
+  }, [feedRootRef, generations, listSettled, reduceMotion, resultId]);
 }

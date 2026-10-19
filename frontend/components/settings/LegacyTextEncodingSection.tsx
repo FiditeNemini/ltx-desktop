@@ -1,6 +1,5 @@
-import { clsx } from "clsx";
 import { AlertCircle } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { flushSync } from "react-dom";
 
 import { Text } from "@/ds/Text/Text";
@@ -13,7 +12,7 @@ import { logger } from "../../lib/logger";
 import { SettingsHintWarning } from "./encodingModelDownloads";
 import {
   SettingsNumberInput,
-  SettingsOptionCard,
+  SettingsChoiceCard,
   SettingsStack,
   SettingsSubsection,
 } from "./SettingsContent";
@@ -114,7 +113,7 @@ export function LegacyTextEncodingSection({
     >
       <SettingsStack>
         <div className={contentStyles.textEncodingOptionRow}>
-          <TextEncodingChoiceCard
+          <SettingsChoiceCard
             selected={!localEncoderSelected}
             disabled={!apiEncodingSupported}
             onClick={selectLtxApiEncoding}
@@ -151,7 +150,7 @@ export function LegacyTextEncodingSection({
             }
           />
 
-          <TextEncodingChoiceCard
+          <SettingsChoiceCard
             selected={localEncoderSelected}
             onClick={selectLocalEncoding}
             title="Local encoder"
@@ -183,58 +182,6 @@ export function LegacyTextEncodingSection({
           )}
       </SettingsStack>
     </SettingsSubsection>
-  );
-}
-
-function TextEncodingChoiceCard({
-  selected,
-  disabled = false,
-  onClick,
-  title,
-  badge,
-  description,
-  footer,
-}: {
-  selected: boolean;
-  disabled?: boolean;
-  onClick: () => void;
-  title: string;
-  badge?: ReactNode;
-  description: string;
-  footer?: ReactNode;
-}) {
-  return (
-    <div className={contentStyles.textEncodingOptionCell}>
-      <SettingsOptionCard
-        selected={selected}
-        disabled={disabled}
-        onClick={onClick}
-        activateOnPointerDown
-        applySelectedClass={false}
-        className={clsx(
-          contentStyles.textEncodingCard,
-          selected && contentStyles.textEncodingCardSelected,
-        )}
-        innerClassName={contentStyles.textEncodingCardHead}
-        footerClassName={contentStyles.textEncodingCardFooter}
-        footer={footer}
-      >
-        <span
-          className={clsx(
-            contentStyles.textEncodingRadio,
-            selected && contentStyles.textEncodingRadioSelected,
-          )}
-          aria-hidden
-        />
-        <div className={contentStyles.textEncodingCardCopy}>
-          <div className={contentStyles.textEncodingCardTitleRow}>
-            <span className={contentStyles.textEncodingCardTitle}>{title}</span>
-            {badge}
-          </div>
-          <p className={contentStyles.textEncodingCardDescription}>{description}</p>
-        </div>
-      </SettingsOptionCard>
-    </div>
   );
 }
 

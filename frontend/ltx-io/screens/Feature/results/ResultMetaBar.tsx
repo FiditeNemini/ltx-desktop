@@ -65,7 +65,6 @@ export function ResultMetaBar({ generation }: { generation: Generation }) {
   return (
     <Flex
       direction="row"
-      gap="lg"
       align="center"
       justify="between"
       className={styles.container}

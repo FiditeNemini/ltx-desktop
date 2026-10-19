@@ -17,6 +17,8 @@ export type TextFieldProps = {
   disabled?: boolean;
   maxLength?: number;
   id?: string;
+  /** Accessible name for fields that have no visible label. */
+  "aria-label"?: string;
   /** Native input name — helps browser / password-manager autofill. */
   name?: string;
   /**
@@ -45,6 +47,7 @@ export const TextField = forwardRef<HTMLInputElement, TextFieldProps>(function T
     disabled,
     maxLength,
     id,
+    "aria-label": ariaLabel,
     name,
     autoComplete = "off",
     debounceDelay = 0,
@@ -78,6 +81,7 @@ export const TextField = forwardRef<HTMLInputElement, TextFieldProps>(function T
   return (
     <input
       id={id}
+      aria-label={ariaLabel}
       name={name}
       data-testid={dataTestId}
       className={clsx(

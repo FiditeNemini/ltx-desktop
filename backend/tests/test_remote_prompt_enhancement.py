@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from PIL import Image
 from starlette.testclient import TestClient
 
 from remote.app import create_remote_app
 from tests.fakes import FakeResponse
 from tests.http_error_assertions import assert_http_error
+from tests.lora_catalog_helpers import add_ic_lora
+from tests.video_fixtures import write_mp4
 
 AUTH = {"Authorization": "Bearer pair-token"}
 _LOCAL_ENHANCER_MODEL_ID = "ltx-2.3-22b-distilled-1.1"
@@ -239,3 +242,88 @@ def test_remote_enhance_does_not_leak_path_when_image_is_invalid(
     assert str(asset_path) not in body["message"]
     assert "/" not in body["message"]
     assert "\\" not in body["message"]
+
+
+def test_remote_enhance_resolves_a_video_asset_id_for_an_ic_lora_with_no_prompt(
+    test_state, fake_services, create_fake_model_files, tmp_path: Path
+) -> None:
+    create_fake_model_files(model_id=_LOCAL_ENHANCER_MODEL_ID)
+    add_ic_lora(fake_services, id="day-to-night", name="Day to Night")
+    fake_services.prompt_enhancer_pipeline.enhanced_prompt = "a night scene from the stills"
+    video = write_mp4(tmp_path / "clip.mp4", seconds=6, fps=12)
+    app = create_remote_app(handler=test_state, remote_token="pair-token")
+    with TestClient(app) as client:
+        uploaded = client.post(
+            "/api/assets/upload",
+            headers=AUTH,
+            files={"file": ("clip.mp4", video.read_bytes(), "video/mp4")},
+        )
+        assert uploaded.status_code == 200
+        r = client.post(
+            "/api/enhance-prompt",
+            headers=AUTH,
+            json={
+                "prompt": "",
+                "provider": "local",
+                "icLoraId": "day-to-night",
+                "videoAssetId": uploaded.json()["id"],
+            },
+        )
+    assert r.status_code == 200
+    assert r.json()["enhancedPrompt"] == "a night scene from the stills"
+    call = fake_services.prompt_enhancer_pipeline.enhance_video_frames_calls[0]
+    assert call["role"] == "driving"
+    assert call["frames_existed"]
+
+
+def test_remote_enhance_passes_a_retake_window_on_so_the_phone_matches_the_desktop(
+    test_state, fake_services, create_fake_model_files, tmp_path: Path
+) -> None:
+    create_fake_model_files(model_id=_LOCAL_ENHANCER_MODEL_ID)
+    video = write_mp4(tmp_path / "clip.mp4", seconds=6, fps=12)
+    app = create_remote_app(handler=test_state, remote_token="pair-token")
+    with TestClient(app) as client:
+        uploaded = client.post(
+            "/api/assets/upload",
+            headers=AUTH,
+            files={"file": ("clip.mp4", video.read_bytes(), "video/mp4")},
+        )
+        r = client.post(
+            "/api/enhance-prompt",
+            headers=AUTH,
+            json={
+                "prompt": "the woman turns away",
+                "provider": "local",
+                "videoAssetId": uploaded.json()["id"],
+                "replacedWindow": {"start": 2, "end": 4},
+            },
+        )
+
+    assert r.status_code == 200
+    times = fake_services.prompt_enhancer_pipeline.enhance_video_frames_calls[0]["frame_times"]
+    assert not any(2 < time < 4 for time in times)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"icLoraId": "day-to-night", "loraCatalogIds": ["a"]},
+        {"icLoraId": "day-to-night", "videoAssetId": "v", "replacedWindow": {"start": 1, "end": 2}},
+        {"replacedWindow": {"start": 1, "end": 2}},
+    ],
+    ids=["ic-lora-with-lora", "window-with-ic-lora", "window-without-video"],
+)
+def test_remote_enhance_rejects_a_bad_selection_mix_with_422_not_500(
+    test_state, fake_services, body: dict[str, object]
+) -> None:
+    add_ic_lora(fake_services, id="day-to-night", name="Day to Night")
+    app = create_remote_app(handler=test_state, remote_token="pair-token")
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/enhance-prompt",
+            headers=AUTH,
+            json={"prompt": "a cat", "provider": "local", **body},
+        )
+
+    assert r.status_code == 422
+    assert "validation error" not in r.text

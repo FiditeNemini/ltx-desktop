@@ -9,6 +9,7 @@ from frame_math import AutoDurationSpec
 
 if TYPE_CHECKING:
     import torch
+    from ltx_pipelines.utils.types import OffloadMode
 
 
 class FastVideoPipeline(Protocol):
@@ -23,6 +24,7 @@ class FastVideoPipeline(Protocol):
         streaming_prefetch_count: int | None,
         loras: list[tuple[str, float]] | None = None,
         *,
+        offload_mode: OffloadMode,
         video_vae_path: str | None = None,
         audio_vae_path: str | None = None,
         duration_head_path: str | None = None,
@@ -42,6 +44,7 @@ class FastVideoPipeline(Protocol):
         *,
         guide_all_images: bool = False,
         skip_stage_2: bool = False,
+        chunk_pixel_frames: int | None = None,
     ) -> None:
         ...
 

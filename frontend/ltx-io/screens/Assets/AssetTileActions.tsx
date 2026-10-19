@@ -1,6 +1,6 @@
 import { useRef, type ReactNode } from "react";
 
-import { FolderOpen } from "lucide-react";
+import { FolderOpen, MessageSquare } from "lucide-react";
 import { Button } from "@ds/Button/Button";
 import { Text } from "@ds/Text/Text";
 import { Tooltip } from "@ds/Tooltip/Tooltip";
@@ -240,6 +240,10 @@ export function AssetTileActions({
   if (runtime.deleteAsset !== null) {
     return (
       <div className={styles.actions}>
+        {runtime.askAssistant && (
+          <OverlayButton label="Ask assistant" icon={<MessageSquare />}
+            onClick={() => runtime.askAssistant?.(asset.id)} />
+        )}
         <OverlayButton
           label={asset.in_use ? "Used as an input" : "Delete file"}
           icon={<RemoveIcon />}

@@ -1411,7 +1411,9 @@
         "audio_mode": "source"
       },
       "enhancement_examples": [
-        "An empty clean plate of the exact same location: identical background, environment, structures and lighting as the source video, with no people, no humans, no figures, and no body parts such as arms, hands or legs anywhere in the frame."
+        "An empty clean plate of the exact same scene: a colorful wooden fishing boat with identical painted hull, fishing nets, ropes and gear floating on calm blue sea, with the same distant boat, rocky breakwater shoreline, water and clear sky as the source video, but with no one aboard. No people, no humans, no men, no fishermen, no figures, and no body parts such as heads, arms, hands or legs anywhere in the frame, on the boats or in the background. No cast shadows or reflections of people on the boat or water. Static photorealistic footage, natural daylight, high detail. Keep the boats, nets and background intact.",
+        "An empty clean plate of the exact same location: a modern open-plan office with identical desks, office chairs, monitor dividers, concrete pillar, exposed ceiling with pipes and acoustic panels, large windows with city view, floor and lighting as the source video. No people, no humans, no figures, and no body parts such as faces, arms, hands or legs anywhere in the frame. No backpack, no ID badge, no lanyard anywhere in the frame. No cast shadows from people on the floor or walls. Static photorealistic footage, natural indoor light, high detail.",
+        "An empty clean plate of the exact same location: an elevated train station platform with identical concrete floor, blue tactile edge strip, metal-and-glass canopy roof, train tracks, trackside buildings, storefronts, advertising tower and sunset sky as the source video. No people, no humans, no figures, and no body parts such as arms, hands or legs anywhere in the frame. No backpack, no tripod, no hat anywhere in the frame. No train, no subway car, no cars, no vans, no vehicles anywhere in the frame. No cast shadows from people, trains or vehicles. Static photorealistic footage, natural daylight, high detail."
       ]
     },
     {
@@ -2025,7 +2027,8 @@
     {
       "id": "ingredients",
       "supported_models": [
-        "LTX-2.3"
+        "LTX-2.3",
+        "LTX-2.5"
       ],
       "name": "Ingredients",
       "description": "Keep a subject consistent across a video from a reference sheet.",
@@ -2064,7 +2067,8 @@
         "url": "https://github.com/Lightricks/LTX-2/blob/main/LICENSE"
       },
       "input": {
-        "kind": "image"
+        "kind": "image",
+        "max_count": 10
       },
       "preprocessing": [
         {
@@ -2108,7 +2112,7 @@
           "title": "Prompt",
           "body": [
             "Two labelled parts, no caps trigger — first describe each panel of the sheet, then describe the action: 'Reference sheet: {panels — characters, props, settings}. Generated video: {the action}.'",
-            "Example: Reference sheet: a 3D owl mascot shown from several angles; a bright grocery aisle. Generated video: a high-quality 3D animated commercial outside a modern 'FreshMart' store."
+            "Be detailed in both parts. Describe each panel's look, clothing and colors. Describe the shot as a full scene: camera, what each character does and says, lighting and background."
           ]
         },
         {
@@ -2127,13 +2131,14 @@
         "resolution_factor": 1.5,
         "audio_mode": "generated"
       },
-      "prompt_template": {
-        "template": "Reference sheet: {panels}. Generated video: {action}.",
-        "placeholders": {
-          "panels": {},
-          "action": {}
-        }
-      }
+      "enhancement_examples": [
+        "Reference sheet: Top Row Left (Setting): A modern \"FreshMart\" grocery store exterior with a grey facade, a prominent green awning displaying the FreshMart logo (a leaf inside a shopping cart), and a white delivery car parked in front on a dark asphalt lot under a bright, partly cloudy sky. Top Row Middle (Setting): A long, brightly lit interior aisle of a grocery store fully stocked with various colorful packaged products on tall shelves, with polished floors reflecting the overhead fluorescent lights. Top Row Right (Character): A 3D animated owl mascot shown from multiple angles (front, sides, back, 3/4 view). The owl has grey and white feathers, large expressive eyes, and wears a green short-sleeved polo shirt, a dark green apron with the FreshMart logo, and a green visor cap. Middle Row Left (Props): Dark blue reusable shopping tote bags with bright green handles and trim. One features the FreshMart logo, and another features the text \"FRESH CHOICES, BETTER LIVING\". Middle Row Right (Props): Multiple angles (front, back, side) of a white 5-door FreshMart delivery hatchback car featuring the FreshMart logo on the side doors and a roof sign. Bottom Row Left (Props): Close-up angles of the FreshMart tote bags, showing their sturdy boxy shape, green fabric trim, and folded handles. Bottom Row Right (Logo): The standalone FreshMart logo featuring a minimalist shopping cart with a green leaf design above bold green text. Generated video: A bright, high-quality 3D animated commercial shot set outside a modern \"FreshMart\" grocery store exterior during a sunny day. The camera holds a steady, static wide shot. In the foreground, standing on the grey pavement, is a cheerful 3D animated owl mascot with grey and white feathers, large expressive eyes, and a small yellow beak. The owl is dressed in a green short-sleeved polo shirt, a dark green apron featuring the FreshMart logo, and a matching green visor cap. Parked directly behind and slightly to the right of the owl is a white 5-door FreshMart delivery hatchback car with the store's leaf-and-cart logo on the side doors and a small roof sign. The store's grey facade and prominent green awning form the background, with the sliding glass entrance doors visible behind the character. The owl warmly spreads its wings outward and upward in an inviting, energetic welcoming gesture, blinking its large eyes naturally. It looks directly into the camera lens with a joyful, enthusiastic expression and opens its beak, confidently delivering its lines: \"Welcome to FreshMart, where we're always ready to help you load up with everything you need. Fresh choices, better living!\" The lighting is crisp and commercial, casting soft natural shadows on the asphalt and highlighting the clean, vibrant green accents of the store.",
+        "Reference sheet: Top Row (Character): A 3D animated young, athletic man shown from multiple turnaround angles. He has short brown hair and brown eyes. He wears a teal hooded sleeveless vest with a high collar over a dark grey undershirt, brown leather bracers on his forearms, a cross-body leather satchel strap, brown pants with thick brown boots, and a glowing blue crystal pendant necklace. Middle Row Left (Prop): A casual short-sleeved button-up Hawaiian shirt in a light cream color, covered with large green tropical pine and palm leaf patterns. Middle Row Right (Prop): A brightly colored tropical soda can shown from three angles. The can has a yellow top transitioning to a teal bottom with abstract wave designs and a silver pull tab. Bottom Row Left (Prop): A magical wooden staff made of dark brown twisting wood. The top holds a large, sharp, glowing blue crystal bound tightly to the wood by dark leather straps. Bottom Row Right (Setting): A bright, sunny open-air tropical beach bar with wooden railings, sturdy wooden pillars, and warm hanging lantern lights. The background features a pristine white sand beach, lush green trees, and clear turquoise ocean water beneath a bright blue sky. Generated video: A vibrant, high-quality 3D animated cinematic shot set inside a sun-drenched, open-air tropical beach bar. The camera frames a steady medium shot of the young, athletic man with short brown hair leaning casually near a sturdy wooden pillar. He is dressed in the light cream Hawaiian shirt covered in green palm leaf patterns, layered under the teal hooded sleeveless vest, wearing brown leather bracers and the glowing blue crystal pendant necklace. In his right hand, he firmly grips the twisting dark wooden staff with the glowing blue crystal at the top. In his left hand, he holds the brightly colored yellow and teal tropical soda can. He takes a slow, deep breath of the ocean air, looking slightly off-camera before turning his warm brown eyes forward. A soft, contented smile spreads across his face as he slightly raises the soda can in a subtle toasting motion. He speaks smoothly in a relaxed and satisfied way: \"Nothing beats a cold drink after a long quest.\" He pauses for a beat, his smile widening as he gently shakes the can, adding: \"Pure magic!\" The background features a shallow depth of field, showcasing the pristine white sand, lush green trees, and clear turquoise ocean water. Warm, bright daylight illuminates his face, casting natural shadows, while a gentle ocean breeze slightly rustles his hair and the collar of his shirt.",
+        "Reference sheet: Top Row Left (Character): A young woman with long, slightly wavy brown hair parted down the middle. She has a warm complexion and is wearing a dark olive green ribbed tank top and dark, baggy cargo pants with large side pockets. She is shown from front, side, and back profiles with a relaxed expression. Top Row Right (Prop): A sleek, modern black video game controller shown from top, front, and angled perspectives, featuring standard joysticks, a D-pad, and action buttons. Middle Row Right (Prop): A dark olive green short-sleeved t-shirt featuring a stylized retro graphic print of a bright orange sun setting behind dark silhouette pine trees and green rolling hills. Bottom Row (Setting): A wide shot of a cozy, dimly lit bedroom at night. The room features wood-paneled accents, a neatly made low bed with green bedding, string lights on the wall, and a gaming desk setup with dual monitors. A striking circular wall light emitting a warm yellow-orange ring illuminates the space above the bed, casting a neon glow over the dark, moody room. Generated video: A cozy, cinematic scene inside a dimly lit bedroom at night with rich wood-paneled accents. The camera holds a steady, static medium shot. A young woman with long, slightly wavy brown hair parted down the middle and a warm complexion is sitting on the edge of her neatly made low bed with green bedding. She is gripping the sleek, modern black video game controller tightly in both hands, her thumbs actively moving on the thumbsticks. She wears the dark olive green short-sleeved t-shirt featuring the stylized retro graphic print of a bright orange sun setting behind silhouette pine trees, paired with her dark, baggy cargo pants. The room is bathed in deep, atmospheric shadows, heavily illuminated by the striking circular wall light emitting a warm yellow-orange ring above her bed, casting a vivid neon glow across her face. Her initial expression is one of intense focus and determination, but she suddenly relaxes as a triumphant smile breaks across her face. She throws her head back slightly, letting out a joyful, energetic laugh, and speaks to her off-screen opponent in a smug and playful way: \"Oh, you thought you had me cornered, didn't you?\" She pauses for a split second, leaning forward slightly as her smile widens, and exclaims: \"Not today!\" The background gaming desk setup with dual monitors remains softly blurred, emphasizing her vivid expressions under the warm ambient neon light.",
+        "Reference sheet: Top Row Left (Character): A cute 3D animated hedgehog with a round, plump body, soft brown spiky fur on its back, a light tan belly, and a friendly, curious face. Top Row Middle (Character): A 3D animated grey and white rabbit shown from multiple angles. The rabbit has tall ears with pink insides, large expressive blue eyes, a small pink nose, and soft, fluffy fur. Top Row Right (Character): Multiple turnaround angles (front, back, sides) of the same brown hedgehog character. Middle Row Left (Prop): A green and white rectangular sign that reads \"Greenfield Home & Garden\" with a small leaf logo. Next to it is a digital menu board listing garden services. Middle Row Right (Props): A collection of bright green gardening tools against a white background, including a boxy green retractable wall-mounted hose reel, a handheld leaf blower, and a pair of sharp pruning shears with green handles. Bottom Row (Setting): The interior of a bright, spacious retail garden center. Aisles of metal shelving are heavily stocked with various potted green plants, bags of organic soil, and boxed gardening supplies, with hanging green aisle signs visible overhead. Generated video: A bright, high-quality 3D animated commercial shot set inside the bright, spacious retail garden center. The camera frames a steady, well-lit medium shot of a wooden display counter. Sitting in the center of the counter is the boxy green retractable wall-mounted hose reel. Standing on the counter to the left of the hose reel is the cute 3D animated hedgehog with a round, plump body and soft brown spiky fur. Standing on the counter to the right is the 3D animated grey and white rabbit with tall ears, a small pink nose, and large expressive blue eyes. The hedgehog gestures warmly with its small paws, looking directly at the camera with a friendly, welcoming expression, and says cheerfully: \"Welcome to Greenfield! We have the best new garden tools!\". The rabbit then leans in slightly, raising a fluffy paw with an eager, wide-eyed expression, and interrupts to asks in a curious way: \"Hold on... Does this dirt make carrots grow instantly? Asking for a friend.\". The scene features vibrant, cinematic Pixar-style lighting that highlights the lush potted green plants on the metal shelving in the softly blurred background, while the characters display smooth, lifelike micro-movements and natural breathing.",
+        "Reference sheet: Top Row Left (Character): A young man with dark, messy curly hair and a mustache. He has a warm, natural skin tone and is wearing a black collared overshirt left unbuttoned over a simple white t-shirt. He has a relaxed, subtle smile. Top Row Right (Character): Multiple turnaround angles of the same man in the black overshirt, showing his full body wearing dark pants and dark casual shoes. Middle Row Left (Prop): A black rectangular sign displaying the white \"SOUNDWAVE\" logo alongside a stylized circular audio wave icon. Middle Row Right (Prop): Close-up angles of a pair of premium black over-ear wireless headphones with thick cushioned earcups and a smooth, matte black headband. To the far right is the sleek, tall black retail packaging box for the headphones. Bottom Row (Setting): A wide view of a modern, upscale \"Soundwave\" audio electronics retail store. The store features warm wood accents, large windows letting in natural sunlight, neat wooden display tables showcasing gadgets, and walls lined with neatly organized boxed products and headphones. A store clerk wearing a black polo shirt stands behind a wooden counter. Generated video: A cinematic, high-quality commercial scene set inside a modern \"Soundwave\" audio electronics retail store. The camera frames a steady medium shot. In the foreground, a young man with dark messy curly hair and a mustache, wearing a black collared overshirt left unbuttoned over a simple white t-shirt, stands at a wooden counter. He is holding and closely inspecting a pair of premium black over-ear wireless headphones with thick cushioned earcups and a smooth, matte black headband. Behind the counter stands a male store clerk wearing a black polo shirt, watching the customer attentively. The customer gently turns the headphones in his hands to examine their texture, looks up at the clerk, and says in an impressed and enthusiastic way: \"The build quality on these is honestly incredible. How is the active noise cancellation?\" The clerk nods with a warm, welcoming smile and replies professionally and confidently: \"It's our best yet, it completely blocks out the street noise\" Natural sunlight streams through large windows out of frame, casting warm, cinematic lighting across the rich wood accents of the store and highlighting the sleek matte finish of the headphones. The background, featuring shelves lined with neatly organized boxed products and the Soundwave logo, remains softly out of focus.",
+        "Reference sheet: Top Row Left (Character): A young Asian woman with a warm skin tone. Her dark hair is parted down the middle and styled into two long braids resting on her chest. She wears a short-sleeved olive-green t-shirt, khaki cargo pants, dark brown hiking boots, and a black wristwatch on her left arm. She has a serious, natural expression. Top Row Right (Prop - Backpack): A large, heavy-duty blue hiking backpack. It features an external silver metal frame, multiple side and top pouches, black adjustable straps, and a brown leather square patch near the bottom. Middle Row Left (Prop - Walking Stick): A simple, thick, natural wooden walking stick with rough bark texture and a slight fork or knot near one end. Middle Row Right (Character/Animal - Yak): A large, sturdy yak with long, shaggy white and blonde hair and curved grey horns. It wears a highly ornate saddle blanket featuring intricate blue, red, and yellow patterns, along with a saddle equipped with metal stirrups. Colorful tassels hang near its ears and chest. Bottom Row Left (Setting - Landscape): A sweeping, majestic mountain landscape. A dirt path winds through green, rocky slopes toward towering, snow-capped peaks in the distance, set under a bright blue sky with scattered white clouds. Bottom Row Right (Setting - Building): A small, traditional square stone building (a shrine or temple). It has a flat, slightly tiered roof adorned with a bright yellow fabric valance along the roofline. The windows have bright blue trim, and the wooden door is painted red. A small stone stupa sits beside it. Generated video: cinematic adventure documentary scene captures a dynamic medium wide shot of a young asian woman with her dark hair in two long braids, wearing an olive-green t-shirt and khaki cargo pants. she is sitting on a rock along a mountain dirt path, resting beside a massive white shaggy yak with curved horns. the yak wears an ornate blue, red, and yellow patterned saddle blanket with metal stirrups. leaning against a nearby small stone building—which features blue window trim, a red door, and a yellow fabric roof valance—is her large blue external-frame backpack and thick wooden walking stick. majestic snow-capped mountains tower in the distant background under a bright blue sky. she looks at the yak, chest heaving slightly from exertion, and says with a breathy, tired, but gentle voice: \"we've got a long way to go...\" she pauses briefly, extending her hand to gently pat the thick white fur on the yak's neck. the yak shifts its weight slightly, causing the colorful tassels near its ears to sway. a faint, exhausted smile breaks across her face as she continues softly: \"...big guy.\" lowering her hand, she grabs her thick wooden walking stick, leaning her weight onto it as she turns her gaze up toward the distant snowy peaks. her expression shifts from exhaustion to quiet determination as she adds, her voice growing slightly firmer: \"but the pass...\" she takes a deep, grounding breath. \"...is just over that ridge.\" the woman looks profoundly weary but unbroken, embodying a deep connection to the harsh, beautiful environment and her animal companion. her acting is subtle and grounded; micro-expressions of fatigue are visible in the slight tension around her eyes and her parted lips as she catches her breath, while her jaw sets with firm resolve as she contemplates the climb ahead. the camera is dynamically handheld, slowly orbiting around the woman and the yak to reveal the depth of the valley and the towering mountains behind them. the film aesthetic is naturalistic and breathtaking, with bright, crisp sunlight casting sharp shadows across the rocky path and stone shrine. the audio is clear and immersive, featuring her wind-swept voice, the heavy, rhythmic breathing of the yak, the faint jingle of metal stirrups, and the distant, ambient howl of mountain winds, with no background music."
+      ]
     },
     {
       "id": "instant-shave",
@@ -2676,7 +2681,7 @@
         {
           "kind": "summary",
           "title": "What it does",
-          "body": "Renders a plain 3D layout (simple shapes and a camera move) as a finished shot. The layout video sets the motion and the framing. The reference image sets the colors, the materials and the light."
+          "body": "A plain 3D layout (simple shapes and a camera move) becomes a realistic scene. The layout video sets the motion and the framing. The reference image sets the colors, the materials and the light."
         },
         {
           "kind": "input",
@@ -2687,7 +2692,7 @@
           "kind": "prompting",
           "title": "Prompt",
           "body": [
-            "No trigger word. Describe the finished shot in one sentence."
+            "No trigger word. Describe the scene in one sentence."
           ]
         },
         {
@@ -2699,10 +2704,198 @@
           ]
         }
       ],
+      "enhancement_examples": [
+        "A rustic stone well sits in summer grass as the camera slowly pulls back from the basin. Hot midday sun, golden-tipped blades, small white wildflowers, dry moss on the stone, a wooden bucket hanging over dark water, weathered posts and a fence behind. Match the first frame: high summer, dry heat, daisies, no snow. Keep the same well, bucket, posts, and camera as the driver. Photoreal, real stone and grass.",
+        "A grassy shoreline with wildflowers and reeds next to a calm pond, backed by a dense forest of vibrant yellow and orange autumn trees under warm sunlight.",
+        "Two men in dark coats stand with their backs to the camera in a night apartment, looking through floor-to-ceiling windows at a city skyline. Warm lamps, a wood floor, and a dark wood ceiling."
+      ],
       "default_settings": {
         "skip_stage_2": false,
         "stage_2_ic_lora": true,
         "resolution_factor": 1.0,
+        "audio_mode": "source",
+        "lora_strength": 1
+      }
+    },
+    {
+      "id": "motion-track",
+      "name": "Motion Track Control",
+      "description": "Draw a path on an image. An object or the camera follows it through the scene.",
+      "tags": [
+        "motion"
+      ],
+      "download": {
+        "repo_id": "Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control",
+        "variants": [
+          {
+            "id": "ltx-2.3__motion-track",
+            "label": "LTX-2.3",
+            "filename": "ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors",
+            "size_bytes": 327309314,
+            "base_model": "LTX-2.3",
+            "repo_id": "Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control"
+          }
+        ]
+      },
+      "requires_hf_login": false,
+      "author": {
+        "name": "LTX",
+        "url": "https://huggingface.co/Lightricks",
+        "affiliation": "ltx"
+      },
+      "license": {
+        "name": "LTX-2 Community License",
+        "url": "https://github.com/Lightricks/LTX-2/blob/main/LICENSE"
+      },
+      "base_model": "LTX-2.3",
+      "supported_models": [
+        "LTX-2.3",
+        "LTX-2.5"
+      ],
+      "input": {
+        "kind": "video"
+      },
+      "allows_reference_image": true,
+      "reference_image_required": true,
+      "reference_image_frame": 0,
+      "preprocessing": [],
+      "instructions": [
+        {
+          "kind": "summary",
+          "title": "What it does",
+          "body": "Draw a path on an image. A dot moves along the path, and the model moves an object or the camera the same way. The image is the first frame."
+        },
+        {
+          "kind": "input",
+          "title": "Input",
+          "body": "One image, and a path of 2 to 7 points over it. Set the pace and the duration. The app draws the control clip from the path. The control clip is one colored dot for each path, on a black background."
+        },
+        {
+          "kind": "prompting",
+          "title": "Prompt",
+          "body": [
+            "No trigger word. Describe the subject, the scene and the action that the image shows, as free text.",
+            "Do not describe the path, the dot or the black background. The camera is locked, so do not describe camera moves."
+          ]
+        },
+        {
+          "kind": "tips",
+          "title": "Tips",
+          "body": [
+            "LoRA strength 1.0",
+            "Start the path on the object that must move. A path with fewer points moves in a smoother line."
+          ]
+        }
+      ],
+      "enhancement_examples": [
+        "The conductor frog smoothly but forcefully moves his baton-holding arm and hand along the provided motion track, precisely following the path from point to point. The shoulder, elbow, wrist, hand, and baton move together naturally in a powerful, commanding conducting gesture. He maintains a firm grip on the baton throughout. Sharp, energetic movements with controlled acceleration and natural joint articulation. The frog's body reacts subtly to the intensity of the conducting. The orchestra remains visually stable. Audio: violent, aggressive orchestral music with pounding percussion",
+        "A small paper boat glides across a calm pond and follows the provided motion track from point to point. Soft ripples spread behind it. Dragonflies hover over the reeds. The water and the shore stay still. Warm morning light. Audio: gentle birdsong and soft water sounds",
+        "A glowing lantern floats through a dark forest clearing and follows the provided motion track in a slow, steady drift. Fireflies swirl around it, and its light flickers across the ferns. The trees stay still. Audio: quiet night air and soft crickets"
+      ],
+      "default_settings": {
+        "skip_stage_2": true,
+        "audio_mode": "generated",
+        "lora_strength": 1
+      }
+    },
+    {
+      "id": "video-guide",
+      "name": "Video Guide",
+      "description": "Combine depth, pose, and style controls in a single generation pass.",
+      "tags": [
+        "motion"
+      ],
+      "download": {
+        "repo_id": "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control",
+        "variants": [
+          {
+            "id": "ltx-2.3__video-guide",
+            "label": "LTX-2.3",
+            "filename": "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
+            "size_bytes": 654465352,
+            "base_model": "LTX-2.3",
+            "repo_id": "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control"
+          }
+        ]
+      },
+      "requires_hf_login": false,
+      "author": {
+        "name": "LTX",
+        "url": "https://huggingface.co/Lightricks",
+        "affiliation": "ltx"
+      },
+      "license": {
+        "name": "LTX-2 Community License",
+        "url": "https://github.com/Lightricks/LTX-2/blob/main/LICENSE"
+      },
+      "base_model": "LTX-2.3",
+      "supported_models": [
+        "LTX-2.3",
+        "LTX-2.5"
+      ],
+      "input": {
+        "kind": "video"
+      },
+      "allows_reference_image": true,
+      "reference_image_frame": 0,
+      "requires_checkpoints": [
+        "dpt-hybrid-midas",
+        "yolox-l-torchscript",
+        "dw-ll-ucoco-384-bs5"
+      ],
+      "preprocessing": [
+        {
+          "utility": "video_control",
+          "params": {}
+        }
+      ],
+      "controls": [
+        {
+          "id": "control_type",
+          "label": "Control mode",
+          "kind": "select",
+          "default": "pose",
+          "options": [
+            "pose",
+            "depth",
+            "canny"
+          ],
+          "value_labels": {
+            "pose": "Pose",
+            "depth": "Depth",
+            "canny": "Canny edges"
+          }
+        }
+      ],
+      "prompt_template": {
+        "template": "{scene}. {action}. {camera}.",
+        "placeholders": {
+          "scene": {},
+          "action": {},
+          "camera": {}
+        }
+      },
+      "instructions": [
+        {
+          "kind": "summary",
+          "title": "What it does",
+          "body": "Direct your generation with visual guides. Combine pose, depth, and edge references in a single model to control movement and composition while keeping full creative freedom over style."
+        },
+        {
+          "kind": "input",
+          "title": "Input",
+          "body": "A reference video, and an optional start frame. Choose a control mode: Depth for camera movement, Pose for body motion, or Canny for shapes and edges."
+        },
+        {
+          "kind": "prompting",
+          "title": "Prompt",
+          "body": [
+            "No trigger word. Describe your scene based on your image and reference video."
+          ]
+        }
+      ],
+      "default_settings": {
+        "skip_stage_2": true,
         "audio_mode": "source",
         "lora_strength": 1
       }
@@ -2832,8 +3025,6 @@
       "input": {
         "kind": "video"
       },
-      "allows_reference_image": true,
-      "reference_image_frame": 0,
       "preprocessing": [],
       "instructions": [
         {
@@ -2844,7 +3035,7 @@
         {
           "kind": "input",
           "title": "Input",
-          "body": "A delivery-grade clip, for example 1080p web video, a compressed clip or a generated clip. Do not sharpen or denoise it first. An optional look image sets the detail of the first frame. Use a sharp still of the first frame of the clip."
+          "body": "A delivery-grade clip, for example 1080p web video, a compressed clip or a generated clip. Do not sharpen or denoise it first. The clip is scaled up to the output size with Lanczos before the model reads it. A 1080p clip refined to 4K is one pass."
         },
         {
           "kind": "prompting",
@@ -2876,7 +3067,8 @@
         "lora_strength": 1,
         "tiling": {
           "long_side": 1024,
-          "short_side": 576
+          "short_side": 576,
+          "window_frames": 73
         }
       }
     }

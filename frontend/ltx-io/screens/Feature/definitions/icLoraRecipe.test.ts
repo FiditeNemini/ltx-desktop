@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
@@ -314,6 +315,33 @@ describe("ic-lora recipe form", () => {
     assert.deepEqual(labels(1280, 720), ["270p", "360p", "540p", "720p (Original)"]);
     assert.deepEqual(labels(640, 360), ["270p", "360p (Original)", "540p"]);
     assert.deepEqual(labels(null, null), ["270p", "360p", "540p", "720p", "1080p"]);
+  });
+
+  it("starts Refine Details at the Original cell and lists no smaller cell", () => {
+    const definition = createIcLoraRecipeDefinition(getIcLoraRecipe("refine-details"));
+    const clip = { ...definition.defaults, video: { assetId: "clip" } };
+    const sized = (videoWidth: number, videoHeight: number) => ({
+      ...context(),
+      videoWidth,
+      videoHeight,
+    });
+    const offered = (videoWidth: number, videoHeight: number) => {
+      const form = definition.form(clip, sized(videoWidth, videoHeight));
+      const field = form.fields.find((item) => item.dataKey === "resolution");
+      return field?.kind === "options" ? field.options.map((option) => option.label) : [];
+    };
+    assert.deepEqual(offered(1920, 1080), ["1080p (Original)"]);
+    assert.deepEqual(offered(960, 540), ["540p (Original)", "720p", "1080p"]);
+    for (const [width, height, original] of [
+      [320, 180, "270p"],
+      [960, 540, "540p"],
+      [1280, 720, "720p"],
+      [1920, 1080, "1080p"],
+    ] as const) {
+      assert.equal(definition.normalize(clip, sized(width, height)).resolution, original);
+    }
+    const picked = { ...clip, resolution: "1080p" as const };
+    assert.equal(definition.normalize(picked, sized(960, 540)).resolution, "1080p");
   });
 
   it("warns about slow runs at 720p and higher on a low performance machine only", () => {
@@ -687,5 +715,76 @@ describe("ic-lora recipe Restore", () => {
       field.options.map((option) => option.label),
       ["270p (Original)", "360p", "540p", "720p", "1080p"],
     );
+  });
+});
+
+describe("ic-lora recipe Video Guide control mode", () => {
+  const guide = createIcLoraRecipeDefinition(getIcLoraRecipe("video-guide"));
+  const other = createIcLoraRecipeDefinition(getIcLoraRecipe("day-to-night"));
+  const clip = { video: { assetId: "clip" } };
+
+  it("sends controlType only for a recipe that has the control mode", () => {
+    const chosen = { ...guide.defaults, ...clip, controlType: "depth" as const };
+    assert.equal(guide.toCreateBody(chosen, context()).params.controlType, "depth");
+    const stale = { ...other.defaults, ...clip, controlType: "depth" as const };
+    assert.equal("controlType" in other.toCreateBody(stale, context()).params, false);
+  });
+
+  it("restores the saved control type and falls back to pose for an unknown one", () => {
+    const restore = (controlType: unknown) =>
+      guide.fromGeneration(
+        {
+          params: {
+            prompt: "a dancer",
+            model: "ltx-2.5-fast",
+            resolution: "540p",
+            controlType,
+            loras: [{ ref: "", scale: 1, variantId: "default" }],
+          },
+          inputs: { video: { assetId: "clip" } },
+        },
+        context(),
+      )?.controlType;
+    assert.equal(restore("canny"), "canny");
+    assert.equal(restore("sketch"), "pose");
+  });
+});
+
+describe("ic-lora recipe Video Guide form", () => {
+  const guide = createIcLoraRecipeDefinition(getIcLoraRecipe("video-guide"));
+  const form = guide.form({ ...guide.defaults, video: { assetId: "clip" } }, context());
+
+  it("lists the control modes and labels the catalog entry declares", () => {
+    // The catalog is the backend source of the options. A mode added there and not here is refused by the form.
+    const catalog = JSON.parse(
+      readFileSync(
+        new URL("../../../../../backend/runtime_config/lora_catalog.json", import.meta.url),
+        "utf8",
+      ),
+    ) as {
+      ic_loras: {
+        id: string;
+        controls: { id: string; options: string[]; value_labels: Record<string, string> }[];
+      }[];
+    };
+    const control = catalog.ic_loras
+      .find((entry) => entry.id === "video-guide")
+      ?.controls.find((candidate) => candidate.id === "control_type");
+    const field = form.fields.find((candidate) => candidate.dataKey === "controlType");
+    const options = field?.kind === "options" ? field.options : [];
+    assert.deepEqual(
+      options.map((option) => option.value),
+      control?.options,
+    );
+    assert.deepEqual(
+      options.map((option) => option.label),
+      control?.options.map((value) => control.value_labels[value]),
+    );
+  });
+
+  it("puts the Start Frame above the guide video and offers no End Frame", () => {
+    const keys = form.fields.map((field) => field.dataKey);
+    assert.ok(keys.indexOf("image") < keys.indexOf("video"));
+    assert.equal(keys.includes("endImage" as never), false);
   });
 });

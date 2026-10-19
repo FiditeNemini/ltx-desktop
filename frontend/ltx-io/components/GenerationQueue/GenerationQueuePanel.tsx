@@ -19,6 +19,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router";
+import { consumeQueueEscape } from "./generationQueueEscape.ts";
 
 import SectionVideosIcon from "@ds/assets/Icons/SectionVideos.svg?react";
 import { animationProps } from "@ds/lib/popoverAnimationOptions";
@@ -139,17 +140,26 @@ export function GenerationQueuePanel({
       if (root?.contains(target)) return;
       closePanel();
     };
+    // Capture phase: the open popover owns Escape, so the Assistant panel around it
+    // does not also stop its run. Mid-drag it still reaches the drag sensor, which cancels the drag.
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (activeDragIdRef.current != null) return;
-      event.preventDefault();
-      closePanel();
+      if (event.key !== "Escape" || event.isComposing) return;
+      const target = event.target;
+      // A dialog or menu opened over the popover closes first.
+      if (
+        target instanceof Element &&
+        !rootRef.current?.contains(target) &&
+        target.closest('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')
+      ) {
+        return;
+      }
+      consumeQueueEscape(event, activeDragIdRef.current != null, closePanel);
     };
     document.addEventListener("pointerdown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("keydown", onKeyDown, true);
     return () => {
       document.removeEventListener("pointerdown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("keydown", onKeyDown, true);
     };
   }, [isOpen]);
   const navigate = useNavigate();
@@ -173,8 +183,10 @@ export function GenerationQueuePanel({
     api,
   });
 
-  const openDoneResult = (entry: ExploreQueueEntry) => {
-    markDoneRead(entry.generation.id);
+  // Every Queue row opens its generation on the feature page. That page scrolls to the card
+  // and shows a notice when the card is missing. Here we only guard an unknown feature.
+  const openResult = (entry: ExploreQueueEntry, options?: { markRead?: boolean }) => {
+    if (options?.markRead === true) markDoneRead(entry.generation.id);
     const location = resultLocationForFeature(
       entry.generation.feature,
       entry.generation.id,
@@ -426,6 +438,7 @@ export function GenerationQueuePanel({
                         onCancel={() =>
                           cancelGeneration(snapshot.active!.generation.id)
                         }
+                        onOpen={() => openResult(snapshot.active!)}
                       />
                     ) : null}
                     {snapshot.queued.length > 0 ? (
@@ -451,6 +464,7 @@ export function GenerationQueuePanel({
                         mediaUrlForAsset={mediaUrlForAsset}
                         thumbUrlForAsset={thumbUrlForAsset}
                         onCancel={() => cancelGeneration(entry.generation.id)}
+                        onOpen={() => openResult(entry)}
                       />
                     ))}
                     {doneEntries.length > 0 ? (
@@ -480,7 +494,7 @@ export function GenerationQueuePanel({
                         mediaUrlForAsset={mediaUrlForAsset}
                         thumbUrlForAsset={thumbUrlForAsset}
                         showUnreadDot={unreadDoneIds.has(entry.generation.id)}
-                        onOpen={() => openDoneResult(entry)}
+                        onOpen={() => openResult(entry, { markRead: true })}
                         onRemove={() => removeDoneEntry(entry.generation.id)}
                       />
                     ))}
@@ -511,7 +525,7 @@ export function GenerationQueuePanel({
                         listItemMotion={queueRowListMotion}
                         mediaUrlForAsset={mediaUrlForAsset}
                         thumbUrlForAsset={thumbUrlForAsset}
-                        onOpen={() => openDoneResult(entry)}
+                        onOpen={() => openResult(entry)}
                       />
                     ))}
                   </AnimatePresence>

@@ -2,22 +2,27 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from contextlib import nullcontext
 import os
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import torch
 
 from api_types import ImageConditioningInput
 from frame_math import AutoDurationSpec
+from services.fast_video_pipeline.windowed_run import encode_result, measured_windows, plan_windows
+from services.ic_lora_pipeline.ic_lora_inference import InferenceResult
 from services.ltx_pipeline_common import (
     auto_tiling_config,
     build_model_paths,
-    encode_video_output,
-    offload_mode_for_prefetch_count,
-    video_chunks_number,
 )
-from services.services_utils import AudioOrNone, PipelineTilingType, TilingConfigType, device_supports_fp8
+from services.services_utils import PipelineTilingType, device_supports_fp8
+
+if TYPE_CHECKING:
+    from ltx_pipelines.chunks import ChunkConfig
+
+if TYPE_CHECKING:
+    from ltx_pipelines.utils.types import OffloadMode
 
 
 class LTXFastVideoPipeline:
@@ -32,6 +37,7 @@ class LTXFastVideoPipeline:
         streaming_prefetch_count: int | None,
         loras: list[tuple[str, float]] | None = None,
         *,
+        offload_mode: OffloadMode,
         video_vae_path: str | None = None,
         audio_vae_path: str | None = None,
         duration_head_path: str | None = None,
@@ -43,6 +49,7 @@ class LTXFastVideoPipeline:
             device=device,
             streaming_prefetch_count=streaming_prefetch_count,
             loras=loras or [],
+            offload_mode=offload_mode,
             video_vae_path=video_vae_path,
             audio_vae_path=audio_vae_path,
             duration_head_path=duration_head_path,
@@ -57,6 +64,7 @@ class LTXFastVideoPipeline:
         streaming_prefetch_count: int | None,
         loras: list[tuple[str, float]] | None = None,
         *,
+        offload_mode: OffloadMode,
         video_vae_path: str | None = None,
         audio_vae_path: str | None = None,
         duration_head_path: str | None = None,
@@ -73,7 +81,7 @@ class LTXFastVideoPipeline:
         self._audio_vae_path = audio_vae_path
         self._duration_head_path = duration_head_path
         self._device = device
-        self._offload_mode = offload_mode_for_prefetch_count(streaming_prefetch_count, device)
+        self._offload_mode = offload_mode
         self._quantization = build_fp8_cast_policy(checkpoint_path) if device_supports_fp8(device) else None
         self._loras = loras or []
 
@@ -108,23 +116,21 @@ class LTXFastVideoPipeline:
         images: list[ImageConditioningInput],
         tiling_config: PipelineTilingType,
         *,
-        guide_all_images: bool = False,
         skip_stage_2: bool = False,
-    ) -> tuple[torch.Tensor | Iterator[torch.Tensor], AudioOrNone, int, TilingConfigType | None]:
-        from contextlib import nullcontext
-
+        chunk_config: ChunkConfig | None = None,
+    ) -> InferenceResult:
+        """Run the pipeline. A windowed job streams, so the caller must encode inside the
+        keyframe-guiding scope and the progress scope, and close the streams after."""
         from ltx_pipelines.utils.types import ImageConditioningInput as _LtxImageInput
         from ltx_pipelines.utils.types import AutoDuration
-        from services.fast_video_pipeline.distilled_keyframe_guiding import distilled_keyframe_guiding
 
         pipeline_num_frames: int | AutoDuration = (
             AutoDuration(min_seconds=num_frames.min_seconds, max_seconds=num_frames.max_seconds)
             if isinstance(num_frames, AutoDurationSpec)
             else num_frames
         )
-
-        ctx = distilled_keyframe_guiding() if guide_all_images else nullcontext()
-        with ctx:
+        ltx_images = [_LtxImageInput(img.path, img.frame_idx, img.strength) for img in images]
+        if chunk_config is None:
             result = self.pipeline(
                 prompt=prompt,
                 seed=seed,
@@ -132,11 +138,29 @@ class LTXFastVideoPipeline:
                 width=width,
                 num_frames=pipeline_num_frames,
                 frame_rate=frame_rate,
-                images=[_LtxImageInput(img.path, img.frame_idx, img.strength) for img in images],
+                images=ltx_images,
                 tiling_config=tiling_config,
                 skip_stage_2=skip_stage_2,
             )
-        return result.video, result.audio, result.num_frames, result.tiling_config
+            return InferenceResult(result.video, result.audio, result.num_frames, result.tiling_config)
+        if skip_stage_2:
+            raise ValueError("A windowed job runs both stages")
+        from ltx_pipelines.chunks import split_decoded_chunks
+
+        chunks, resolved_frames, resolved_tiling = self.pipeline.stream_chunks(
+            prompt=prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=pipeline_num_frames,
+            frame_rate=frame_rate,
+            images=ltx_images,
+            tiling_config=tiling_config,
+            chunk_config=chunk_config,
+        )
+        video, audio, audio_sampling_rate = split_decoded_chunks(chunks)
+        streams = (video, chunks) if audio is None else (video, audio, chunks)
+        return InferenceResult(video, audio, resolved_frames, resolved_tiling, audio_sampling_rate, streams)
 
     @torch.inference_mode()
     def generate(
@@ -152,11 +176,22 @@ class LTXFastVideoPipeline:
         *,
         guide_all_images: bool = False,
         skip_stage_2: bool = False,
+        chunk_pixel_frames: int | None = None,
     ) -> None:
         from services.denoising_progress import distilled_total_steps, track_denoising
+        from services.fast_video_pipeline.distilled_keyframe_guiding import distilled_keyframe_guiding
 
-        with track_denoising(distilled_total_steps(stage_2=not skip_stage_2)):
-            video, audio, resolved_frames, resolved_tiling = self._run_inference(
+        chunk_config, chunk_count = plan_windows(
+            chunk_pixel_frames, width=width, height=height, num_frames=num_frames, frame_rate=frame_rate
+        )
+        steps = distilled_total_steps(stage_2=not skip_stage_2) * chunk_count
+        guiding = distilled_keyframe_guiding() if guide_all_images else nullcontext()
+        measured = measured_windows(
+            chunk_config, width=width, height=height, window_count=chunk_count,
+            num_frames=num_frames, frame_rate=frame_rate, device=self._device,
+        )
+        with track_denoising(steps), guiding, measured:
+            result = self._run_inference(
                 prompt=prompt,
                 seed=seed,
                 height=height,
@@ -165,18 +200,17 @@ class LTXFastVideoPipeline:
                 frame_rate=frame_rate,
                 images=images,
                 tiling_config=auto_tiling_config(),
-                guide_all_images=guide_all_images,
                 skip_stage_2=skip_stage_2,
+                chunk_config=chunk_config,
             )
-        chunks = video_chunks_number(resolved_frames, resolved_tiling)
-        encode_video_output(video=video, audio=audio, fps=int(frame_rate), output_path=output_path, video_chunks_number_value=chunks)
+            encode_result(result, fps=int(frame_rate), output_path=output_path, streamed=chunk_config is not None)
 
     @torch.inference_mode()
     def warmup(self, output_path: str) -> None:
         warmup_frames = 9
 
         try:
-            video, audio, resolved_frames, resolved_tiling = self._run_inference(
+            result = self._run_inference(
                 prompt="test warmup",
                 seed=42,
                 height=256,
@@ -186,8 +220,7 @@ class LTXFastVideoPipeline:
                 images=[],
                 tiling_config=auto_tiling_config(),
             )
-            chunks = video_chunks_number(resolved_frames, resolved_tiling)
-            encode_video_output(video=video, audio=audio, fps=8, output_path=output_path, video_chunks_number_value=chunks)
+            encode_result(result, fps=8, output_path=output_path, streamed=False)
         finally:
             if os.path.exists(output_path):
                 os.unlink(output_path)

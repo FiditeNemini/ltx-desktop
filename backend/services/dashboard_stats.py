@@ -6,15 +6,20 @@ Percentiles use linear interpolation between the nearest ranks:
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 from datetime import date, datetime, timedelta
-from typing import Literal, cast
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from services.dashboard_feature_runs import (
+    FeatureRun,
+    feature_runs,
+    is_feature_candidate,
+    video_metadata,
+)
 from services.generation_stats_sql import generation_stats_sql
 
 DashboardWindow = Literal["7d", "30d", "all"]
@@ -31,6 +36,7 @@ _RENDER_GROUPS = frozenset(
     {"text-to-video", "image-to-video", "audio-to-video", "lora"}
 )
 _EDIT_FEATURES = frozenset({"retake", "extend"})
+_LORA_GROUPS = frozenset({"lora", "ic-lora"})
 # Days before today included in a bounded window. 7d is today plus the six days before it.
 _WINDOW_LOOKBACK_DAYS = {"7d": 6, "30d": 29}
 # All zero-fills at most this many days. Older days appear only when a run finished then.
@@ -90,6 +96,12 @@ class FpsRenderCell(RenderCell):
     fps: int
 
 
+class FeatureRenderCell(RenderCell):
+    """Retake, extend, or one IC-LoRA recipe. `duration_s` is the edited span, or the output length for IC-LoRA."""
+
+    feature: str
+
+
 class FailureRow(BaseModel):
     model_config = ConfigDict(strict=True)
     error_code: str
@@ -105,6 +117,7 @@ class KeepRate(BaseModel):
 
 class UsualSettings(BaseModel):
     model_config = ConfigDict(strict=True)
+    model: str
     resolution: str
     aspect_ratio: str
     duration_s: float
@@ -122,6 +135,7 @@ class DashboardSnapshot(BaseModel):
     loras: LoraPanel
     render: list[RenderCell]
     render_by_fps: list[FpsRenderCell]
+    render_by_feature: list[FeatureRenderCell]
     aspect_ratios: list[str]
     fps_values: list[int]
     failures: list[FailureRow]
@@ -221,16 +235,10 @@ def _clip_kept(asset: sqlite3.Row) -> bool:
 def _footage_s(feature: str, edited_span_s: float | None, metadata: str) -> float:
     if feature in _EDIT_FEATURES:
         return float(edited_span_s or 0)
-    try:
-        parsed: object = json.loads(metadata)
-    except json.JSONDecodeError:
+    inner = video_metadata(metadata)
+    if inner is None:
         return 0.0
-    if not isinstance(parsed, dict):
-        return 0.0
-    inner = cast(dict[str, object], parsed).get("metadata")
-    if not isinstance(inner, dict):
-        return 0.0
-    duration_ms = cast(dict[str, object], inner).get("durationMs")
+    duration_ms = inner.get("durationMs")
     if isinstance(duration_ms, bool) or not isinstance(duration_ms, (int, float)):
         return 0.0
     return float(duration_ms) / 1000
@@ -271,6 +279,38 @@ def _group_render(rows: list[sqlite3.Row]) -> list[RenderCell]:
     ]
 
 
+def _group_feature_render(runs: list[FeatureRun]) -> list[FeatureRenderCell]:
+    grouped: dict[tuple[str, str, str, str, float], list[float]] = {}
+    for run in runs:
+        key = (run.feature, run.model, run.resolution, run.aspect_ratio, run.length_s)
+        grouped.setdefault(key, []).append(run.run_ms)
+    return [
+        FeatureRenderCell(
+            feature=feature,
+            model=model,
+            resolution=resolution,
+            aspect_ratio=aspect,
+            duration_s=length_s,
+            median_ms=percentile(samples, 0.5),
+            p90_ms=percentile(samples, 0.9),
+            count=len(samples),
+        )
+        for (feature, model, resolution, aspect, length_s), samples in sorted(
+            grouped.items()
+        )
+    ]
+
+
+def _output_videos(assets: list[sqlite3.Row]) -> dict[str, dict[str, object]]:
+    """The first output video of each generation. Extra outputs, like a cutout matte, share its size."""
+    outputs: dict[str, dict[str, object]] = {}
+    for asset in assets:
+        inner = video_metadata(str(asset["metadata"]))
+        if inner is not None:
+            outputs.setdefault(str(asset["generation_id"]), inner)
+    return outputs
+
+
 def _usual_ready(row: sqlite3.Row) -> bool:
     if row["status"] != "succeeded" or row["feature"] in _EDIT_FEATURES:
         return False
@@ -282,7 +322,7 @@ def _usual_ready(row: sqlite3.Row) -> bool:
     )
 
 
-def _log_exclusions(rows: list[sqlite3.Row]) -> None:
+def _log_exclusions(rows: list[sqlite3.Row], feature_runs_count: int) -> None:
     """Count rows dropped from one metric and still counted in the others."""
     render_excluded = sum(
         1
@@ -299,11 +339,15 @@ def _log_exclusions(rows: list[sqlite3.Row]) -> None:
         and row["resolution_label"]
         and not _usual_ready(row)
     )
+    feature_excluded = (
+        sum(1 for row in rows if is_feature_candidate(row)) - feature_runs_count
+    )
     unrecognized = sum(
         1 for row in rows if str(row["feature_group"]) not in _ACTIVITY_FEATURES
     )
     for metric, count in (
         ("render", render_excluded),
+        ("feature_render", feature_excluded),
         ("usual_settings", usual_excluded),
         ("feature_group", unrecognized),
     ):
@@ -342,7 +386,10 @@ def compute_dashboard(
 def _read(
     conn: sqlite3.Connection, start_ms: int | None
 ) -> tuple[list[sqlite3.Row], list[sqlite3.Row], bool]:
-    """Both reads share one transaction, so a run that finishes between them cannot skew a request."""
+    """Both reads share one transaction, so a run that finishes between them cannot skew a request.
+
+    A run counts as one clip, its first output video. A cutout recipe writes a second
+    video, the matte, and that one is not a separate clip."""
     rows = conn.execute(
         generation_stats_sql(
             """
@@ -371,6 +418,13 @@ def _read(
               AND a.media_kind = 'video'
               AND s.status = 'succeeded'
               AND s.finished_at IS NOT NULL
+              AND a.output_ordinal = (
+                  SELECT MIN(peer.output_ordinal)
+                  FROM assets peer
+                  WHERE peer.producer_generation_id = a.producer_generation_id
+                    AND peer.origin = 'generated'
+                    AND peer.media_kind = 'video'
+              )
               AND (? IS NULL OR s.finished_at >= ?)
             """
         ),
@@ -420,12 +474,12 @@ def _snapshot(
 
     lora_runs: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
-        if row["feature_group"] != "lora":
+        if row["feature_group"] not in _LORA_GROUPS:
             continue
         lora_runs.setdefault(str(row["feature"]), []).append(row)
     lora_assets: dict[str, list[sqlite3.Row]] = {}
     for asset in assets:
-        if asset["feature_group"] != "lora":
+        if asset["feature_group"] not in _LORA_GROUPS:
             continue
         lora_assets.setdefault(str(asset["feature"]), []).append(asset)
     ranked = sorted(
@@ -450,7 +504,8 @@ def _snapshot(
         )
     lora_total = sum(len(runs) for runs in lora_runs.values())
 
-    _log_exclusions(rows)
+    feature_pool = feature_runs(rows, _output_videos(assets))
+    _log_exclusions(rows, len(feature_pool))
     render_pool = [row for row in rows if _render_ready(row)]
     aspect_ratios = sorted(
         {str(row["aspect_ratio"]) for row in render_pool if row["aspect_ratio"]}
@@ -474,11 +529,12 @@ def _snapshot(
         code = str(row["error_code"] or "UNKNOWN")
         failures[code] = failures.get(code, 0) + 1
 
-    usual_counts: dict[tuple[str, str, float, int], tuple[int, int]] = {}
+    usual_counts: dict[tuple[str, str, str, float, int], tuple[int, int]] = {}
     for row in rows:
         if not _usual_ready(row):
             continue
         key = (
+            str(row["model"] or ""),
             str(row["resolution_label"]),
             str(row["aspect_ratio"]),
             round(float(row["render_duration_s"]), 4),
@@ -489,8 +545,9 @@ def _snapshot(
     usual = None
     if usual_counts:
         best = max(usual_counts.items(), key=lambda item: (item[1][0], item[1][1]))
-        resolution, ratio, duration_s, setting_fps = best[0]
+        usual_model, resolution, ratio, duration_s, setting_fps = best[0]
         usual = UsualSettings(
+            model=usual_model,
             resolution=resolution,
             aspect_ratio=ratio,
             duration_s=duration_s,
@@ -519,6 +576,7 @@ def _snapshot(
         ),
         render=cells,
         render_by_fps=by_fps,
+        render_by_feature=_group_feature_render(feature_pool),
         aspect_ratios=aspect_ratios,
         fps_values=fps_values,
         failures=[

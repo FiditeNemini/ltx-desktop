@@ -4,12 +4,14 @@ from fastapi import APIRouter, Depends, Path, Query
 
 from api_types import (
     CreateAudioToVideoRequest,
-    CreateIcLoraRecipeRequest,
+    IcLoraRecipeCreate,
     CreateExtendRequest,
     CreateImageToVideoRequest,
     CreateLoraRecipeRequest,
     CreateRetakeRequest,
     CreateTextToVideoRequest,
+    EditPreflightRequest,
+    EditPreflightResponse,
     Generation,
     QueueSnapshot,
     ReorderGenerationQueueRequest,
@@ -174,7 +176,7 @@ def route_create_retake(
     tags=["generations"],
 )
 def route_create_ic_lora_recipe(
-    req: CreateIcLoraRecipeRequest,
+    req: IcLoraRecipeCreate,
     recipe_id: str = Path(pattern=_RECIPE_ID_PATTERN),
     handler: AppHandler = Depends(get_state_service),
 ) -> Generation:
@@ -194,6 +196,17 @@ def route_create_extend(
     return handler.queued_generations.create_extend(
         req, analytics_client="desktop"
     )
+
+
+@router.post(
+    "/generations/edit/preflight",
+    response_model=EditPreflightResponse,
+    tags=["generations"],
+)
+def route_preflight_edit(
+    req: EditPreflightRequest, handler: AppHandler = Depends(get_state_service)
+) -> EditPreflightResponse:
+    return handler.queued_generations.preflight_edit(req)
 
 
 @router.get("/generations", response_model=list[Generation], tags=["generations"])

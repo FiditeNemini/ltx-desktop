@@ -6,16 +6,20 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from _routes._errors import HTTPError
 from api_types import (
+    IC_LORA_SHEET_MAX_IMAGES,
     EnhancePromptRequest,
     EnhancePromptResponse,
+    LTXVideoGenAspectRatio,
+    LTXVideoGenResolution,
     PromptEnhancerStatusResponse,
+    ReplacedWindow,
 )
 from app_handler import AppHandler
-from services.prompt_enhancement.resolve_enhance_assets import resolve_enhance_image_assets
+from services.prompt_enhancement.resolve_enhance_assets import resolve_enhance_media_assets
 from state import get_state_service
 
 router = APIRouter(prefix="/api", tags=["prompt-enhancement"])
@@ -27,12 +31,19 @@ class RemoteEnhancePromptRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
     prompt: str
     loraCatalogIds: list[str] = Field(default_factory=list)
+    icLoraId: str | None = None
     imageAssetId: str | None = None
     lastImageAssetId: str | None = None
+    # The panel images of an image-list IC-LoRA (Ingredients), in order.
+    imageAssetIds: list[str] = Field(default_factory=list[str], max_length=IC_LORA_SHEET_MAX_IMAGES)
+    aspectRatio: LTXVideoGenAspectRatio | None = None
+    resolution: LTXVideoGenResolution | None = None
+    videoAssetId: str | None = None
+    replacedWindow: ReplacedWindow | None = None
     provider: Literal["local", "api"] | None = None
     mediaType: Literal["video"] = "video"
 
-    @field_validator("imageAssetId", "lastImageAssetId", mode="before")
+    @field_validator("imageAssetId", "lastImageAssetId", "videoAssetId", mode="before")
     @classmethod
     def _asset_id_must_be_present_when_set(cls, value: object) -> object:
         if value is None:
@@ -44,12 +55,28 @@ class RemoteEnhancePromptRequest(BaseModel):
             raise ValueError("Asset id cannot be blank")
         return stripped
 
+    @field_validator("imageAssetIds")
+    @classmethod
+    def _asset_ids_must_be_present(cls, value: list[str]) -> list[str]:
+        if any(not asset_id.strip() for asset_id in value):
+            raise ValueError("Asset id cannot be blank")
+        return [asset_id.strip() for asset_id in value]
+
     @model_validator(mode="after")
     def _last_frame_needs_first(self) -> RemoteEnhancePromptRequest:
         if self.lastImageAssetId and not self.imageAssetId:
             raise ValueError("Last frame requires a first-frame image")
-        if not self.prompt.strip() and not self.imageAssetId:
-            raise ValueError("Prompt is required unless an image is provided")
+        if self.videoAssetId and self.lastImageAssetId:
+            raise ValueError("A video cannot be combined with a last-frame image")
+        if self.videoAssetId and self.imageAssetId and self.icLoraId is None:
+            raise ValueError("A video combines with an image only for an IC-LoRA look image")
+        if (
+            not self.prompt.strip()
+            and not self.imageAssetId
+            and not self.imageAssetIds
+            and not self.videoAssetId
+        ):
+            raise ValueError("Prompt is required unless an image or video is provided")
         return self
 
 
@@ -86,17 +113,28 @@ def route_remote_enhance_prompt(
         provider = handler.prompt_enhancement.status(
             prefer_gemini=True
         ).defaultProvider
-    desktop_req = EnhancePromptRequest(
-        prompt=req.prompt,
-        loraCatalogIds=req.loraCatalogIds,
-        imageAssetId=req.imageAssetId,
-        lastImageAssetId=req.lastImageAssetId,
-        provider=provider,
-        mediaType=req.mediaType,
-    )
+    try:
+        desktop_req = EnhancePromptRequest(
+            prompt=req.prompt,
+            loraCatalogIds=req.loraCatalogIds,
+            icLoraId=req.icLoraId,
+            imageAssetId=req.imageAssetId,
+            lastImageAssetId=req.lastImageAssetId,
+            imageAssetIds=req.imageAssetIds,
+            aspectRatio=req.aspectRatio,
+            resolution=req.resolution,
+            videoAssetId=req.videoAssetId,
+            replacedWindow=req.replacedWindow,
+            provider=provider,
+            mediaType=req.mediaType,
+        )
+    except ValidationError as exc:
+        # The Remote model does not repeat the selection rules. A bad mix is the client's error.
+        reason = str(exc.errors()[0]["msg"]).removeprefix("Value error, ")
+        raise HTTPError(422, reason) from exc
     try:
         return handler.prompt_enhancement.enhance(
-            resolve_enhance_image_assets(handler.assets, desktop_req)
+            resolve_enhance_media_assets(handler.assets, desktop_req)
         )
     except HTTPError as exc:
         raise _sanitize_enhance_http_error(exc) from exc

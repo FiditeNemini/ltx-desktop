@@ -93,13 +93,26 @@ def test_stage_2_canvas_of_a_1250x704_source_at_720p_keeps_the_source_height() -
     assert canvas == (1216, 704)
 
 
-def test_stage_2_canvas_never_upscales_a_540p_source() -> None:
-    # 960x540 on the 64 grid is 896x512 (1.4% off aspect). 960x576 would exceed the source.
-    for resolution in (None, TargetResolution(width=1920, height=1080)):
-        width, height = _stage_2_ic_lora_canvas(960, 540, resolution)
-        assert (width, height) == (896, 512)
-        assert width <= 960 and height <= 540
-        assert width % 64 == 0 and height % 64 == 0
+def test_stage_2_canvas_without_a_requested_resolution_stays_inside_a_540p_source() -> None:
+    # Gen Space sends no resolution. Growing there would upscale every clip by default.
+    width, height = _stage_2_ic_lora_canvas(960, 540)
+    assert (width, height) == (896, 512)
+    assert width <= 960 and height <= 540
+
+
+def test_stage_2_canvas_of_a_540p_source_at_the_1080p_cell_upscales_to_the_cell() -> None:
+    assert _stage_2_ic_lora_canvas(960, 540, TargetResolution(width=1920, height=1088)) == (1920, 1088)
+
+
+def test_stage_2_canvas_of_a_270p_source_stops_at_twice_the_source_not_at_the_cell() -> None:
+    width, height = _stage_2_ic_lora_canvas(480, 270, TargetResolution(width=1920, height=1088))
+    assert (width, height) == (896, 512)
+    assert width <= 2 * 480 and height <= 2 * 270
+
+
+def test_stage_2_canvas_of_a_1080p_source_at_the_1080p_cell_does_not_grow_past_the_source() -> None:
+    # 1920x1088 would raise the job budget of every 1080p source. It already fills the cell.
+    assert _stage_2_ic_lora_canvas(1920, 1080, TargetResolution(width=1920, height=1088)) == (1856, 1024)
 
 
 def test_stage_2_canvas_of_a_2160p_source_without_a_resolution_is_the_1080p_cell() -> None:

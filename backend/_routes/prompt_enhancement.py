@@ -10,7 +10,7 @@ from api_types import (
     PromptEnhancerStatusResponse,
 )
 from app_handler import AppHandler
-from services.prompt_enhancement.resolve_enhance_assets import resolve_enhance_image_assets
+from services.prompt_enhancement.resolve_enhance_assets import resolve_enhance_media_assets
 from state import get_state_service
 
 router = APIRouter(prefix="/api", tags=["prompt-enhancement"])
@@ -31,5 +31,5 @@ def route_enhance_prompt(
 ) -> EnhancePromptResponse:
     """POST /api/enhance-prompt."""
     return handler.prompt_enhancement.enhance(
-        resolve_enhance_image_assets(handler.assets, req)
+        resolve_enhance_media_assets(handler.assets, req)
     )

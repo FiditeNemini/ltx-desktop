@@ -4,18 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 import logging
-import platform
 from typing import TYPE_CHECKING
 
 import torch
 
 from runtime_config.runtime_policy import CUDA_CPU_OFFLOAD_RAM_FLOOR_GB, should_disk_stream_cuda_weights
 from services.services_utils import AudioOrNone, PipelineTilingType, TilingConfigType
+from services.storage_info.storage_info import DriveType
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ltx_core.components.guiders import MultiModalGuiderParams
+    from ltx_core.model.video_vae.transformer.config import DiffVAEMode
     from ltx_pipelines.utils.model_paths import ModelPaths
     from ltx_pipelines.utils.types import OffloadMode
 
@@ -36,17 +37,6 @@ def host_available_bytes() -> int:
     import psutil
 
     return int(psutil.virtual_memory().available)
-
-
-def host_total_gib() -> int | None:
-    """Total system RAM in GiB, or None if it cannot be queried."""
-    try:
-        import psutil
-
-        return int(psutil.virtual_memory().total // (1024**3))
-    except Exception:
-        logger.warning("Failed to query total system RAM", exc_info=True)
-        return None
 
 
 def diffvae_activation_budget_bytes(device: torch.device | None = None) -> int:
@@ -79,8 +69,13 @@ def resolve_tiling_config(
     width: int,
     num_frames: int,
     device: torch.device | None = None,
+    diffvae_optimization: DiffVAEMode | None = None,
 ) -> TilingConfigType:
-    """Same recommendation ``AUTO_TILING`` resolves to, for pipelines that decode themselves."""
+    """Same recommendation ``AUTO_TILING`` resolves to, for pipelines that decode themselves.
+
+    ``height`` and ``width`` are the size the decoder sees, not the pipeline canvas.
+    """
+    from ltx_core.model.video_vae.transformer.config import DiffVAEMode
     from ltx_pipelines.utils.helpers import get_device, tiling_config_for_vae
 
     if device is None:
@@ -92,7 +87,89 @@ def resolve_tiling_config(
         num_frames=num_frames,
         device=device,
         free_bytes=diffvae_activation_budget_bytes(device),
+        # CHUNKED_EAGER is upstream's own default for ``tiling_config_for_vae``. It is spelled
+        # out here because the parameter is optional on this wrapper, not to change the mode.
+        diffvae_optimization=DiffVAEMode.CHUNKED_EAGER if diffvae_optimization is None else diffvae_optimization,
     )
+
+
+def is_decode_tile_shortage(exc: BaseException) -> bool:
+    """True when the failure is the DiffVAE resolver fitting no tile in budget.
+
+    Matches the upstream ``recommended_decode_tiling_config`` refusal by its
+    message prefix — the only signal it offers (a bare ValueError). Any other
+    ValueError (bad geometry, unreadable checkpoint) must propagate untouched:
+    those do not get better with a bigger budget.
+    """
+    return isinstance(exc, ValueError) and str(exc).startswith("Cannot fit a DiffVAE decode tile")
+
+
+def stable_cuda_decode_budget_bytes(
+    *, fraction: float, device_total_bytes: int, raw_free_bytes: int, reserved_bytes: int
+) -> int:
+    """Decode-phase CUDA budget: the cap, minus what other processes hold.
+
+    The resolver asks too early (right after text encoding, transformer still
+    resident) and reads a transient low-water mark. Post-evict decode enjoys
+    everything no other process holds — raw device free plus our own reserved
+    pool, which the evict frees — capped by our per-process fraction. Pure
+    arithmetic over torch reads the caller supplies, so it unit-tests on CPU.
+    """
+    return max(0, min(int(fraction * device_total_bytes), raw_free_bytes + reserved_bytes))
+
+
+def resolve_cuda_decode_tiling_retry(
+    vae_checkpoint_path: str,
+    *,
+    height: int,
+    width: int,
+    num_frames: int,
+    chunk_pixel_frames: int | None,
+    device: torch.device,
+    keyframes: bool,
+    diffvae_optimization: DiffVAEMode,
+) -> TilingConfigType:
+    """Decode tiling resolved against the stable budget — the R8 retry.
+
+    Call only after the momentary-budget resolution refused with a decode-tile
+    shortage (see ``is_decode_tile_shortage``): the first attempt already proved
+    the transient number too small, so this one prices against what decode will
+    actually enjoy post-evict. A refusal here is a genuine floor (the R5 family)
+    and propagates to the caller as today's 400.
+
+    Resolves per-window frames like upstream (frame-grid snap plus the chunk
+    cap); decode re-resolves post-evict anyway (``diffvae_decode_vram`` patch),
+    so this config only survives the early gate and tiles the reference encode.
+    CUDA-only by contract — the caller keeps every other device on AUTO_TILING.
+    """
+    from ltx_pipelines.utils.helpers import snap_frames_to_grid, tiling_config_for_vae
+
+    resolve_frames = snap_frames_to_grid(num_frames)
+    if chunk_pixel_frames is not None:
+        resolve_frames = min(resolve_frames, chunk_pixel_frames)
+    raw_free, device_total = torch.cuda.mem_get_info(device)
+    stable = stable_cuda_decode_budget_bytes(
+        fraction=torch.cuda.get_per_process_memory_fraction(device),
+        device_total_bytes=device_total,
+        raw_free_bytes=raw_free,
+        reserved_bytes=torch.cuda.memory_reserved(device),
+    )
+    tiling = tiling_config_for_vae(
+        vae_checkpoint_path,
+        height=height,
+        width=width,
+        num_frames=resolve_frames,
+        diffvae_optimization=diffvae_optimization,
+        device=device,
+        free_bytes=stable,
+        keyframes=keyframes,
+    )
+    logger.info(
+        "[ic-lora] decode-tiling retry against a %.2f GiB stable budget: %s",
+        stable / 1024**3,
+        tiling,
+    )
+    return tiling
 
 
 def build_model_paths(
@@ -135,18 +212,42 @@ def video_chunks_number(num_frames: int, tiling_config: TilingConfigType | None)
     return int(get_video_chunks_number(num_frames, tiling_config))
 
 
-def offload_mode_for_prefetch_count(streaming_prefetch_count: int | None, device: torch.device) -> OffloadMode:
+def _disk_stream_reason(system: str, ram_gb: int | None) -> str:
+    if system == "Windows":
+        return "checkpoint volume is NVMe on Windows CUDA"
+    if ram_gb is None:
+        return (
+            "host RAM unknown on Linux CUDA; failing closed below the "
+            f"{CUDA_CPU_OFFLOAD_RAM_FLOOR_GB} GiB pinned-CPU floor (LTX-Desktop#163)"
+        )
+    return (
+        f"host RAM {ram_gb} GiB on Linux CUDA is below the "
+        f"{CUDA_CPU_OFFLOAD_RAM_FLOOR_GB} GiB floor for pinned CPU streaming (LTX-Desktop#163)"
+    )
+
+
+def offload_mode_for_prefetch_count(
+    streaming_prefetch_count: int | None,
+    device: torch.device,
+    *,
+    drive_type: DriveType | None,
+    system: str,
+    ram_bytes: int | None,
+) -> OffloadMode:
     """Translate the desktop's streaming_prefetch_count knob to ltx_pipelines' OffloadMode.
 
-    ltx_pipelines moved weight streaming from a per-call prefetch-count int to a
-    construction-time OffloadMode enum (NONE/CPU/DISK). Desktop's runtime policy
-    (runtime_config/runtime_policy.py) distinguishes fully resident (None) vs streaming
-    (an int); which *kind* of streaming depends on the device's memory model:
+    Pure over explicit inputs: prefetch distinguishes fully resident (None) vs
+    streaming (an int); device picks the memory model; system/RAM/drive pick the
+    CUDA streaming kind. Callers pass frozen startup facts — no platform or
+    psutil reads inside, so the verdict is stable and trivially testable.
 
     - CUDA: system RAM is separate from VRAM, so OffloadMode.CPU pins the blocks in host
       RAM and streams them to the smaller VRAM — the fast streaming path. On Linux,
       that pin is unswappable and needs ~36 GB host RAM; 32 GB machines (the advertised
-      local-gen floor) must use OffloadMode.DISK instead (LTX-Desktop#163).
+      local-gen floor) must use OffloadMode.DISK instead (LTX-Desktop#163). On Windows,
+      the checkpoint drive routes instead: NVMe maps ~70 GB per generation in ~20 s
+      (and commits ~5 GB host RAM against ~34 pinned), so NVMe streams from DISK while
+      SATA and unknown drives stay on CPU.
     - MPS (Apple Silicon): CPU-pinned weights live in the *same* unified RAM as the GPU,
       so OffloadMode.CPU (which pins every block, ~46 GB for the bf16 transformer) OOMs.
       OffloadMode.DISK mmaps blocks from the checkpoint through a small pinned buffer
@@ -160,22 +261,9 @@ def offload_mode_for_prefetch_count(streaming_prefetch_count: int | None, device
     if device.type == "mps":
         return OffloadMode.DISK
     if device.type == "cuda":
-        system = platform.system()
-        ram_gb = host_total_gib() if system == "Linux" else None
-        if should_disk_stream_cuda_weights(system, ram_gb):
-            if ram_gb is None:
-                logger.info(
-                    "Using OffloadMode.DISK on Linux CUDA: host RAM unknown; "
-                    "failing closed below the %s GiB pinned-CPU floor (LTX-Desktop#163).",
-                    CUDA_CPU_OFFLOAD_RAM_FLOOR_GB,
-                )
-            else:
-                logger.info(
-                    "Using OffloadMode.DISK on Linux CUDA: host RAM %s GiB is below the "
-                    "%s GiB floor for pinned CPU streaming (LTX-Desktop#163).",
-                    ram_gb,
-                    CUDA_CPU_OFFLOAD_RAM_FLOOR_GB,
-                )
+        ram_gb = ram_bytes // (1024**3) if ram_bytes is not None else None
+        if should_disk_stream_cuda_weights(system, ram_gb, drive_type=drive_type):
+            logger.info("Using OffloadMode.DISK: %s", _disk_stream_reason(system, ram_gb))
             return OffloadMode.DISK
     return OffloadMode.CPU
 

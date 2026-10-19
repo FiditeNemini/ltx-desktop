@@ -218,7 +218,11 @@ class TestLocalVideoAlwaysEnhances:
         response = client.post("/api/generate", json=_T2V_JSON)
 
         assert response.status_code == 200
-        assert response.json() == {"status": "cancelled"}
+        assert response.json() == {
+            "status": "cancelled",
+            "load_mode": "full_models_loading",
+            "offload_mode": "NONE",
+        }
         assert fake_services.fast_video_pipeline.generate_calls == []
         assert not any(
             record.getMessage().startswith("Automatic local enhancement failed")

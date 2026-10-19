@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from threading import Event, Lock, Thread
 
 from mps_prebuilt_ext import mps_memory_sample, reset_mps_sdpa_stats
+from server_utils.generation_liveness import liveness_hold
 from server_utils.units import gib
 
 logger = logging.getLogger(__name__)
@@ -35,11 +36,15 @@ def cuda_memory_sample() -> str | None:
         return None
     try:
         free, total = torch.cuda.mem_get_info()
+        # Retries are cudaMalloc failures that flushed the cache; a count that climbs
+        # while reserved sits at capacity is allocator thrash, not slow compute.
+        retries = int(torch.cuda.memory_stats().get("num_alloc_retries", 0))
         return (
             f"allocated={gib(torch.cuda.memory_allocated()):.2f}GiB "
             f"reserved={gib(torch.cuda.memory_reserved()):.2f}GiB "
             f"peak={gib(torch.cuda.max_memory_allocated()):.2f}GiB "
-            f"free={gib(free):.2f}/{gib(total):.2f}GiB"
+            f"free={gib(free):.2f}/{gib(total):.2f}GiB "
+            f"alloc_retries={retries}"
         )
     except Exception:
         logger.warning("[heartbeat] cuda sample failed", exc_info=True)
@@ -70,42 +75,45 @@ def log_heartbeat(label: str, interval_s: float = 15.0) -> Iterator[None]:
     Only one ticker runs at a time. A nested or overlapping caller is silent so
     Desktop and Remote QueueRunners in the same process cannot dump interleaved
     heartbeats. A single queue loop already serializes GPU work; the lock is for
-    the dual-runner case (``remote/controller.py``).
+    the dual-runner case (``remote/controller.py``). Every caller — ticker or
+    silent — holds the liveness file, so the Electron kill-grace covers the
+    union of overlapping generations, not just the ticker's span.
     """
-    if not _active.acquire(blocking=False):
-        yield
-        return
-    try:
-        _reset_stats()
-        stop = Event()
-        start = time.perf_counter()
+    with liveness_hold():
+        if not _active.acquire(blocking=False):
+            yield
+            return
+        try:
+            _reset_stats()
+            stop = Event()
+            start = time.perf_counter()
 
-        def _beat() -> None:
-            while not stop.wait(interval_s):
+            def _beat() -> None:
+                while not stop.wait(interval_s):
+                    elapsed = time.perf_counter() - start
+                    sample = _device_sample()
+                    if sample is not None:
+                        logger.info("[heartbeat] %s %.0fs | %s", label, elapsed, sample)
+                    else:
+                        logger.info("[heartbeat] %s still running… %.0fs elapsed", label, elapsed)
+
+            thread = Thread(target=_beat, name="generation-heartbeat", daemon=True)
+            thread.start()
+            failed = False
+            try:
+                yield
+            except BaseException:
+                failed = True
+                raise
+            finally:
+                stop.set()
+                thread.join(timeout=1.0)
                 elapsed = time.perf_counter() - start
+                status = "failed" if failed else "done"
                 sample = _device_sample()
                 if sample is not None:
-                    logger.info("[heartbeat] %s %.0fs | %s", label, elapsed, sample)
+                    logger.info("[heartbeat] %s %s %.0fs | %s", label, status, elapsed, sample)
                 else:
-                    logger.info("[heartbeat] %s still running… %.0fs elapsed", label, elapsed)
-
-        thread = Thread(target=_beat, name="generation-heartbeat", daemon=True)
-        thread.start()
-        failed = False
-        try:
-            yield
-        except BaseException:
-            failed = True
-            raise
+                    logger.info("[heartbeat] %s %s %.0fs", label, status, elapsed)
         finally:
-            stop.set()
-            thread.join(timeout=1.0)
-            elapsed = time.perf_counter() - start
-            status = "failed" if failed else "done"
-            sample = _device_sample()
-            if sample is not None:
-                logger.info("[heartbeat] %s %s %.0fs | %s", label, status, elapsed, sample)
-            else:
-                logger.info("[heartbeat] %s %s %.0fs", label, status, elapsed)
-    finally:
-        _active.release()
+            _active.release()

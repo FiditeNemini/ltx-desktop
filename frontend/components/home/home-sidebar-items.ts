@@ -40,6 +40,7 @@ export function planHomeSidebarItems(input: {
 
 export type HomeSidebarNavItemId =
   | "home"
+  | "assistant"
   | HomeFeatureId
   | "assets"
   | "remote"

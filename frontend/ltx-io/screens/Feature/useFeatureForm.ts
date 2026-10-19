@@ -66,9 +66,9 @@ export function useFeatureForm<
   const generationsQuery = useGenerations(definition.id, {
     keepPolling: keepPollingId != null,
   });
-  const cancelGeneration = useCancelGeneration(definition.id);
-  const retryGeneration = useRetryGeneration(definition.id);
-  const deleteGeneration = useDeleteGeneration(definition.id);
+  const cancelGeneration = useCancelGeneration();
+  const retryGeneration = useRetryGeneration();
+  const deleteGeneration = useDeleteGeneration();
 
   const [revealedIssueIds, setRevealedIssueIds] = useState<Set<string>>(
     () => new Set(),
@@ -183,16 +183,16 @@ export function useFeatureForm<
   }, [context, definition, setValues]);
 
   const generateWithProvenance = useCallback(
-    (promptProvenance: PromptProvenance) => {
+    (promptProvenance: PromptProvenance): boolean => {
       const submittedSeed = readCachedGenerationSeed(queryClient);
-      if (!canGenerate || submittedSeed == null) return;
+      if (!canGenerate || submittedSeed == null) return false;
       const currentIssues = definition.validate(values, context);
       const blockingIssues = currentIssues.filter(
         (issue) => issue.blocksGenerate !== false,
       );
       if (blockingIssues.length > 0) {
         setRevealedIssueIds(new Set(currentIssues.map((issue) => issue.id)));
-        return;
+        return false;
       }
       setRevealedIssueIds(new Set());
       createGeneration.reset();
@@ -220,6 +220,7 @@ export function useFeatureForm<
           }
         },
       });
+      return true;
     },
     [
       canGenerate,
@@ -268,6 +269,7 @@ export function useFeatureForm<
     isCreating: createGeneration.isPending,
     generations: visibleGenerations,
     isGenerationsLoading: generationsQuery.isPending,
+    isGenerationsFetching: generationsQuery.isFetching,
     generationsError,
     cancel: (generationId: string) => {
       createGeneration.reset();

@@ -36,7 +36,10 @@ ALLOWED_INGEST_SUFFIXES = (
 
 MAX_IMAGE_BYTES = 50 * 1024 * 1024
 MAX_AUDIO_BYTES = 100 * 1024 * 1024
-MAX_VIDEO_BYTES = 100 * 1024 * 1024
+# Local video inputs and trims. A 4K clip of 10 s can pass 100 MB.
+MAX_VIDEO_BYTES = 500 * 1024 * 1024
+# Remote (phone) uploads keep the smaller limit.
+MAX_VIDEO_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_IMAGE_PIXELS = 50_000_000
 
 _EXT_BY_MIME = {
@@ -372,6 +375,19 @@ def _probe_file(path: Path) -> tuple[MediaKind, str, AssetMetadata]:
         )
     logger.warning("unsupported media type for %s", path)
     raise MediaError("UNSUPPORTED_MEDIA", "unsupported media type")
+
+
+def first_audio_codec(path: Path) -> str | None:
+    """Codec name of the first audio stream, or None when the file has no audio."""
+    try:
+        with av.open(str(path)) as container:
+            for stream in container.streams:
+                if stream.type == "audio":
+                    return stream.codec_context.name
+    except av.FFmpegError as exc:
+        logger.warning("unreadable media file %s: %s", path, exc)
+        raise MediaError("UNREADABLE_MEDIA", "unreadable media file") from exc
+    return None
 
 
 def media_has_audio(path: str) -> bool:

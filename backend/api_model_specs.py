@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
 from api_types import (
+    BudgetReadout,
+    ChunkedFastCell,
     DownloadedLocalVideoGenerationModelSpecItem,
+    DroppedFastAspectCell,
+    DroppedFastCell,
     GenerateVideoModelsSpecsResponse,
     GenerateVideoRequest,
     LTXLocalModelId,
@@ -19,12 +24,18 @@ from api_types import (
     LTXVideoGenFps,
     LTXVideoGenPipeline,
     LTXVideoGenResolution,
+    LocalUnavailableReason,
+    WarnedFastAspectCell,
+    WarnedFastCell,
 )
+from frame_math import compute_num_frames
 from keyframe_request import validate_keyframe_inputs
+from runtime_config.fast_chunking import job_window_count
 from runtime_config.ltx_capabilities import (
     CanvasMode,
     LtxOfferingCapabilities,
     api_caps,
+    budget_pixels,
     budget_size,
     effective_local_caps,
     local_canvas,
@@ -40,8 +51,31 @@ from runtime_config.model_download_specs import (
     get_ltx_model_spec,
     is_duration_head_ready,
 )
-from runtime_config.runtime_policy import LocalGenerationMode
-from runtime_config.video_job_budget import advertised_fast_durations
+from runtime_config.reject_reasons import (
+    LoadRiskTier,
+    ShortfallKind,
+    VideoJobRejectReason,
+)
+from runtime_config.video_job_budget import (
+    BudgetFeature,
+    LocalJobFilter,
+    VideoJobLoad,
+    VideoJobReject,
+    decide_fast_durations,
+    decide_video_job,
+    load_headroom_gib,
+    load_risk_tier,
+    reject_message_and_code,
+    reject_over_gib,
+    reject_over_ram_gb,
+    reject_shortfall_kind,
+    budget_readout_for_reject,
+    risk_for_reject,
+    tight_fit_message,
+    tight_readout,
+    unmeasured_message,
+    untested_readout,
+)
 from server_utils.media_validation import normalize_optional_path
 
 # The concrete ltxv-api model id each Desktop-facing pipeline maps to when forced onto
@@ -228,73 +262,291 @@ def _item_with_caps(
     )
 
 
+def _dropped_cell_message(
+    decision: VideoJobReject,
+    job_filter: LocalJobFilter,
+) -> str:
+    """List-time refusal copy for one withheld cell.
+
+    Same builder as the request-time 422s over the figures the gate
+    compared, so a cell refused in the picker reads identically if it
+    ever 422s.
+    """
+    message, _code = reject_message_and_code(decision, job_filter)
+    return message
+
+
+_UNSUPPORTED_DROPPED_DECISION = VideoJobReject(
+    seq=0.0, full_gib=0.0, stream_gib=0.0, reason="unsupported"
+)
+
+
+def _unsupported_dropped_cells(
+    specs: dict[LTXVideoGenResolution, LTXVideoGenerationResolutionSpec],
+    *,
+    audio: bool,
+    job_filter: LocalJobFilter,
+) -> list[DroppedFastCell]:
+    """Every static cell withheld with `unsupported`, no decisions needed."""
+    return [
+        DroppedFastCell(
+            resolution=resolution,
+            fps=fps,
+            duration=duration,
+            reason="unsupported",
+            message=_dropped_cell_message(
+                _UNSUPPORTED_DROPPED_DECISION, job_filter
+            ),
+            audio=audio,
+        )
+        for resolution, spec in specs.items()
+        for fps, durations in spec.fps_to_durations.items()
+        for duration in durations
+    ]
+
+
+def _warned_cell_parts(
+    load: VideoJobLoad,
+    job_filter: LocalJobFilter,
+    *,
+    feature: BudgetFeature,
+) -> tuple[LoadRiskTier, float | None, str, BudgetReadout] | None:
+    """Warning tier, headroom, and tooltip for a kept cell, if it warns.
+
+    Single home for warned-cell emission (base cells and aspect cells): tight
+    cells carry available-minus-ask headroom, unmeasured cells compare nothing.
+    None when the cell fits cleanly.
+    """
+    tier = load_risk_tier(load, job_filter, feature=feature)
+    if tier is None:
+        return None
+    if tier == "unmeasured":
+        return (tier, None, unmeasured_message(), untested_readout())
+    headroom = load_headroom_gib(load, job_filter)
+    assert headroom is not None  # a tight tier implies compared figures exist
+    available = headroom + load.stream_gib
+    darwin = job_filter.profile.system == "Darwin"
+    return (
+        tier,
+        headroom,
+        tight_fit_message(load.stream_gib, available, darwin=darwin),
+        tight_readout(load.stream_gib, available),
+    )
+
+
+def _dropped_cell_figures(
+    reject: VideoJobReject, job_filter: LocalJobFilter
+) -> tuple[float | None, int | None, ShortfallKind | None]:
+    """Figure triple for one withheld cell: one ``risk_for_reject`` call, unpacked.
+
+    When it declines (hard wall, or no compared exact bytes) the per-figure
+    helpers still name an integer-fallback total binding, so the fallback keeps
+    those rows byte-identical.
+    """
+    risk = risk_for_reject(reject, job_filter)
+    if risk is not None:
+        return (risk.over_gib, risk.over_ram_gb, risk.shortfall_kind)
+    return (
+        reject_over_gib(reject, job_filter),
+        reject_over_ram_gb(reject, job_filter),
+        reject_shortfall_kind(reject, job_filter),
+    )
+
+
 def _filter_local_fast_resolution_map(
     specs: dict[LTXVideoGenResolution, LTXVideoGenerationResolutionSpec] | None,
     caps: LtxOfferingCapabilities,
     *,
-    memory_gb: float | None,
-    process_mode: LocalGenerationMode,
-    darwin: bool,
+    job_filter: LocalJobFilter,
     mode: CanvasMode = "video",
-) -> dict[LTXVideoGenResolution, LTXVideoGenerationResolutionSpec] | None:
+    audio: bool = False,
+) -> tuple[
+    dict[LTXVideoGenResolution, LTXVideoGenerationResolutionSpec] | None,
+    list[DroppedFastCell],
+    list[DroppedFastAspectCell],
+    list[WarnedFastCell],
+    list[WarnedFastAspectCell],
+    list[ChunkedFastCell],
+]:
     if specs is None:
-        return None
-    if process_mode == "unsupported":
-        return {}
+        return None, [], [], [], [], []
+    if job_filter.profile.process_mode == "unsupported":
+        return {}, _unsupported_dropped_cells(specs, audio=audio, job_filter=job_filter), [], [], [], []
     filtered: dict[LTXVideoGenResolution, LTXVideoGenerationResolutionSpec] = {}
+    dropped: list[DroppedFastCell] = []
+    aspect_dropped: list[DroppedFastAspectCell] = []
+    warned: list[WarnedFastCell] = []
+    aspect_warned: list[WarnedFastAspectCell] = []
+    chunked: list[ChunkedFastCell] = []
     for resolution, spec in specs.items():
         if resolution not in caps.resolution_pixels_16_9:
             raise KeyError(resolution)
         width, height = budget_size(local_canvas(resolution, mode=mode))
         fps_to_durations: dict[LTXVideoGenFps, list[LTXVideoGenDuration]] = {}
         for fps, durations in spec.fps_to_durations.items():
-            kept = advertised_fast_durations(
+            outcome = decide_fast_durations(
                 width,
                 height,
                 int(fps),
                 durations,
-                memory_gb=memory_gb,
-                process_mode=process_mode,
-                darwin=darwin,
+                job_filter=job_filter,
             )
-            if kept:
-                fps_to_durations[fps] = cast(list[LTXVideoGenDuration], kept)
+            if outcome.kept:
+                fps_to_durations[fps] = cast(
+                    list[LTXVideoGenDuration], outcome.kept
+                )
+            for duration, reason in outcome.rejected.items():
+                reject = outcome.rejects[duration]
+                over_gib, over_ram_gb, shortfall_kind = _dropped_cell_figures(
+                    reject, job_filter
+                )
+                reject_window = reject.chunk_pixel_frames
+                dropped.append(
+                    DroppedFastCell(
+                        resolution=resolution,
+                        fps=fps,
+                        duration=cast(LTXVideoGenDuration, duration),
+                        reason=reason,
+                        message=_dropped_cell_message(reject, job_filter),
+                        audio=audio,
+                        over_gib=over_gib,
+                        over_ram_gb=over_ram_gb,
+                        shortfall_kind=shortfall_kind,
+                        readout=budget_readout_for_reject(reject, job_filter),
+                        windows=(
+                            None
+                            if reject_window is None
+                            else job_window_count(
+                                compute_num_frames(duration, int(fps)), reject_window
+                            )
+                        ),
+                        window_frames=reject_window,
+                    )
+                )
+            # Emit warned cells for kept durations
+            for duration in outcome.kept:
+                parts = _warned_cell_parts(
+                    outcome.loads[duration], job_filter, feature="fast"
+                )
+                if parts is None:
+                    continue
+                tier, headroom_gib, message, readout = parts
+                warned.append(
+                    WarnedFastCell(
+                        resolution=resolution,
+                        fps=fps,
+                        duration=cast(LTXVideoGenDuration, duration),
+                        tier=tier,
+                        headroom_gib=headroom_gib,
+                        message=message,
+                        readout=readout,
+                        audio=audio,
+                    )
+                )
+            # Kept durations that run in more than one window, for the "takes longer" notice.
+            for duration in outcome.kept:
+                window = outcome.loads[duration].chunk_pixel_frames
+                if window is None:
+                    continue
+                chunked.append(
+                    ChunkedFastCell(
+                        resolution=resolution,
+                        fps=fps,
+                        duration=cast(LTXVideoGenDuration, duration),
+                        windows=job_window_count(compute_num_frames(duration, int(fps)), window),
+                        window_frames=window,
+                        audio=audio,
+                    )
+                )
+            # Aspect refinement: a kept anchor cell a wider shape cannot run.
+            # Narrower-or-equal shapes cost no more than the anchor, so only
+            # wider ratios (21:9 today) can emit here; the anchor itself and
+            # anchor-dropped cells never do.
+            for duration in outcome.kept:
+                frames = compute_num_frames(duration, int(fps))
+                for ratio in spec.aspect_ratios:
+                    selected_width, selected_height = budget_pixels(
+                        caps, resolution, ratio, mode=mode
+                    )
+                    if selected_width * selected_height <= width * height:
+                        continue
+                    decision = decide_video_job(
+                        selected_width, selected_height, frames, job_filter=job_filter
+                    )
+                    if isinstance(decision, VideoJobReject):
+                        over_gib, over_ram_gb, shortfall_kind = _dropped_cell_figures(
+                            decision, job_filter
+                        )
+                        aspect_dropped.append(
+                            DroppedFastAspectCell(
+                                resolution=resolution,
+                                fps=fps,
+                                duration=cast(LTXVideoGenDuration, duration),
+                                aspectRatio=ratio,
+                                reason=decision.reason,
+                                message=_dropped_cell_message(decision, job_filter),
+                                audio=audio,
+                                over_gib=over_gib,
+                                over_ram_gb=over_ram_gb,
+                                shortfall_kind=shortfall_kind,
+                                readout=budget_readout_for_reject(decision, job_filter),
+                            )
+                        )
+                    else:
+                        parts = _warned_cell_parts(decision, job_filter, feature="fast")
+                        if parts is not None:
+                            tier, headroom_gib, message, readout = parts
+                            aspect_warned.append(
+                                WarnedFastAspectCell(
+                                    resolution=resolution,
+                                    fps=fps,
+                                    duration=cast(LTXVideoGenDuration, duration),
+                                    aspectRatio=ratio,
+                                    tier=tier,
+                                    headroom_gib=headroom_gib,
+                                    message=message,
+                                    readout=readout,
+                                    audio=audio,
+                                )
+                            )
         if fps_to_durations:
             filtered[resolution] = LTXVideoGenerationResolutionSpec(
                 fps_to_durations=fps_to_durations,
                 aspect_ratios=list(spec.aspect_ratios),
             )
-    return filtered
+    return filtered, dropped, aspect_dropped, warned, aspect_warned, chunked
 
 
 def _filter_local_fast_item(
     item: LTXVideoGenerationModelSpecItem,
     caps: LtxOfferingCapabilities,
     *,
-    memory_gb: float | None,
-    process_mode: LocalGenerationMode,
-    darwin: bool,
+    job_filter: LocalJobFilter,
 ) -> LTXVideoGenerationModelSpecItem:
     spec = item.spec
+    kept, dropped, aspect_dropped, warned, aspect_warned, chunked = _filter_local_fast_resolution_map(
+        spec.supported_resolutions_durations,
+        caps,
+        job_filter=job_filter,
+    )
+    a2v_kept, a2v_dropped, a2v_aspect_dropped, a2v_warned, a2v_aspect_warned, a2v_chunked = _filter_local_fast_resolution_map(
+        spec.a2v_supported_resolutions_durations,
+        caps,
+        job_filter=job_filter,
+        mode="a2v",
+        audio=True,
+    )
     return item.model_copy(
         update={
             "spec": spec.model_copy(
                 update={
-                    "supported_resolutions_durations": _filter_local_fast_resolution_map(
-                        spec.supported_resolutions_durations,
-                        caps,
-                        memory_gb=memory_gb,
-                        process_mode=process_mode,
-                        darwin=darwin,
-                    ),
-                    "a2v_supported_resolutions_durations": _filter_local_fast_resolution_map(
-                        spec.a2v_supported_resolutions_durations,
-                        caps,
-                        memory_gb=memory_gb,
-                        process_mode=process_mode,
-                        darwin=darwin,
-                        mode="a2v",
-                    ),
+                    "supported_resolutions_durations": kept,
+                    "a2v_supported_resolutions_durations": a2v_kept,
+                    "dropped_cells": dropped + a2v_dropped,
+                    "dropped_aspect_cells": aspect_dropped + a2v_aspect_dropped,
+                    "warned_cells": warned + a2v_warned,
+                    "warned_aspect_cells": aspect_warned + a2v_aspect_warned,
+                    "chunked_cells": chunked + a2v_chunked,
                 }
             )
         }
@@ -305,10 +557,17 @@ def get_local_video_generation_model_specs(
     model_id: LTXLocalModelId | None = None,
     *,
     duration_head_ready: bool = False,
-    memory_gb: float | None = None,
-    process_mode: LocalGenerationMode | None = None,
-    darwin: bool = False,
+    job_filter: LocalJobFilter | None = None,
 ) -> list[LTXVideoGenerationModelSpecItem]:
+    """Specs for one local model, filtered when a job filter is provided.
+
+    ``job_filter=None`` serves the unfiltered static ceiling (request-shape
+    validation only). Otherwise each row is evaluated under its own model's
+    profile: a downloaded 2.5 row takes the 2.5 Windows profile even while
+    2.3 is active, because profile is (system, model, hardware), not offering.
+    """
+    if job_filter is not None and model_id is None and job_filter.profile.model_id is not None:
+        model_id = job_filter.profile.model_id
     resolved_id = model_id or get_latest_ltx_model_id()
     local_model_spec = get_ltx_model_spec(resolved_id)
     caps = effective_local_caps(resolved_id, duration_head_ready=duration_head_ready)
@@ -316,18 +575,12 @@ def get_local_video_generation_model_specs(
         _item_with_caps(pipeline, spec, caps)
         for pipeline, spec in local_model_spec.supported_pipelines
     ]
-    if process_mode is None:
+    if job_filter is None:
         return items
-    return [
-        _filter_local_fast_item(
-            item,
-            caps,
-            memory_gb=memory_gb,
-            process_mode=process_mode,
-            darwin=darwin,
-        )
-        for item in items
-    ]
+    row_filter = replace(
+        job_filter, profile=replace(job_filter.profile, model_id=resolved_id)
+    )
+    return [_filter_local_fast_item(item, caps, job_filter=row_filter) for item in items]
 
 
 def get_api_video_generation_model_specs() -> list[LTXVideoGenerationModelSpecItem]:
@@ -341,9 +594,7 @@ def get_api_video_generation_model_specs() -> list[LTXVideoGenerationModelSpecIt
 def get_downloaded_local_video_generation_model_specs(
     models_dir: Path,
     *,
-    memory_gb: float | None = None,
-    process_mode: LocalGenerationMode | None = None,
-    darwin: bool = False,
+    job_filter: LocalJobFilter,
 ) -> list[DownloadedLocalVideoGenerationModelSpecItem]:
     items: list[DownloadedLocalVideoGenerationModelSpecItem] = []
     for offering in OFFERING_IDS:
@@ -353,9 +604,7 @@ def get_downloaded_local_video_generation_model_specs(
         for local_item in get_local_video_generation_model_specs(
             model_id,
             duration_head_ready=is_duration_head_ready(models_dir, model_id),
-            memory_gb=memory_gb,
-            process_mode=process_mode,
-            darwin=darwin,
+            job_filter=job_filter,
         ):
             items.append(
                 DownloadedLocalVideoGenerationModelSpecItem(
@@ -367,34 +616,143 @@ def get_downloaded_local_video_generation_model_specs(
     return items
 
 
+def _fast_grid_reject_reasons(
+    specs: dict[LTXVideoGenResolution, LTXVideoGenerationResolutionSpec] | None,
+    caps: LtxOfferingCapabilities,
+    *,
+    job_filter: LocalJobFilter,
+) -> set[VideoJobRejectReason]:
+    """Every reject reason the grid produces under the served filter.
+
+    Mirrors ``_filter_local_fast_resolution_map``'s grid walk (same cells,
+    same filter) but aggregates verdicts instead of maps — no counterfactual
+    inputs. A second reason later is a set-membership check, not a new probe.
+    Single-pass collection would thread outcomes through four pydantic-returning
+    layers to save milliseconds of pure math on an infrequent endpoint — the
+    mirror stays.
+    """
+    reasons: set[VideoJobRejectReason] = set()
+    if specs is None:
+        return reasons
+    for resolution, spec in specs.items():
+        if resolution not in caps.resolution_pixels_16_9:
+            raise KeyError(resolution)
+        width, height = budget_size(local_canvas(resolution, mode="video"))
+        for fps, durations in spec.fps_to_durations.items():
+            outcome = decide_fast_durations(
+                width,
+                height,
+                int(fps),
+                durations,
+                job_filter=job_filter,
+            )
+            reasons.update(outcome.rejected.values())
+    return reasons
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalUnavailableDetails:
+    """Why the local grid is empty, plus RAM numbers when RAM binds.
+
+    Numbers ride with the reason from the same verdicts: required is the floor
+    that actually gated this decision (read from the profile that produced it,
+    not a module constant), detected is the measured total RAM. Both None
+    unless the reason is ram_shortfall.
+    """
+
+    reason: LocalUnavailableReason | None
+    required_ram_gb: int | None
+    detected_ram_gb: int | None
+
+
+_EMPTY_DETAILS = _LocalUnavailableDetails(reason=None, required_ram_gb=None, detected_ram_gb=None)
+
+
+def _local_unavailable_details(
+    local_models: list[LTXVideoGenerationModelSpecItem],
+    *,
+    local_model_id: LTXLocalModelId | None,
+    duration_head_ready: bool,
+    job_filter: LocalJobFilter,
+) -> _LocalUnavailableDetails:
+    """Name RAM when it is the binding constraint on an empty local grid.
+
+    A ``ram_shortfall`` verdict means VRAM and mode already passed, so any
+    such verdict under the served filter proves RAM is what hides the grid —
+    no sufficient-RAM rerun needed. Unknown RAM yields ``unsupported``, never
+    shortfall, so it correctly reports empty details here.
+    """
+    fast = next((item for item in local_models if item.pipeline == "fast"), None)
+    if fast is None or fast.spec.supported_resolutions_durations:
+        return _EMPTY_DETAILS
+    # Same row resolution as get_local_video_generation_model_specs: the probe
+    # must evaluate the model the served maps came from.
+    resolved_id = local_model_id or job_filter.profile.model_id or get_latest_ltx_model_id()
+    row_filter = replace(job_filter, profile=replace(job_filter.profile, model_id=resolved_id))
+    fast_spec = next(
+        (
+            spec
+            for pipeline, spec in get_ltx_model_spec(resolved_id).supported_pipelines
+            if pipeline == "fast"
+        ),
+        None,
+    )
+    if fast_spec is None:
+        return _EMPTY_DETAILS
+    caps = effective_local_caps(resolved_id, duration_head_ready=duration_head_ready)
+    reasons = _fast_grid_reject_reasons(
+        fast_spec.supported_resolutions_durations, caps, job_filter=row_filter
+    )
+    if job_filter.budget_mode == "reckless" and not reasons.isdisjoint(
+        {"stream_over", "ram_shortfall"}
+    ):
+        # Downgradable verdicts exist: reckless renders the warned form, not
+        # the empty-state card, so no reason may survive the mode flip.
+        return _EMPTY_DETAILS
+    if "ram_shortfall" not in reasons:
+        return _EMPTY_DETAILS
+    # Shortfall verdicts prove total RAM is known (unknown yields unsupported),
+    # so detected is present — the assert narrows what the verdicts guarantee.
+    total_ram_bytes = row_filter.budget.total_ram_bytes
+    assert total_ram_bytes is not None
+    return _LocalUnavailableDetails(
+        reason="ram_shortfall",
+        required_ram_gb=row_filter.profile.windows_fast_required_ram_bytes // (1024**3),
+        detected_ram_gb=total_ram_bytes // (1024**3),
+    )
+
+
 def build_generate_video_model_specs_response(
     local_model_id: LTXLocalModelId | None = None,
     *,
     models_dir: Path | None = None,
     duration_head_ready: bool = False,
-    memory_gb: float | None = None,
-    process_mode: LocalGenerationMode | None = None,
-    darwin: bool = False,
+    job_filter: LocalJobFilter,
     low_performance_machine: bool = False,
 ) -> GenerateVideoModelsSpecsResponse:
+    if local_model_id is None and job_filter.profile.model_id is not None:
+        local_model_id = job_filter.profile.model_id
     downloaded = (
         get_downloaded_local_video_generation_model_specs(
             models_dir,
-            memory_gb=memory_gb,
-            process_mode=process_mode,
-            darwin=darwin,
+            job_filter=job_filter,
         )
         if models_dir is not None
         else []
     )
+    local_models = get_local_video_generation_model_specs(
+        local_model_id,
+        duration_head_ready=duration_head_ready,
+        job_filter=job_filter,
+    )
+    unavailable = _local_unavailable_details(
+        local_models,
+        local_model_id=local_model_id,
+        duration_head_ready=duration_head_ready,
+        job_filter=job_filter,
+    )
     return GenerateVideoModelsSpecsResponse(
-        local_models=get_local_video_generation_model_specs(
-            local_model_id,
-            duration_head_ready=duration_head_ready,
-            memory_gb=memory_gb,
-            process_mode=process_mode,
-            darwin=darwin,
-        ),
+        local_models=local_models,
         api_models=get_api_video_generation_model_specs(),
         downloaded_local_models=downloaded,
         active_offering=(
@@ -402,7 +760,11 @@ def build_generate_video_model_specs_response(
             if local_model_id is not None
             else None
         ),
+        local_unavailable_reason=unavailable.reason,
+        local_unavailable_required_ram_gb=unavailable.required_ram_gb,
+        local_unavailable_detected_ram_gb=unavailable.detected_ram_gb,
         low_performance_machine=low_performance_machine,
+        budgetMode=job_filter.budget_mode,
     )
 
 

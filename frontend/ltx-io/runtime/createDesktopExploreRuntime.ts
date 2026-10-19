@@ -20,6 +20,7 @@ import type {
   ExploreApi,
   ExploreAsset,
   ExploreAudioSource,
+  ExploreMediaChooseRequest,
   ExploreMediaInput,
   ExploreRuntime,
 } from "./ExploreRuntime";
@@ -35,6 +36,7 @@ export type DesktopExploreHost = {
   showOpenFileDialog: (input: {
     title?: string;
     filters?: { name: string; extensions: string[] }[];
+    properties?: string[];
   }) => Promise<string[] | null>;
   getPathForFile: (file: File) => string;
   showItemInFolder: (input: { filePath: string }) => void;
@@ -144,18 +146,32 @@ export function createDesktopMediaInput(
 ): ExploreMediaInput {
   const ingestPath = async (filePath: string) =>
     unwrapApiResult(await api.ingestAsset({ path: filePath }));
+  const openDialog = (request: ExploreMediaChooseRequest, properties?: string[]) =>
+    host.showOpenFileDialog({
+      title: request.title,
+      filters: [
+        {
+          name: describeMediaFilter(request),
+          extensions: [...request.extensions],
+        },
+      ],
+      ...(properties ? { properties } : {}),
+    });
+  const ingestAcceptedPath = async (
+    filePath: string,
+    request: ExploreMediaChooseRequest,
+  ) => {
+    if (!isAcceptedMediaFile({ name: filePath, type: "" }, request)) {
+      throw new ApiResultError(UNSUPPORTED_MEDIA_MESSAGE, {
+        code: "UNSUPPORTED_MEDIA",
+      });
+    }
+    return ingestPath(filePath);
+  };
 
   return {
     choose: async (request) => {
-      const paths = await host.showOpenFileDialog({
-        title: request.title,
-        filters: [
-          {
-            name: describeMediaFilter(request),
-            extensions: [...request.extensions],
-          },
-        ],
-      });
+      const paths = await openDialog(request);
       const selected = paths?.[0];
       if (!selected) {
         return null;
@@ -170,12 +186,11 @@ export function createDesktopMediaInput(
         const video = await ingestPath(selected);
         return unwrapApiResult(await api.extractAudio(video.id));
       }
-      if (!isAcceptedMediaFile(picked, request)) {
-        throw new ApiResultError(UNSUPPORTED_MEDIA_MESSAGE, {
-          code: "UNSUPPORTED_MEDIA",
-        });
-      }
-      return ingestPath(selected);
+      return ingestAcceptedPath(selected, request);
+    },
+    chooseMany: async (request) => {
+      const paths = await openDialog(request, ["openFile", "multiSelections"]);
+      return (paths ?? []).map((selected) => () => ingestAcceptedPath(selected, request));
     },
     ingestDroppedFile: async (file) => {
       const filePath = pathForDroppedFile(host, file);
@@ -246,12 +261,16 @@ export function createDesktopExploreRuntime(
     usesLtxApiTextEncoding?: boolean;
     openLtxApiKeySettings?: () => void;
     openTextEncodingSettings?: () => void;
+    budgetMode?: "standard" | "reckless";
+    budgetModeSaving?: boolean;
   },
 ): ExploreRuntime & { modelsVersion: number } {
   const api = options?.api ?? ApiClient;
   const host = options?.host ?? desktopHost();
   return {
     modelsVersion,
+    budgetMode: options?.budgetMode ?? "standard",
+    budgetModeSaving: options?.budgetModeSaving ?? false,
     api,
     wsUrl: options?.wsUrl ?? backendWsUrl,
     mediaInput: createDesktopMediaInput(api, host),

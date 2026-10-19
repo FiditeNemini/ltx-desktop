@@ -1,15 +1,24 @@
 import {
-  isOfferingId,
   restoreOfferingId,
   type DownloadedLocalVideoGenerationModelSpecItem,
   type OfferingId,
 } from "../../../../lib/video-generation-model-specs.ts";
-import { lowPerformanceResolutionWarning } from "../../../lib/lowPerformanceWarning.ts";
+import { namedResolutionDisplayName } from "../../../../lib/video-resolution.ts";
+import { highResEditWarning, lowPerformanceResolutionWarning } from "../../../lib/lowPerformanceWarning.ts";
 import { readGenerationParams } from "../../../lib/resultsFeedModel.ts";
 import type { VideoFeatureContext } from "../../../lib/videoFieldPolicy.ts";
+import {
+  findPreflightCell,
+  firstPassingResolutionKey,
+  preflightFallbackMessage,
+  preflightStatus,
+  resolutionPreflightStatus,
+  type EditPreflightState,
+} from "../../../lib/editPreflight.ts";
 import type { AssetRef, FieldOption, ValidationIssue } from "../types.ts";
 import {
   CELL_SHORT_EDGE,
+  HIGH_RES_CELLS,
   IC_LORA_RESOLUTIONS,
   icLoraResolutionOptions,
   type IcLoraRecipeResolution,
@@ -21,15 +30,21 @@ export type VideoInputContext = VideoFeatureContext & {
   videoDurationPending: boolean;
   videoWidth: number | null;
   videoHeight: number | null;
+  /** Fresh-or-absent edit verdicts for the selected video (null while unknown). */
+  preflight?: EditPreflightState | null;
   videoFps: number | null;
+  /** The `highResVideoToVideo` flag is on. Retake and extend then keep sources up to 2160p, else 1080p. */
+  highResVideoToVideo?: boolean;
 };
 
 /** "original" keeps the source size. Any other key is an IC-LoRA cell below it. */
 export type EditResolutionKey = "original" | IcLoraRecipeResolution;
 
+const ALL_CELLS: readonly IcLoraRecipeResolution[] = [...IC_LORA_RESOLUTIONS, ...HIGH_RES_CELLS];
+
 function resolutionKeyFromSize(width: number, height: number): IcLoraRecipeResolution {
   const shortEdge = Math.min(width, height);
-  return IC_LORA_RESOLUTIONS.reduce((best, cell) =>
+  return ALL_CELLS.reduce((best, cell) =>
     Math.abs(CELL_SHORT_EDGE[cell] - shortEdge) < Math.abs(CELL_SHORT_EDGE[best] - shortEdge)
       ? cell
       : best,
@@ -50,33 +65,94 @@ export function editResolutionKeyFromParams(
 
 /**
  * The IC-LoRA cells below the clip, then Original. Retake and extend never upscale.
- * Original runs at the source size, capped at the 1080p local cell, so its label
- * names that size. Empty when the size is unknown or no cell is below the clip,
- * so the control stays hidden.
+ * Original runs at the source size, capped at the 1080p cell (2160p with the
+ * `highResVideoToVideo` flag), so its label names that size. Empty when the size is unknown or no cell is below the clip,
+ * so the control stays hidden — unless preflight fails the single Original tier,
+ * which reveals it as a disabled display-only box carrying the refusal (a hidden
+ * control could never show why Generate is blocked).
  */
 export function editResolutionFieldOptions(
   width: number | null,
   height: number | null,
   lowPerformanceMachine?: boolean,
+  preflight?: {
+    state: EditPreflightState | null | undefined;
+    minDuration: number;
+  },
+  highResVideoToVideo = false,
 ): FieldOption<EditResolutionKey>[] {
   if (width == null || height == null) return [];
-  const sourceEdge = Math.min(Math.min(width, height), CELL_SHORT_EDGE["1080p"]);
-  const lower = icLoraResolutionOptions({ videoWidth: width, videoHeight: height, specs: null })
+  const options = editResolutionTiers(width, height, highResVideoToVideo).map(([value, label, edge]) => {
+    const warning =
+      highResEditWarning(edge) ?? lowPerformanceResolutionWarning(edge, lowPerformanceMachine);
+    return { value, label, ...(warning ? { warning } : {}) };
+  });
+  if (preflight == null) {
+    return options.length <= 1 ? [] : options;
+  }
+  const withVerdicts: FieldOption<EditResolutionKey>[] = options.map(
+    (option) => {
+      const status = resolutionPreflightStatus(
+        preflight.state,
+        option.value,
+        preflight.minDuration,
+      );
+      if (status.status === "blocked") {
+        return {
+          ...option,
+          disabledReason: preflightFallbackMessage(status),
+          ...(status.readout ? { budget: status.readout } : {}),
+        };
+      }
+      return option;
+    },
+  );
+  if (
+    withVerdicts.length > 1 ||
+    withVerdicts.some((option) => option.disabledReason !== undefined)
+  ) {
+    return withVerdicts;
+  }
+  return [];
+}
+
+/** Every tier the clip can run at, Original last: [key, label, short edge]. */
+function editResolutionTiers(
+  width: number,
+  height: number,
+  highResVideoToVideo: boolean,
+): [EditResolutionKey, string, number][] {
+  const capEdge = CELL_SHORT_EDGE[highResVideoToVideo ? "2160p" : "1080p"];
+  const sourceEdge = Math.min(Math.min(width, height), capEdge);
+  // Edits run at any smaller cell, so the 1440p cell is a lower tier of a 4K source.
+  // It needs the flag, like every cell above 1080p.
+  const lower = icLoraResolutionOptions({
+    videoWidth: width,
+    videoHeight: height,
+    specs: null,
+    highResCells: highResVideoToVideo ? ["1440p"] : [],
+  })
     .filter((option) => CELL_SHORT_EDGE[option.value] < sourceEdge)
     .map((option): [EditResolutionKey, string, number] => [
       option.value,
       option.value,
       CELL_SHORT_EDGE[option.value],
     ]);
-  if (lower.length === 0) return [];
-  const original: [EditResolutionKey, string, number] = [
-    "original",
-    `${sourceEdge}p (Original)`,
-    sourceEdge,
-  ];
-  return [...lower, original].map(([value, label, edge]) => {
-    const warning = lowPerformanceResolutionWarning(edge, lowPerformanceMachine);
-    return { value, label, ...(warning ? { warning } : {}) };
+  return [...lower, ["original", `${namedResolutionDisplayName(sourceEdge)} (Original)`, sourceEdge]];
+}
+
+/**
+ * The tiers the edit preflight verdicts, echoed back by key. Original sends no
+ * size, so the backend resolves the source size exactly like Generate.
+ */
+export function editResolutionPreflightCandidates(
+  width: number,
+  height: number,
+  highResVideoToVideo = false,
+): { key: EditResolutionKey; width: number | null; height: number | null }[] {
+  return editResolutionTiers(width, height, highResVideoToVideo).map(([key]) => {
+    const size = editResolutionSize(key, width, height);
+    return { key, width: size?.width ?? null, height: size?.height ?? null };
   });
 }
 
@@ -84,9 +160,10 @@ export function normalizeEditResolution(
   current: EditResolutionKey,
   width: number | null,
   height: number | null,
+  highResVideoToVideo = false,
 ): EditResolutionKey {
   if (width == null || height == null) return current;
-  const offered = editResolutionFieldOptions(width, height).some((option) => option.value === current);
+  const offered = editResolutionFieldOptions(width, height, undefined, undefined, highResVideoToVideo).some((option) => option.value === current);
   return offered ? current : "original";
 }
 
@@ -100,6 +177,89 @@ export function editResolutionSize(
   if (short >= Math.min(width, height)) return undefined;
   const long = Math.round((Math.max(width, height) * short) / Math.min(width, height));
   return width >= height ? { width: long, height: short } : { width: short, height: long };
+}
+
+/**
+ * Keep the current tier when it passes the minimum duration, else fall back to
+ * the highest passing tier. Unknown (or nothing passing) keeps the current
+ * selection — the create-time preflight stays authoritative.
+ */
+export function resolvePreflightResolution(
+  current: EditResolutionKey,
+  context: VideoInputContext,
+  minDuration: number,
+): EditResolutionKey {
+  if (context.preflight == null) return current;
+  if (
+    resolutionPreflightStatus(context.preflight, current, minDuration).status !==
+    "blocked"
+  ) {
+    return current;
+  }
+  const highestFirst =
+    context.videoWidth == null || context.videoHeight == null
+      ? []
+      : editResolutionTiers(context.videoWidth, context.videoHeight, context.highResVideoToVideo === true)
+          .map(([key]) => key)
+          .reverse();
+  const passing = firstPassingResolutionKey(
+    context.preflight,
+    highestFirst,
+    minDuration,
+  );
+  return passing ?? current;
+}
+
+/**
+ * Preflight issues for the current selection. A blocked minimum-duration
+ * cell disables the resolution. A blocked duration cell disables that field.
+ * A downgraded duration stays selectable with no issue.
+ * Retake attaches the duration issue to the trim field, extend to its
+ * duration presets — hence the parameterized ids. Unknown stays silent.
+ */
+export function editPreflightIssues(options: {
+  video: unknown;
+  preflight: EditPreflightState | null | undefined;
+  resolution: string;
+  duration: number;
+  minDuration: number;
+  resolutionIssueId: string;
+  durationIssueId: string;
+  durationFieldId: string;
+}): ValidationIssue[] {
+  if (options.video == null || options.preflight == null) return [];
+  const resolutionStatus = resolutionPreflightStatus(
+    options.preflight,
+    options.resolution,
+    options.minDuration,
+  );
+  if (resolutionStatus.status === "blocked") {
+    return [
+      {
+        id: options.resolutionIssueId,
+        fieldId: "resolution",
+        message: preflightFallbackMessage(resolutionStatus),
+        alwaysRevealed: true,
+      },
+    ];
+  }
+  const durationStatus = preflightStatus(
+    options.preflight,
+    findPreflightCell(
+      options.preflight,
+      options.resolution,
+      options.duration,
+    ),
+  );
+  if (durationStatus.status !== "blocked") return [];
+  return [
+    {
+      id: options.durationIssueId,
+      fieldId: options.durationFieldId,
+      message: preflightFallbackMessage(durationStatus),
+      alwaysRevealed: true,
+    },
+  ];
 }
 
 export function readAssetRef(value: unknown): AssetRef | null {
@@ -144,9 +304,7 @@ export function capabilityModelOptions(
   capability: VideoCapability,
 ): FieldOption<OfferingId>[] {
   return (specs?.downloaded_local_models ?? [])
-    .filter(
-      (item) => isOfferingId(item.model) && offeringAdvertises(item.spec, capability),
-    )
+    .filter((item) => offeringAdvertises(item.spec, capability))
     .map((item) => ({
       value: item.model,
       label: item.spec.display_name,
@@ -167,8 +325,9 @@ export function resolveCapableModel(
   fallback: OfferingId,
 ): OfferingId {
   const options = capabilityModelOptions(specs, capability);
-  if (isOfferingId(model) && options.some((option) => option.value === model)) {
-    return model;
+  const match = options.find((option) => option.value === model);
+  if (match) {
+    return match.value;
   }
   return options[0]?.value ?? fallback;
 }

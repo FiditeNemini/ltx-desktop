@@ -7,13 +7,18 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Literal, cast
+from typing import Literal, TypedDict, cast
 
-from api_types import PromptProvenance
+from api_types import PipelineOffloadMode, PromptProvenance, VideoLoadMode
+from services.features.ic_lora_recipes import (
+    get_ic_lora_recipe,
+    ic_lora_skips_prompt_enhancement,
+)
 from services.features.lora_recipes import get_lora_recipe
 from services.http_client.http_client import HTTPClient, HttpTransportError
 from services.records import GenerationRecord
 from services.services_utils import JSONValue
+from services.storage_info.storage_info import DriveType
 from services.task_runner.task_runner import TaskRunner
 
 logger = logging.getLogger(__name__)
@@ -23,7 +28,10 @@ GenerationOutcome = Literal["succeeded", "failed", "cancelled"]
 PromptProvenanceLabel = Literal["raw", "manually-enhanced", "auto-enhanced"]
 _HOME_QUEUE_KIND = "video"
 _HOME_QUEUE_EXECUTION = "local"
-_FORCED_UNENHANCED_FEATURES = frozenset({"retake", "extend"})
+# Queued Home Retake and Extend share VideoEditExecutor. It rewrites their prompt in the app
+# only, from stills of the source video, and it never sends the API enhance flag. A blank prompt
+# is also rewritten: the video is enough to write one from.
+_VIDEO_EDIT_FEATURES = frozenset({"retake", "extend"})
 # generate_ended joins generate_started on generation_id. It does not repeat
 # the start payload; attempt stays so a retry of the same id still pairs.
 # The full set is shared/analytics-ended-details.json. Electron drops anything else.
@@ -33,6 +41,8 @@ ENDED_DETAIL_KEYS = (
     "outcome",
     "runtime_ms",
     "error_code",
+    "load_mode",
+    "offload_mode",
 )
 _ENDED_LINK_KEYS = ("generation_id", "attempt")
 
@@ -47,11 +57,14 @@ class QueuedEnhancement:
         prompt_enhancer_enabled: bool,
         use_local_encoding: bool,
         local_enhancer_available: bool = False,
+        gemini_video_enhance: bool = False,
     ) -> None:
         self.explore_auto_enhance_prompts = explore_auto_enhance_prompts
         self.prompt_enhancer_enabled = prompt_enhancer_enabled
         self.use_local_encoding = use_local_encoding
         self.local_enhancer_available = local_enhancer_available
+        # Gemini will rewrite a job's source video (explicit provider choice plus a key).
+        self.gemini_video_enhance = gemini_video_enhance
 
 
 def prompt_provenance_label(
@@ -69,7 +82,7 @@ def prompt_provenance_label(
 
 
 def unenhanced_prompt_provenance(provenance: str) -> PromptProvenanceLabel:
-    """Retake and extend always submit the prompt as-is."""
+    """Gen Space retake and extend, and a recipe that skips the rewrite, submit the prompt as-is."""
     if provenance == "enhanced":
         return "manually-enhanced"
     return "raw"
@@ -85,19 +98,30 @@ def resolution_for_provenance(
     prompt_enhancer_enabled: bool,
     force_api: bool = False,
     local_enhancer_available: bool = False,
+    gemini_video_enhance: bool = False,
+    enhance_blank_prompt: bool = False,
 ) -> tuple[bool, bool, bool] | None:
     """Shared enhance decision for generation and the analytics preview.
 
-    None means a local rewrite will be attempted. Otherwise the tuple is
-    enhance_via_api, enhanced_locally, skip_recipe_wrap.
+    A blank prompt has nothing to expand, unless ``enhance_blank_prompt`` says the rewrite can
+    write one from the job's source video.
+
+    None means a rewrite will be attempted in the app: on local Gemma, or on Gemini when
+    ``gemini_video_enhance`` says it will rewrite the job's source video. Otherwise the tuple
+    is enhance_via_api, enhanced_locally, skip_recipe_wrap.
     """
     skip_recipe_wrap = (
         explore_generation
         and not explore_auto_enhance_prompts
         and provenance != "enhanced"
     )
-    if provenance == "enhanced" or not prompt.strip() or skip_recipe_wrap:
+    blank = not prompt.strip() and not enhance_blank_prompt
+    if provenance == "enhanced" or blank or skip_recipe_wrap:
         return (False, False, skip_recipe_wrap)
+    # A source video the user wants Gemini to see is rewritten in the app, whatever the text
+    # encoding. The server-side API flag cannot see the video.
+    if gemini_video_enhance:
+        return None
     # Home auto-enhance rewrites on the local checkpoint when it is installed.
     # API text encoding is a different switch: leaving the rewrite to that path
     # drops it for style recipes, because the scaffold wrap turns the API flag
@@ -109,14 +133,32 @@ def resolution_for_provenance(
     return None
 
 
-def _recipe_clears_api_enhance(feature: str) -> bool:
-    """Queued LoRA recipes pass a prompt wrap that forces API enhance off.
+def _clears_api_enhance(feature: str) -> bool:
+    """Queued LoRA recipes pass a prompt wrap that forces API enhance off, and queued
+    Retake and Extend never send the flag.
 
     A local rewrite still happens before that wrap. An API rewrite does not:
     the scaffold would be rewritten, so the job encodes the wrapped prompt as-is.
     """
+    if _is_video_edit(feature):
+        return True
     recipe = get_lora_recipe(feature)
     return recipe is not None and recipe.mode in ("t2v", "i2v")
+
+
+def _is_video_edit(feature: str) -> bool:
+    return feature in _VIDEO_EDIT_FEATURES
+
+
+def _has_source_media(generation: GenerationRecord) -> bool:
+    """A job a Gemini media rewrite can see: a source video, or the images of a sheet recipe."""
+    inputs = generation.spec.get("inputs")
+    if not isinstance(inputs, dict):
+        return False
+    if "video" in inputs:
+        return True
+    recipe = get_ic_lora_recipe(generation.feature)
+    return recipe is not None and recipe.kind == "sheet" and "images" in inputs
 
 
 def _stored_provenance(value: object) -> PromptProvenance:
@@ -133,10 +175,11 @@ def queued_prompt_provenance(
     if not isinstance(params, dict):
         return None
     provenance = _stored_provenance(params.get("promptProvenance"))
+    recipe = get_ic_lora_recipe(generation.feature)
+    if recipe is not None and ic_lora_skips_prompt_enhancement(recipe.catalog_id):
+        return unenhanced_prompt_provenance(provenance)
     prompt = params.get("prompt")
     prompt_text = prompt if isinstance(prompt, str) else ""
-    if generation.feature in _FORCED_UNENHANCED_FEATURES:
-        return unenhanced_prompt_provenance(provenance)
     resolved = resolution_for_provenance(
         provenance,
         prompt=prompt_text,
@@ -145,11 +188,13 @@ def queued_prompt_provenance(
         use_local_encoding=enhancement.use_local_encoding,
         prompt_enhancer_enabled=enhancement.prompt_enhancer_enabled,
         local_enhancer_available=enhancement.local_enhancer_available,
+        gemini_video_enhance=enhancement.gemini_video_enhance and _has_source_media(generation),
+        enhance_blank_prompt=_is_video_edit(generation.feature),
     )
     if resolved is None:
         return prompt_provenance_label(provenance, enhanced_locally=True, enhance_via_api=False)
     enhance_via_api, enhanced_locally, skip_recipe_wrap = resolved
-    if _recipe_clears_api_enhance(generation.feature) and not skip_recipe_wrap:
+    if _clears_api_enhance(generation.feature) and not skip_recipe_wrap:
         enhance_via_api = False
     return prompt_provenance_label(
         provenance,
@@ -184,10 +229,28 @@ def _resolution_value(value: object) -> JSONValue | None:
     return None
 
 
+class QueuedHardwareSnapshot(TypedDict, total=False):
+    """Backend hardware facts for the started event. All optional; None drops."""
+
+    gpu_model: str | None
+    total_vram_bytes: int | None
+    free_vram_bytes: int | None
+    drive_type: DriveType | None
+
+
+class QueuedExecutionModes(TypedDict, total=False):
+    """Decided modes for the ended event. None drops (unknown, e.g. edits)."""
+
+    load_mode: VideoLoadMode | None
+    offload_mode: PipelineOffloadMode | None
+
+
 def queued_generation_details(
     generation: GenerationRecord,
     *,
     enhancement: QueuedEnhancement | None = None,
+    hardware: QueuedHardwareSnapshot | None = None,
+    modes: QueuedExecutionModes | None = None,
 ) -> dict[str, JSONValue] | None:
     analytics = generation.spec.get("_analytics")
     if not isinstance(analytics, dict):
@@ -204,6 +267,7 @@ def queued_generation_details(
         "feature": generation.feature,
         "kind": _HOME_QUEUE_KIND,
         "execution": _HOME_QUEUE_EXECUTION,
+        "requested_by": "assistant" if analytics.get("requested_by") == "assistant" else "user",
     }
     params = generation.spec.get("params")
     if not isinstance(params, dict):
@@ -251,6 +315,26 @@ def queued_generation_details(
         provenance = queued_prompt_provenance(generation, enhancement)
         if provenance is not None:
             details["prompt_provenance"] = provenance
+    if hardware is not None:
+        gpu_model = hardware.get("gpu_model")
+        if gpu_model is not None:
+            details["gpu_model"] = gpu_model
+        total_vram_bytes = hardware.get("total_vram_bytes")
+        if total_vram_bytes is not None:
+            details["total_vram_bytes"] = total_vram_bytes
+        free_vram_bytes = hardware.get("free_vram_bytes")
+        if free_vram_bytes is not None:
+            details["free_vram_bytes"] = free_vram_bytes
+        drive_type = hardware.get("drive_type")
+        if drive_type is not None:
+            details["drive_type"] = drive_type
+    if modes is not None:
+        load_mode = modes.get("load_mode")
+        if load_mode is not None:
+            details["load_mode"] = load_mode
+        offload_mode = modes.get("offload_mode")
+        if offload_mode is not None:
+            details["offload_mode"] = offload_mode
     return details
 
 
@@ -269,6 +353,9 @@ def _ended_details(
     ended["runtime_ms"] = max(0, runtime_ms)
     if error_code is not None:
         ended["error_code"] = error_code
+    for key in ENDED_DETAIL_KEYS:
+        if key not in ended and details.get(key) is not None:
+            ended[key] = details[key]
     return ended
 
 

@@ -18,6 +18,7 @@ import {
 } from "../types.ts";
 import {
   capabilityModelOptions,
+  editPreflightIssues,
   editResolutionFieldOptions,
   editResolutionSize,
   editResolutionKeyFromParams,
@@ -27,6 +28,7 @@ import {
   readPrompt,
   readVideoGenerationInput,
   resolveCapableModel,
+  resolvePreflightResolution,
   type VideoInputContext,
   videoLengthUnknownIssue,
   videoRequiredIssue,
@@ -97,6 +99,22 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+/** Wire values create enforces. Validation reads these, never raw form state. */
+function retakeWireValues(values: RetakeValues): {
+  startTime: number;
+  duration: number;
+} {
+  return {
+    // 0.1s grid like duration: the trim is continuous and create prices
+    // the wire values, so rounding the wire start up to the 0.5s preflight
+    // grid over-refuses tail selections (6.3s on an 8.3s clip would wire
+    // as 6.5s + 2.0s = 8.5s > 8.4s). Only the preflight *request* rounds
+    // to 0.5s (RetakeFeatureScreen, to keep drags from refetching).
+    startTime: roundDurationSeconds(values.startTime),
+    duration: roundDurationSeconds(values.duration),
+  };
+}
+
 function regionBounds(context: RetakeContext, startTime: number) {
   const videoLen = context.videoDurationSeconds ?? 0;
   const maxStart = Math.max(0, videoLen - RETAKE_MIN_DURATION_SECONDS);
@@ -152,10 +170,8 @@ function videoLengthIssue(
       alwaysRevealed: true,
     };
   }
-  if (
-    values.startTime + values.duration >
-    context.videoDurationSeconds + 0.1
-  ) {
+  const wire = retakeWireValues(values);
+  if (wire.startTime + wire.duration > context.videoDurationSeconds + 0.1) {
     return {
       id: "retake-selection-out-of-range",
       fieldId: "video",
@@ -164,6 +180,22 @@ function videoLengthIssue(
     };
   }
   return null;
+}
+
+function preflightIssues(
+  values: RetakeValues,
+  context: RetakeContext,
+): ValidationIssue[] {
+  return editPreflightIssues({
+    video: values.video,
+    preflight: context.preflight,
+    resolution: values.resolution,
+    duration: retakeWireValues(values).duration,
+    minDuration: RETAKE_MIN_DURATION_SECONDS,
+    resolutionIssueId: "retake-resolution-too-large",
+    durationIssueId: "retake-selection-too-long",
+    durationFieldId: "video",
+  });
 }
 
 export function validateRetake(
@@ -177,6 +209,7 @@ export function validateRetake(
     const lengthIssue = videoLengthIssue(values, context);
     if (lengthIssue) issues.push(lengthIssue);
   }
+  issues.push(...preflightIssues(values, context));
   return issues;
 }
 
@@ -195,14 +228,15 @@ export function toCreateBody(
   if (values.video == null) {
     throw new Error("Video is required.");
   }
+  const wire = retakeWireValues(values);
   return {
     contract_version: 1,
     inputs: { video: { assetId: values.video.assetId } },
     params: {
       prompt: values.prompt.trim(),
       model: values.model,
-      startTime: values.startTime,
-      duration: roundDurationSeconds(values.duration),
+      startTime: wire.startTime,
+      duration: wire.duration,
       mode: RETAKE_CREATE_MODE,
       promptProvenance: "typed",
       ...editResolutionParam(values, context),
@@ -230,6 +264,8 @@ export function buildRetakeForm(
     context.videoWidth,
     context.videoHeight,
     context.specs?.low_performance_machine,
+    { state: context.preflight, minDuration: RETAKE_MIN_DURATION_SECONDS },
+    context.highResVideoToVideo,
   );
   return {
     fields: [
@@ -282,10 +318,15 @@ export function normalizeRetake(
   context: RetakeContext,
 ): RetakeValues {
   const model = resolveRetakeModel(values.model, context);
-  const resolution = normalizeEditResolution(
-    values.resolution,
-    context.videoWidth,
-    context.videoHeight,
+  const resolution = resolvePreflightResolution(
+    normalizeEditResolution(
+      values.resolution,
+      context.videoWidth,
+      context.videoHeight,
+      context.highResVideoToVideo,
+    ),
+    context,
+    RETAKE_MIN_DURATION_SECONDS,
   );
   // Unknown length is not 0s. Clamping against 0 collapses the 5s-to-end example
   // to a 2s window at the start, then sticks after the duration loads.
@@ -348,7 +389,10 @@ export const retakeDefinition: FeatureDefinition<
   isReady: (values, context) => {
     if (values.video == null) return false;
     if (context.videoDurationPending) return false;
-    return videoLengthIssue(values, context) == null;
+    if (videoLengthIssue(values, context) != null) return false;
+    return preflightIssues(values, context).every(
+      (issue) => issue.blocksGenerate === false,
+    );
   },
   isUnavailable: (_values, context) => !hasAdvertisedRetake(context.specs),
 };

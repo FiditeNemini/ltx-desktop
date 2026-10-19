@@ -1,3 +1,10 @@
+import {
+  CUDA_OOM,
+  CUDA_OOM_MESSAGE,
+  JOB_TOO_LARGE,
+  JOB_TOO_LARGE_MESSAGE,
+} from "../../lib/staticFailureNotices.ts";
+
 // Wording follows the codes stored on generations.error_code.
 const FAILURE_LABELS: Record<string, string> = {
   INTERRUPTED: "Interrupted",
@@ -6,6 +13,8 @@ const FAILURE_LABELS: Record<string, string> = {
   OUTPUT_UNREADABLE: "Unreadable video",
   EXECUTOR_FAILED: "Render failed",
   CAPABILITY_FAILED: "Could not start",
+  [CUDA_OOM]: "Out of memory",
+  [JOB_TOO_LARGE]: "No longer fits",
   LTX_INVALID_API_KEY: "API key rejected",
   LTX_API_PROMPT_EMBEDDING_FAILED: "Prompt encoding failed",
   UNKNOWN: "Unknown error",
@@ -19,6 +28,8 @@ const FIX_HINTS: Record<string, string> = {
   EXECUTOR_FAILED: "The run failed while rendering. Generate again.",
   CAPABILITY_FAILED:
     "This run could not start with the current model or inputs. Check them, then generate again.",
+  [CUDA_OOM]: CUDA_OOM_MESSAGE,
+  [JOB_TOO_LARGE]: JOB_TOO_LARGE_MESSAGE,
   LTX_INVALID_API_KEY:
     "The LTX API key was rejected while encoding the prompt. Update it in Settings.",
   LTX_API_PROMPT_EMBEDDING_FAILED:
@@ -28,17 +39,23 @@ const FIX_HINTS: Record<string, string> = {
 
 export const DASHBOARD_INFO = {
   content:
-    "Finished video clips in this range, including clips you later delete from Assets. The line below is the new footage they hold: each clip's length, and for Retake and Extend only the part you edited.",
+    "Finished video clips in this range, including clips you later delete from Assets. A run that writes more than one video, such as AlphaGen, counts once. The line below is the new footage they hold: each clip's length, and for Retake and Extend only the part you edited.",
   gpu: "How long generation ran in this range. Succeeded and failed runs are included. Cancelled runs are not.",
   success:
     "Succeeded runs divided by succeeded and failed runs. Cancelled runs are listed beside the rate and are not part of it.",
   render:
-    "Typical time to finish a video in the selected range, grouped by resolution, aspect ratio, and length. Includes text, image, audio, and LoRA renders. Retake and Extend are not included. Select a square for the median and the 90th percentile.",
+    "Typical time to finish a video in the selected range, grouped by resolution, aspect ratio, and length. Generate has text, image, audio, and LoRA renders. Retake and Extend, and IC-LoRA, have their own tabs. Select a square for the median and the 90th percentile.",
+  renderEdit:
+    "Columns are the length of the part you edited, to the nearest 2 seconds. Resolution and aspect ratio come from the finished video, matched to the nearest ones the app offers. Run time also depends on the length of the source video, and the grid does not split by it.",
+  renderIcLora:
+    "Columns are the length of the clip, to the nearest 2 seconds. Each style has its own rows. Aspect ratio comes from the finished video, matched to the nearest one the app offers.",
   loras:
-    "Styles used in this range, ranked by number of runs. Keep is the share of that style's clips still in your library, using the same rule as Keep rate.",
+    "Styles and IC-LoRAs used in this range, ranked by number of runs. Keep is the share of that style's clips still in your library, using the same rule as Keep rate.",
+  activity:
+    "Every finished run in this range, by the day it finished. Failed and cancelled runs are included. Colors show the feature.",
   keep: "The share of finished clips in this range that are still in your library. Deleting a clip from Assets, or deleting the generation that made it, marks it as dropped and lowers this rate. Deleted clips stay in the total.",
   usual:
-    "The resolution, aspect ratio, length, and frame rate you finish most often in this range.",
+    "The model, resolution, aspect ratio, length, and frame rate you finish most often in this range.",
 } as const;
 
 export const ACTIVITY_SERIES = [

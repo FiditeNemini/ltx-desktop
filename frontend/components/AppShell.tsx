@@ -11,6 +11,7 @@ import { useAppUpdateModal } from '../hooks/use-app-update'
 import { useDeepLinkCourier } from '../hooks/use-deep-link-courier'
 import { ApiGatewayModal, type ApiGatewaySection } from './ApiGatewayModal'
 import { LogViewer } from './LogViewer'
+import { useToggleLogsShortcut } from './log-viewer/useToggleLogsShortcut'
 import { LtxUpgradePrompt } from './LtxUpgradePrompt'
 import type { AppUpdate } from '../hooks/use-app-update'
 import {
@@ -137,6 +138,11 @@ export function AppShell() {
   const closeSettings = useCallback(() => {
     setSettingsModal((prev) => ({ ...prev, isOpen: false }))
   }, [])
+
+  const openLogs = useCallback(() => setIsLogViewerOpen(true), [])
+  const toggleLogs = useCallback(() => setIsLogViewerOpen((isOpen) => !isOpen), [])
+  // Off while the shortcuts editor is open, so it never swallows a key being recorded.
+  useToggleLogsShortcut(toggleLogs, !isShortcutsEditorOpen)
 
   const isBackendRestarting = layout.isBackendRestarting
   const waitingForRuntimePolicy = layout.connected && !runtimePolicyLoaded
@@ -322,7 +328,7 @@ export function AppShell() {
 
   const chromeControls = useMemo<AppChromeControls>(
     () => ({
-      openLogs: () => setIsLogViewerOpen(true),
+      openLogs,
       openSettings,
       closeSettings,
       isSettingsModalOpen: settingsModal.isOpen,
@@ -332,7 +338,7 @@ export function AppShell() {
         onCheckForUpdates: checkForUpdates,
       },
     }),
-    [checkForUpdates, closeSettings, openModal, openSettings, settingsModal.isOpen, update],
+    [checkForUpdates, closeSettings, openLogs, openModal, openSettings, settingsModal.isOpen, update],
   )
 
   return (

@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 
 import {
   isAwayFromNewestResult,
+  isResultMissing,
   isStillFocusingResult,
   scrollTopToCenter,
   shouldFollowNewestResult,
@@ -28,6 +29,33 @@ describe("isStillFocusingResult", () => {
     assert.equal(isStillFocusingResult("job-a", "job-a"), false);
     assert.equal(isStillFocusingResult("job-b", "job-a"), true);
     assert.equal(isStillFocusingResult(null, "job-a"), false);
+  });
+});
+
+describe("isResultMissing", () => {
+  it("reports a missing card only after the list has settled", () => {
+    assert.equal(
+      isResultMissing({ resultId: "job-a", found: false, listSettled: true }),
+      true,
+    );
+    assert.equal(
+      isResultMissing({ resultId: "job-a", found: false, listSettled: false }),
+      false,
+    );
+  });
+
+  it("does not report a card that is on the page", () => {
+    assert.equal(
+      isResultMissing({ resultId: "job-a", found: true, listSettled: true }),
+      false,
+    );
+  });
+
+  it("does not report when no result is requested", () => {
+    assert.equal(
+      isResultMissing({ resultId: null, found: false, listSettled: true }),
+      false,
+    );
   });
 });
 

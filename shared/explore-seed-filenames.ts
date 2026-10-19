@@ -70,6 +70,21 @@ export const RESTORE_IMAGE_SEED_FILENAME = "restore-first-frame.jpg";
 export const RESTORE_IMAGE_SEED_PREVIOUS_FILENAMES = [] as const;
 /** Bump when the packaged look image changes, so a stored copy is replaced. */
 export const RESTORE_IMAGE_SEED_REVISION = 1;
+/** The pre-made reference sheet that fills the Ingredients form at first open. */
+export const INGREDIENTS_SHEET_SEED_FILENAME = "ingredients-sheet.jpg";
+/** The still that fills the Motion Track form at first open. Same file as ltx.io. */
+export const MOTION_TRACK_IMAGE_SEED = {
+  kind: "motion-track-image",
+  filename: "motion-track-input.jpg",
+} as const;
+/** The start frame that fills the Video Guide form at first open. Same file as ltx.io. */
+export const VIDEO_GUIDE_IMAGE_SEED = {
+  kind: "video-guide-image",
+  filename: "video-guide-start-frame.jpg",
+  previousFilenames: [],
+  /** Bump when the packaged start frame changes, so a stored copy is replaced. */
+  revision: 1,
+} as const;
 /** Single-file packaged seeds resolved by `getPackagedSeedPath({ kind })`. */
 export const PACKAGED_SEED_KINDS = [
   "image-to-video-start-frame",
@@ -87,5 +102,10 @@ export const PACKAGED_SEED_KINDS = [
   "layout-to-render-image",
   "restore-video",
   "restore-image",
+  "ingredients-sheet",
+  "refine-details-video",
+  "motion-track-image",
+  "video-guide-video",
+  "video-guide-image",
 ] as const;
 export type PackagedSeedKind = (typeof PACKAGED_SEED_KINDS)[number];

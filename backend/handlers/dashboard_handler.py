@@ -9,6 +9,7 @@ from services.dashboard_stats import (
     InvalidTimezone,
     LoraUsage,
 )
+from services.features.ic_lora_recipes import IC_LORA_RECIPES
 from services.features.lora_recipes import LORA_RECIPES
 from services.lora_catalog import LoraCatalogProvider
 from services.records import UnavailableError
@@ -48,7 +49,7 @@ class DashboardHandler:
 
     def _named(self, usage: LoraUsage) -> LoraUsage:
         """Runs made before names were stored carry the recipe id. The catalog still knows the name."""
-        recipe = LORA_RECIPES.get(usage.feature)
+        recipe = LORA_RECIPES.get(usage.feature) or IC_LORA_RECIPES.get(usage.feature)
         if recipe is None or usage.name != usage.feature:
             return usage
         item = self._catalog.get_lora(recipe.catalog_id)

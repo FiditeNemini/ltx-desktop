@@ -59,6 +59,7 @@ export function FeatureChromeLayout() {
       {usesPageHeader && breadcrumbs ? (
         <PageHeader
           insetFromShell
+          actionsAtEndWhenWrapped
           showHistoryNav={showHistoryNav}
           leading={breadcrumbs}
           queueControl={queueControl}

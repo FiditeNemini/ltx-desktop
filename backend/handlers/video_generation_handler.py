@@ -26,6 +26,9 @@ from frame_math import (
 from api_types import (
     AudioToVideoParams,
     CreateAudioToVideoParams,
+    EstimateVideoRequest,
+    EstimateVideoResponse,
+    GenerationRisk,
     OfferingId,
     GenerateVideoCancelledResponse,
     GenerateVideoCompleteResponse,
@@ -35,17 +38,29 @@ from api_types import (
     ImageConditioningInput,
     LoraEntry,
     LTXLocalModelId,
+    LTXVideoGenerationModelSpecItem,
     LTXLocalA2VResolution,
+    LTXQueuedAspectRatio,
     LTXVideoGenFps,
     LTXVideoGenResolution,
+    PipelineOffloadMode,
     VideoCameraMotion,
+    VideoLoadMode,
+    WallTimeEstimateResponse,
 )
+from runtime_config.eta import (
+    EtaFeature,
+    EtaLoadMode,
+    WallTimeEstimate,
+    estimate_fast_wall_time_s,
+    is_measured_hardware_class,
+)
+from runtime_config.evict_retry import evict_retry_filter
 from runtime_config.ltx_capabilities import (
     CanvasMode,
     LtxAspectRatio,
     a2v_pixels_for,
-    budget_pixels,
-    budget_size,
+    budget_shape,
     local_canvas,
     local_caps,
     pixels_for,
@@ -57,11 +72,14 @@ from runtime_config.runtime_policy import LocalGenerationMode
 from runtime_config.video_job_budget import (
     LOCAL_GENERATION_UNSUPPORTED,
     LOCAL_GENERATION_UNSUPPORTED_MESSAGE,
-    VIDEO_JOB_TOO_LARGE,
-    VIDEO_JOB_TOO_LARGE_MESSAGE,
+    LocalJobFilter,
+    VideoJobLoad,
     VideoJobReject,
-    decide_video_job,
-    memory_gb_for_job,
+    reject_message_and_code,
+    risk_for_reject,
+    risk_if_allowed,
+    unmeasured_load_risk,
+    vram_snapshot_suffix,
 )
 from _routes._errors import HTTPError
 from api_model_specs import (
@@ -78,8 +96,8 @@ from handlers.generation_handler import GenerationHandler
 from handlers.pipelines_handler import PipelinesHandler
 from handlers.prompt_enhancement_handler import PromptEnhancementHandler
 from handlers.text_handler import TextHandler
-from runtime_config.offerings import resolve_offering_local_model_id
-from runtime_config.model_download_specs import is_duration_head_ready, resolve_active_ltx_model_id
+from runtime_config.offerings import OFFERING_LOCAL_MODEL_IDS, resolve_offering_local_model_id
+from runtime_config.model_download_specs import get_latest_ltx_model_id, is_duration_head_ready, resolve_active_ltx_model_id
 from server_utils.media_validation import (
     normalize_optional_path,
     validate_audio_file,
@@ -88,9 +106,10 @@ from server_utils.media_validation import (
 from server_utils.oriented_image import open_oriented_rgb, oriented_image_file
 from services.denoising_progress import distilled_total_steps
 from services.generation_interrupt import GenerationCancelledError, is_cancel_exception
-from services.interfaces import LTXAPIClient
+from services.interfaces import GpuInfo, LTXAPIClient
 from services.ltx_api_client.ltx_api_client import LTXAPIClientError
 from services.ltx_api_client.ltx_api_errors import map_ltx_api_client_error, missing_ltx_api_key_error
+from services.patches import diffusion_stage_cache
 from state.app_state_types import AppState
 from state.app_settings import should_video_generate_with_ltx_api
 
@@ -117,6 +136,20 @@ def _lora_catalog_ids(loras: list[LoraEntry]) -> list[str]:
 FORCED_API_RESOLUTION_MAP: dict[str, dict[str, dict[str, str]]] = forced_api_resolution_map()
 
 
+def _a2v_fps_durations(
+    item: LTXVideoGenerationModelSpecItem | None,
+    resolution: LTXLocalA2VResolution,
+    fps: LTXVideoGenFps,
+) -> list[int]:
+    duration_map = None if item is None else item.spec.a2v_supported_resolutions_durations
+    if duration_map is None:
+        return []
+    resolution_spec = duration_map.get(resolution)
+    if resolution_spec is None:
+        return []
+    return list(resolution_spec.fps_to_durations.get(fps, []))
+
+
 class VideoGenerationHandler(StateHandlerBase):
     def __init__(
         self,
@@ -128,8 +161,9 @@ class VideoGenerationHandler(StateHandlerBase):
         prompt_enhancement_handler: PromptEnhancementHandler,
         ltx_api_client: LTXAPIClient,
         config: RuntimeConfig,
+        gpu_info: GpuInfo,
     ) -> None:
-        super().__init__(state, lock, config)
+        super().__init__(state, lock, config, gpu_info=gpu_info)
         self._generation = generation_handler
         self._pipelines = pipelines_handler
         self._text = text_handler
@@ -165,28 +199,51 @@ class VideoGenerationHandler(StateHandlerBase):
         except KeyError as exc:
             raise HTTPError(400, invalid_code) from exc
 
-    def _local_job_filter(self) -> tuple[float | None, LocalGenerationMode, bool]:
-        darwin = self.config.darwin_unified_memory
-        return (
-            memory_gb_for_job(
-                vram_gb=self.config.vram_gb,
-                available_ram_gb=self.config.available_ram_gb,
-                darwin=darwin,
-            ),
-            self.config.local_generations_mode,
-            darwin,
-        )
-
     def get_model_specs(self) -> GenerateVideoModelsSpecsResponse:
-        memory_gb, process_mode, darwin = self._local_job_filter()
+        # Display on total: the picker lists every total-fitting cell; GenSpace
+        # refuses over-free cells at click, queued jobs re-check at execute.
+        job_filter = self._local_job_filter(total_only=True)
         return build_generate_video_model_specs_response(
-            local_model_id=self._active_ltx_model_id(),
+            local_model_id=job_filter.profile.model_id,
             models_dir=self.models_dir,
             duration_head_ready=self._duration_head_ready(),
-            memory_gb=memory_gb,
-            process_mode=process_mode,
-            darwin=darwin,
+            job_filter=job_filter,
             low_performance_machine=detect_low_performance_machine(self.config),
+        )
+
+    def estimate_local_fast(self, req: EstimateVideoRequest) -> EstimateVideoResponse:
+        """Pre-generate wall-time estimate for one local Fast cell (ETA v1).
+
+        Budgets exactly like generate (same 422s), then answers from the table.
+        Null estimate means unknown — unlisted cell, off-class hardware, or
+        automatic duration — never an error.
+        """
+        if req.duration is None:
+            return EstimateVideoResponse(estimate=None)
+        canvas_mode: CanvasMode = "a2v" if req.feature == "a2v" else "video"
+        job_filter = self._local_job_filter()
+        # Local models share one pixel grid, so the latest id is exact here
+        # when none is installed.
+        budget_width, budget_height = budget_shape(
+            local_caps(job_filter.profile.model_id or get_latest_ltx_model_id()),
+            req.resolution,
+            req.aspectRatio,
+            mode=canvas_mode,
+        )
+        frames = compute_num_frames(req.duration, req.fps)
+        load_mode, risk = self._video_job_load_mode(
+            budget_width, budget_height, frames, job_filter=job_filter
+        )
+        est = self._estimate_wall_time(
+            budget_width, budget_height, frames, load_mode, req.feature
+        )
+        if est is None:
+            return EstimateVideoResponse(estimate=None, risk=risk)
+        return EstimateVideoResponse(
+            estimate=WallTimeEstimateResponse(
+                seconds=est.seconds, basis=est.basis, t2vReuse=est.t2v_reuse
+            ),
+            risk=risk,
         )
 
     def derive_local_a2v_params(
@@ -196,6 +253,7 @@ class VideoGenerationHandler(StateHandlerBase):
             resolution=params.resolution,
             model=params.model,
             fps=params.fps,
+            aspect_ratio=params.aspectRatio,
             audio_duration_ms=audio_duration_ms,
         )
         return AudioToVideoParams(
@@ -210,6 +268,7 @@ class VideoGenerationHandler(StateHandlerBase):
             resolution=params.resolution,
             model=params.model,
             fps=params.fps,
+            aspect_ratio=params.aspectRatio,
             audio_duration_ms=audio_duration_ms,
         )
         if params.numFrames != num_frames:
@@ -218,6 +277,25 @@ class VideoGenerationHandler(StateHandlerBase):
                 "Audio-to-video frame count no longer matches the selected audio.",
                 code="INVALID_VIDEO_GENERATION_SPEC",
             )
+
+    def _fast_local_spec_item(
+        self,
+        model_id: LTXLocalModelId,
+        *,
+        job_filter: LocalJobFilter | None,
+    ) -> LTXVideoGenerationModelSpecItem | None:
+        return next(
+            (
+                candidate
+                for candidate in get_local_video_generation_model_specs(
+                    model_id,
+                    duration_head_ready=self._duration_head_ready_for(model_id),
+                    job_filter=job_filter,
+                )
+                if candidate.pipeline == "fast"
+            ),
+            None,
+        )
 
     def _prefix_a2v_audio_seconds(
         self,
@@ -231,23 +309,11 @@ class VideoGenerationHandler(StateHandlerBase):
 
         A clip past this cell but inside a longer one is cut to the cell max.
         A clip past every cell is None, so a caller cannot treat it as the
-        whole clip. Missing specs leave the length unchanged.
+        whole clip. Missing specs leave the length unchanged. The cell is the
+        static ceiling: a budget drop is not a shorter cell, or a kept-max
+        would silently trim audio the budget gate should refuse or annotate.
         """
-        memory_gb, process_mode, darwin = self._local_job_filter()
-        item = next(
-            (
-                candidate
-                for candidate in get_local_video_generation_model_specs(
-                    model_id,
-                    duration_head_ready=self._duration_head_ready_for(model_id),
-                    memory_gb=memory_gb,
-                    process_mode=process_mode,
-                    darwin=darwin,
-                )
-                if candidate.pipeline == "fast"
-            ),
-            None,
-        )
+        item = self._fast_local_spec_item(model_id, job_filter=None)
         duration_map = None if item is None else item.spec.a2v_supported_resolutions_durations
         if duration_map is None:
             return audio_duration_seconds
@@ -274,6 +340,7 @@ class VideoGenerationHandler(StateHandlerBase):
         resolution: LTXLocalA2VResolution,
         model: OfferingId,
         fps: LTXVideoGenFps,
+        aspect_ratio: LTXQueuedAspectRatio,
         audio_duration_ms: int,
     ) -> int:
         # Envelope of the checkpoint that will actually run, not the catalog
@@ -281,28 +348,17 @@ class VideoGenerationHandler(StateHandlerBase):
         a2v_model_id = resolve_offering_local_model_id(self.models_dir, model)
         if a2v_model_id is None:
             raise HTTPError(409, "LTX_MODEL_NOT_INSTALLED")
-        memory_gb, process_mode, darwin = self._local_job_filter()
-        item = next(
-            (
-                candidate
-                for candidate in get_local_video_generation_model_specs(
-                    a2v_model_id,
-                    duration_head_ready=self._duration_head_ready_for(a2v_model_id),
-                    memory_gb=memory_gb,
-                    process_mode=process_mode,
-                    darwin=darwin,
-                )
-                if candidate.pipeline == "fast"
-            ),
-            None,
-        )
-        if item is None or item.spec.a2v_supported_resolutions_durations is None:
+        # Shape comes from the static ceiling. The budget filter's kept max is
+        # not a shorter cell: audio inside the ceiling but past the kept max is
+        # a dropped duration, priced below, not "audio is too long".
+        static_item = self._fast_local_spec_item(a2v_model_id, job_filter=None)
+        if static_item is None or static_item.spec.a2v_supported_resolutions_durations is None:
             raise HTTPError(
                 422,
                 "Audio-to-video is not available for the selected offering.",
                 code="INVALID_VIDEO_GENERATION_SPEC",
             )
-        resolution_spec = item.spec.a2v_supported_resolutions_durations.get(resolution)
+        resolution_spec = static_item.spec.a2v_supported_resolutions_durations.get(resolution)
         if resolution_spec is None:
             raise HTTPError(
                 422,
@@ -336,10 +392,9 @@ class VideoGenerationHandler(StateHandlerBase):
                 "Audio is too long for audio-to-video.",
                 code="INVALID_VIDEO_GENERATION_SPEC",
             )
-        audio_duration_seconds = heard
         max_frames = compute_num_frames(max_duration, fps)
         num_frames = num_frames_for_audio_duration(
-            audio_duration_seconds,
+            heard,
             fps,
             max_frames=max_frames,
         )
@@ -348,6 +403,22 @@ class VideoGenerationHandler(StateHandlerBase):
                 422,
                 "Audio is too long for audio-to-video.",
                 code="INVALID_VIDEO_GENERATION_SPEC",
+            )
+        # Total, like queued create: create and execute agree on the shape.
+        # Free fit is the execute gate's problem.
+        job_filter = self._local_job_filter(model_id=a2v_model_id, total_only=True)
+        filtered_item = self._fast_local_spec_item(a2v_model_id, job_filter=job_filter)
+        kept = _a2v_fps_durations(filtered_item, resolution, fps)
+        if not kept:
+            # The picker dropped the whole row. That stays a hard refusal in
+            # every mode: there is no warned cell to accept. A derived shape
+            # that still loads is quoted as the shortest static cell.
+            self._reject_budget_dropped_a2v_cell(
+                job_filter,
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
+                num_frames=num_frames,
+                static_cell_frames=compute_num_frames(min(durations), fps),
             )
         return num_frames
 
@@ -363,6 +434,16 @@ class VideoGenerationHandler(StateHandlerBase):
             return self._generate_forced_api(req)
 
         with self._generation.reserved_generation_start():
+            # Release dead pools before the budget samples free: the queue
+            # runner does this pre-execute, and start_generation evicts only
+            # after the sample. Best-effort, like the runner's.
+            try:
+                diffusion_stage_cache.evict()
+            except Exception:
+                logger.warning(
+                    "Direct generate reclaim before sample failed; continuing",
+                    exc_info=True,
+                )
             return self._generate_local_reserved_validated(
                 req, generation_id=self._make_generation_id()
             )
@@ -378,6 +459,8 @@ class VideoGenerationHandler(StateHandlerBase):
         a2v_audio_duration_seconds: float | None = None,
         local_model_id: LTXLocalModelId,
         explore_generation: bool = True,
+        risk_allowance: bool | None = None,
+        unmeasured_bet: bool = False,
     ) -> GenerateVideoResponse:
         # Local-only Home/Remote entry: checkpoint is required. GenSpace
         # ``generate()`` still uses Settings via ``_generate_local_reserved_validated``.
@@ -394,6 +477,8 @@ class VideoGenerationHandler(StateHandlerBase):
             a2v_audio_duration_seconds=a2v_audio_duration_seconds,
             local_model_id=local_model_id,
             explore_generation=explore_generation,
+            risk_allowance=risk_allowance,
+            unmeasured_bet=unmeasured_bet,
         )
 
     def _validate_generate_video_request(
@@ -424,6 +509,8 @@ class VideoGenerationHandler(StateHandlerBase):
         a2v_audio_duration_seconds: float | None = None,
         local_model_id: LTXLocalModelId | None = None,
         explore_generation: bool = False,
+        risk_allowance: bool | None = None,
+        unmeasured_bet: bool = False,
     ) -> GenerateVideoResponse:
         resolution = req.resolution
         duration = req.duration
@@ -449,6 +536,8 @@ class VideoGenerationHandler(StateHandlerBase):
                 audio_duration_seconds=a2v_audio_duration_seconds,
                 local_model_id=job_model_id,
                 explore_generation=explore_generation,
+                risk_allowance=risk_allowance,
+                unmeasured_bet=unmeasured_bet,
             )
 
         logger.info("Resolution %s - using fast pipeline", resolution)
@@ -462,22 +551,42 @@ class VideoGenerationHandler(StateHandlerBase):
         width = snap_up_to_multiple(width, 64)
         height = snap_up_to_multiple(height, 64)
 
+        job_filter = self._local_job_filter(model_id=job_model_id)
         if duration is None:
-            memory_gb, process_mode, darwin = self._local_job_filter()
             item = next(
                 candidate
                 for candidate in get_local_video_generation_model_specs(
                     job_model_id,
                     duration_head_ready=self._duration_head_ready_for(job_model_id),
-                    memory_gb=memory_gb,
-                    process_mode=process_mode,
-                    darwin=darwin,
+                    job_filter=job_filter,
                 )
                 if candidate.pipeline == req.model
             )
-            min_seconds, max_seconds = supported_duration_range(
-                item, resolution=resolution, fps=fps
-            )
+            try:
+                min_seconds, max_seconds = supported_duration_range(
+                    item, resolution=resolution, fps=fps
+                )
+            except KeyError:
+                # Validated against the static ceiling but fully
+                # budget-dropped since: refuse with the compared figures
+                # instead of 500ing on the missing cell.
+                if job_model_id is None:
+                    raise HTTPError(409, "NO_DOWNLOADED_LTX_MODEL")
+                min_seconds, max_seconds = self._static_auto_range_or_reject(
+                    job_filter,
+                    model_id=job_model_id,
+                    pipeline=req.model,
+                    resolution=resolution,
+                    aspect_ratio=req.aspectRatio,
+                    fps=fps,
+                    allow_evict_retry=True,
+                    allow_risk=risk_allowance,
+                    unmeasured_bet=unmeasured_bet,
+                )
+                # The static probe may have evicted the resident pipeline to
+                # admit the range; re-sample so the gate below prices the
+                # freed card instead of the stale pre-evict filter.
+                job_filter = self._local_job_filter(model_id=job_model_id)
             num_frames: int | AutoDurationSpec = AutoDurationSpec(
                 min_seconds=float(min_seconds),
                 max_seconds=float(max_seconds),
@@ -522,18 +631,20 @@ class VideoGenerationHandler(StateHandlerBase):
         seed = req.seed if req.seed is not None else self._resolve_seed()
         loras = self._resolve_loras(req.loras, local_model_id=job_model_id)
 
-        canvas = local_canvas(resolution, mode="video")
-        budget_width, budget_height = budget_size(canvas)
-        # The shared duration list is the 16:9 anchor. Only a wider frame can exceed it.
         if job_model_id is None:
             raise HTTPError(409, "NO_DOWNLOADED_LTX_MODEL")
-        selected_width, selected_height = budget_pixels(
+        canvas = local_canvas(resolution, mode="video")
+        budget_width, budget_height = budget_shape(
             local_caps(job_model_id), resolution, req.aspectRatio, mode="video"
         )
-        if selected_width * selected_height > budget_width * budget_height:
-            budget_width, budget_height = selected_width, selected_height
-        load_mode = self._video_job_load_mode(
-            budget_width, budget_height, self._budget_frame_count(num_frames, fps)
+        load_mode, chunk_pixel_frames = self._plan_video_job(
+            budget_width,
+            budget_height,
+            self._budget_frame_count(num_frames, fps),
+            job_filter=job_filter,
+            allow_evict_retry=True,
+            allow_risk=risk_allowance,
+            unmeasured_bet=unmeasured_bet,
         )
 
         try:
@@ -583,11 +694,24 @@ class VideoGenerationHandler(StateHandlerBase):
                         "is installed, and API enhance would rewrite the scaffold"
                     )
                 enhance_via_api = False
+            logger.debug("Generation prompt for %s: %s", generation_id, generation_prompt)
             self._generation.raise_if_cancelled()
             self._pipelines.load_gpu_pipeline(
                 "fast", loras=loras, mode=load_mode, ltx_model_id=job_model_id
             )
-            self._generation.start_generation(generation_id)
+            has_image_input = (
+                image is not None or last_image is not None or bool(keyframe_images)
+            )
+            self._generation.start_generation(
+                generation_id,
+                estimated=self._estimate_wall_time(
+                    width,
+                    height,
+                    self._budget_frame_count(num_frames, fps),
+                    load_mode,
+                    "i2v" if has_image_input else "t2v",
+                ),
+            )
 
             written_path = self.generate_video(
                 prompt=generation_prompt,
@@ -607,10 +731,11 @@ class VideoGenerationHandler(StateHandlerBase):
                 load_mode=load_mode,
                 ltx_model_id=job_model_id,
                 skip_stage_2=canvas.skip_stage_2,
+                chunk_pixel_frames=chunk_pixel_frames,
             )
 
             self._generation.complete_generation(written_path)
-            return GenerateVideoCompleteResponse(status="complete", video_path=written_path)
+            return self._complete_response(written_path, load_mode)
 
         except HTTPError as e:
             self._generation.fail_generation(e.detail)
@@ -619,7 +744,7 @@ class VideoGenerationHandler(StateHandlerBase):
             self._generation.fail_generation(str(e))
             if is_cancel_exception(e):
                 logger.info("Generation cancelled by user")
-                return GenerateVideoCancelledResponse(status="cancelled")
+                return self._cancelled_response(load_mode)
 
             raise HTTPError(500, str(e)) from e
 
@@ -664,6 +789,7 @@ class VideoGenerationHandler(StateHandlerBase):
         load_mode: LocalGenerationMode,
         ltx_model_id: LTXLocalModelId | None = None,
         skip_stage_2: bool = False,
+        chunk_pixel_frames: int | None = None,
     ) -> str:
         t_total_start = time.perf_counter()
         gen_mode = "keyframes" if keyframe_images else "i2v" if image is not None else "t2v"
@@ -732,6 +858,7 @@ class VideoGenerationHandler(StateHandlerBase):
                     output_path=str(output_path),
                     guide_all_images=bool(keyframe_images),
                     skip_stage_2=skip_stage_2,
+                    chunk_pixel_frames=chunk_pixel_frames,
                 )
             t_inference_end = time.perf_counter()
             logger.info("[%s] Inference: %.2fs", gen_mode, t_inference_end - t_inference_start)
@@ -767,6 +894,8 @@ class VideoGenerationHandler(StateHandlerBase):
         audio_duration_seconds: float | None = None,
         local_model_id: LTXLocalModelId | None = None,
         explore_generation: bool = False,
+        risk_allowance: bool | None = None,
+        unmeasured_bet: bool = False,
     ) -> GenerateVideoResponse:
         model_id = local_model_id
         if model_id is None:
@@ -822,6 +951,19 @@ class VideoGenerationHandler(StateHandlerBase):
 
         temp_image_paths: list[str] = []
 
+        # Decided pre-try like the Fast path: a 422 here propagates without
+        # failing a generation that never started, and the cancelled branch
+        # below always sees a bound mode.
+        load_mode, chunk_pixel_frames = self._plan_video_job(
+            width,
+            height,
+            num_frames,
+            job_filter=self._local_job_filter(model_id=model_id),
+            allow_evict_retry=True,
+            allow_risk=risk_allowance,
+            unmeasured_bet=unmeasured_bet,
+        )
+
         try:
             neg = req.negativePrompt if req.negativePrompt else self.config.default_negative_prompt
 
@@ -829,7 +971,6 @@ class VideoGenerationHandler(StateHandlerBase):
                 first=image, last=last_image, num_frames=num_frames
             )
 
-            load_mode = self._video_job_load_mode(width, height, num_frames)
             # Same ordering as Fast: budget 422 before Gemma so an over-size cell
             # does not evict a warmed pipeline for a rewrite that will not run.
             resolved_prompt = self._prompt_enhancement.resolve_for_generation(
@@ -850,7 +991,12 @@ class VideoGenerationHandler(StateHandlerBase):
             a2v_state = self._pipelines.load_a2v_pipeline(
                 loras=loras, mode=load_mode, ltx_model_id=model_id
             )
-            self._generation.start_generation(generation_id)
+            self._generation.start_generation(
+                generation_id,
+                estimated=self._estimate_wall_time(
+                    width, height, num_frames, load_mode, "a2v"
+                ),
+            )
 
             if output_path is None:
                 output_path = self._make_output_path()
@@ -884,6 +1030,7 @@ class VideoGenerationHandler(StateHandlerBase):
                         else max(num_frames / fps, audio_duration_seconds)
                     ),
                     output_path=str(output_path),
+                    chunk_pixel_frames=chunk_pixel_frames,
                 )
 
             # Denoiser interrupt cannot abort VAE decode / ffmpeg; a Stop after the last
@@ -895,7 +1042,7 @@ class VideoGenerationHandler(StateHandlerBase):
 
             self._generation.update_progress("complete", 100)
             self._generation.complete_generation(str(output_path))
-            return GenerateVideoCompleteResponse(status="complete", video_path=str(output_path))
+            return self._complete_response(str(output_path), load_mode)
 
         except HTTPError as e:
             self._generation.fail_generation(e.detail)
@@ -904,7 +1051,7 @@ class VideoGenerationHandler(StateHandlerBase):
             self._generation.fail_generation(str(e))
             if is_cancel_exception(e):
                 logger.info("Generation cancelled by user")
-                return GenerateVideoCancelledResponse(status="cancelled")
+                return self._cancelled_response(load_mode)
             raise HTTPError(500, str(e)) from e
         finally:
             self._text.clear_api_embeddings()
@@ -991,41 +1138,464 @@ class VideoGenerationHandler(StateHandlerBase):
             return compute_num_frames(int(num_frames.max_seconds), fps)
         return num_frames
 
-    def _video_job_load_mode(
-        self, width: int, height: int, frames: int
-    ) -> LocalGenerationMode:
-        """422 or pick full vs stream for this job. Does not change process mode."""
-        darwin = self.config.darwin_unified_memory
-        memory_gb = memory_gb_for_job(
-            vram_gb=self.config.vram_gb,
-            available_ram_gb=self.config.available_ram_gb,
-            darwin=darwin,
-        )
-        decision = decide_video_job(
+    def _plan_video_job(
+        self,
+        width: int,
+        height: int,
+        frames: int,
+        *,
+        job_filter: LocalJobFilter,
+        allow_evict_retry: bool = False,
+        allow_risk: bool | None = None,
+        unmeasured_bet: bool = False,
+    ) -> tuple[LocalGenerationMode, int | None]:
+        """Load mode and temporal window (pixel frames, None = one pass) for this job."""
+        load, _ = self._video_job_load(
             width,
             height,
             frames,
-            memory_gb=memory_gb,
-            process_mode=self.config.local_generations_mode,
-            darwin=darwin,
+            job_filter=job_filter,
+            allow_evict_retry=allow_evict_retry,
+            allow_risk=allow_risk,
+            unmeasured_bet=unmeasured_bet,
         )
-        outcome = "reject" if isinstance(decision, VideoJobReject) else decision.mode
+        return load.mode, load.chunk_pixel_frames
+
+    def _video_job_load_mode(
+        self,
+        width: int,
+        height: int,
+        frames: int,
+        *,
+        job_filter: LocalJobFilter,
+        allow_evict_retry: bool = False,
+        allow_risk: bool | None = None,
+        unmeasured_bet: bool = False,
+    ) -> tuple[LocalGenerationMode, GenerationRisk | None]:
+        load, risk = self._video_job_load(
+            width,
+            height,
+            frames,
+            job_filter=job_filter,
+            allow_evict_retry=allow_evict_retry,
+            allow_risk=allow_risk,
+            unmeasured_bet=unmeasured_bet,
+        )
+        return load.mode, risk
+
+    def _video_job_load(
+        self,
+        width: int,
+        height: int,
+        frames: int,
+        *,
+        job_filter: LocalJobFilter,
+        allow_evict_retry: bool = False,
+        allow_risk: bool | None = None,
+        unmeasured_bet: bool = False,
+    ) -> tuple[VideoJobLoad, GenerationRisk | None]:
+        """422 or pick full vs stream (and the window) for this job. Does not change process mode.
+
+        Real-generation paths pass ``allow_evict_retry``: a total-possible CUDA
+        reject whose shortfall live weights cover gets one evict-and-resample
+        before the 422. Read-only callers (estimate) and total-only preflights
+        must leave it off — the former must never mutate GPU state, the latter
+        reject total-short by construction. ``allow_risk=None`` follows the
+        filter's live mode (every request-scoped caller); executors pass an
+        explicit bool parsed from the stored annotation so a mode flip never
+        re-gates a queued job. An over bet streams, including when the
+        shortfall later grows. An unmeasured bet does not cover a later
+        memory miss. Hard rejects raise in every mode.
+        """
+        decision = job_filter.decide(width, height, frames)
+        if isinstance(decision, VideoJobReject) and allow_evict_retry:
+            rebuilt = evict_retry_filter(
+                feature="fast",
+                is_vram_occupancy_miss=(decision.reason == "stream_over"),
+                stream_gib=decision.stream_gib,
+                seq=decision.seq,
+                full_gib=decision.full_gib,
+                job_filter=job_filter,
+                live_allocated_bytes=self._gpu.get_cuda_live_allocated_bytes(),
+                reserved_bytes=self._gpu.get_cuda_reserved_bytes(),
+                log_prefix="video",
+                evict=self._pipelines.evict_resident_pipeline,
+                rebuild=lambda: self._local_job_filter(
+                    model_id=job_filter.profile.model_id,
+                    total_only=job_filter.budget.total_only,
+                ),
+            )
+            if rebuilt is not None:
+                job_filter = rebuilt
+                decision = job_filter.decide(width, height, frames)
+        window = (
+            f" window={decision.chunk_pixel_frames}f"
+            if decision.chunk_pixel_frames is not None
+            else ""
+        )
+        if isinstance(decision, VideoJobReject):
+            risk = risk_if_allowed(
+                risk_for_reject(decision, job_filter),
+                job_filter,
+                allow_risk,
+                unmeasured_bet=unmeasured_bet,
+            )
+            if risk is not None:
+                logger.info(
+                    "[video] job budget seq=%.0f full=%.1fGiB stream=%.1fGiB -> risk:%s over_gib=%s over_ram_gb=%s%s%s",
+                    decision.seq,
+                    decision.full_gib,
+                    decision.stream_gib,
+                    risk.tier,
+                    risk.over_gib,
+                    risk.over_ram_gb,
+                    window,
+                    vram_snapshot_suffix(
+                        allocated_bytes=self._gpu.get_cuda_live_allocated_bytes(),
+                        reserved_bytes=self._gpu.get_cuda_reserved_bytes(),
+                        free_bytes=job_filter.budget.free_vram_bytes,
+                    ),
+                )
+                return (
+                    VideoJobLoad(
+                        mode="streaming_models_loading",
+                        seq=decision.seq,
+                        full_gib=decision.full_gib,
+                        stream_gib=decision.stream_gib,
+                        chunk_pixel_frames=decision.chunk_pixel_frames,
+                    ),
+                    risk,
+                )
+            logger.info(
+                "[video] job budget seq=%.0f full=%.1fGiB stream=%.1fGiB -> reject%s%s",
+                decision.seq,
+                decision.full_gib,
+                decision.stream_gib,
+                window,
+                vram_snapshot_suffix(
+                    allocated_bytes=self._gpu.get_cuda_live_allocated_bytes(),
+                    reserved_bytes=self._gpu.get_cuda_reserved_bytes(),
+                    free_bytes=job_filter.budget.free_vram_bytes,
+                ),
+            )
+            message, code = reject_message_and_code(decision, job_filter)
+            raise HTTPError(422, message, code=code)
         logger.info(
-            "[video] job budget seq=%.0f full=%.1fGiB stream=%.1fGiB -> %s",
+            "[video] job budget seq=%.0f full=%.1fGiB stream=%.1fGiB -> %s%s%s",
             decision.seq,
             decision.full_gib,
             decision.stream_gib,
-            outcome,
+            decision.mode,
+            window,
+            vram_snapshot_suffix(
+                allocated_bytes=self._gpu.get_cuda_live_allocated_bytes(),
+                reserved_bytes=self._gpu.get_cuda_reserved_bytes(),
+                free_bytes=job_filter.budget.free_vram_bytes,
+            ),
         )
-        if isinstance(decision, VideoJobReject):
-            if decision.reason == "unsupported":
-                raise HTTPError(
-                    422,
-                    LOCAL_GENERATION_UNSUPPORTED_MESSAGE,
-                    code=LOCAL_GENERATION_UNSUPPORTED,
+        return decision, unmeasured_load_risk(
+            decision, job_filter, feature="fast", allow_risk=allow_risk
+        )
+
+    def _load_offload_for_response(
+        self, load_mode: LocalGenerationMode | None
+    ) -> tuple[VideoLoadMode | None, PipelineOffloadMode | None]:
+        """Completion-response modes: the decided load plus the routed offload.
+
+        Offload is derived, not observed — but through the same helper the
+        pipeline was constructed with, so derived == actual by construction,
+        with no live reads on either side.
+        """
+        if load_mode is None or load_mode == "unsupported":
+            return (None, None)
+        return (load_mode, self._offload_mode(load_mode).name)
+
+    def _estimate_wall_time(
+        self,
+        width: int,
+        height: int,
+        frames: int,
+        load_mode: LocalGenerationMode,
+        feature: EtaFeature,
+    ) -> WallTimeEstimate | None:
+        """ETA v1 for the decided cell. None whenever the table has no answer."""
+        if load_mode == "full_models_loading":
+            eta_load: EtaLoadMode = "full_models_loading"
+        elif load_mode == "streaming_models_loading":
+            eta_load = "streaming_models_loading"
+        else:
+            return None
+        _load, offload = self._load_offload_for_response(load_mode)
+        if offload is None:
+            return None
+        return estimate_fast_wall_time_s(
+            width=width,
+            height=height,
+            frames=frames,
+            load_mode=eta_load,
+            offload_mode=offload,
+            feature=feature,
+            machine_factor=(
+                1.0
+                if is_measured_hardware_class(self.config.gpu_device_name)
+                else None
+            ),
+        )
+
+    def _complete_response(
+        self, video_path: str, load_mode: LocalGenerationMode | None
+    ) -> GenerateVideoCompleteResponse:
+        resp_load_mode, resp_offload_mode = self._load_offload_for_response(load_mode)
+        return GenerateVideoCompleteResponse(
+            status="complete",
+            video_path=video_path,
+            load_mode=resp_load_mode,
+            offload_mode=resp_offload_mode,
+        )
+
+    def _cancelled_response(
+        self, load_mode: LocalGenerationMode | None
+    ) -> GenerateVideoCancelledResponse:
+        resp_load_mode, resp_offload_mode = self._load_offload_for_response(load_mode)
+        return GenerateVideoCancelledResponse(
+            status="cancelled",
+            load_mode=resp_load_mode,
+            offload_mode=resp_offload_mode,
+        )
+
+    def preflight_queued_fast_job(
+        self,
+        *,
+        offering: OfferingId,
+        resolution: LTXVideoGenResolution,
+        aspect_ratio: LTXQueuedAspectRatio,
+        duration: int | None,
+        fps: LTXVideoGenFps,
+    ) -> GenerationRisk | None:
+        """Apply the measured LTX 2.5 Fast policy before a Home/Remote queue insert.
+
+        Raises hard rejects; returns the bet annotation for downgradable
+        rejects in reckless mode.
+        """
+        model_id = resolve_offering_local_model_id(self.models_dir, offering)
+        if model_id is None:
+            model_id = OFFERING_LOCAL_MODEL_IDS[offering][0]
+        # Queued admission gates on total ("will it ever fit"): a running job
+        # depresses free, and the queue exists to wait for a free slot.
+        job_filter = self._local_job_filter(model_id=model_id, total_only=True)
+        if job_filter.budget_mode != "reckless" and not (
+            job_filter.profile.is_windows_fast or job_filter.profile.is_mac_fast
+        ):
+            return
+        # Callers resolve auto (i2v start-frame closest-match) before calling;
+        # auto reaching here would budget the wrong shape silently.
+        assert aspect_ratio != "auto"
+        try:
+            width, height = budget_shape(
+                local_caps(model_id), resolution, aspect_ratio, mode="video"
+            )
+        except KeyError as exc:
+            raise HTTPError(400, "INVALID_LOCAL_RESOLUTION") from exc
+        if duration is None:
+            frames = self._queued_auto_budget_frames(
+                job_filter,
+                model_id=model_id,
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
+                fps=fps,
+            )
+        else:
+            frames = self._compute_num_frames(duration, fps)
+        return self._video_job_load_mode(width, height, frames, job_filter=job_filter)[1]
+
+    def preflight_queued_a2v_job(
+        self,
+        *,
+        offering: OfferingId,
+        resolution: LTXLocalA2VResolution,
+        aspect_ratio: LTXQueuedAspectRatio,
+        num_frames: int,
+    ) -> GenerationRisk | None:
+        """Apply the A2V budget before a Home/Remote queue insert.
+
+        Raises hard rejects; returns the bet annotation for downgradable
+        rejects in reckless mode. Runs on every route: the frame count was
+        derived from the static ceiling, so a duration the filter dropped is
+        a budget result here rather than an invalid spec.
+
+        Prices ``budget_shape``, the same canvas as a fully dropped row:
+        the 16:9 anchor, or the selected aspect when it is wider. Callers
+        resolve auto (start-frame closest-match, 16:9 without one); an
+        unresolvable one falls back to the anchor rather than refusing the
+        queue insert.
+        """
+        model_id = resolve_offering_local_model_id(self.models_dir, offering)
+        if model_id is None:
+            model_id = OFFERING_LOCAL_MODEL_IDS[offering][0]
+        # Queued admission gates on total ("will it ever fit"): a running job
+        # depresses free, and the queue exists to wait for a free slot.
+        job_filter = self._local_job_filter(model_id=model_id, total_only=True)
+        aspect: LtxAspectRatio = "16:9" if aspect_ratio == "auto" else aspect_ratio
+        try:
+            width, height = budget_shape(
+                local_caps(model_id), resolution, aspect, mode="a2v"
+            )
+        except KeyError as exc:
+            raise HTTPError(400, "INVALID_LOCAL_A2V_RESOLUTION") from exc
+        return self._video_job_load_mode(width, height, num_frames, job_filter=job_filter)[1]
+
+    def _queued_auto_budget_frames(
+        self,
+        job_filter: LocalJobFilter,
+        *,
+        model_id: LTXLocalModelId,
+        resolution: LTXVideoGenResolution,
+        aspect_ratio: LtxAspectRatio,
+        fps: LTXVideoGenFps,
+    ) -> int:
+        item = next(
+            (
+                candidate
+                for candidate in get_local_video_generation_model_specs(
+                    model_id,
+                    duration_head_ready=self._duration_head_ready_for(model_id),
+                    job_filter=job_filter,
                 )
-            raise HTTPError(422, VIDEO_JOB_TOO_LARGE_MESSAGE, code=VIDEO_JOB_TOO_LARGE)
-        return decision.mode
+                if candidate.pipeline == "fast"
+            ),
+            None,
+        )
+        if item is None:
+            raise HTTPError(
+                422,
+                LOCAL_GENERATION_UNSUPPORTED_MESSAGE,
+                code=LOCAL_GENERATION_UNSUPPORTED,
+            )
+        try:
+            _min_seconds, max_seconds = supported_duration_range(
+                item, resolution=resolution, fps=fps
+            )
+        except KeyError:
+            # Fully budget-dropped resolution/fps: refuse with the compared
+            # figures, not the flat "cannot run" line.
+            _min_seconds, max_seconds = self._static_auto_range_or_reject(
+                job_filter,
+                model_id=model_id,
+                pipeline="fast",
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
+                fps=fps,
+            )
+        return compute_num_frames(max_seconds, fps)
+
+    def _static_auto_range_or_reject(
+        self,
+        job_filter: LocalJobFilter,
+        *,
+        model_id: LTXLocalModelId,
+        pipeline: str,
+        resolution: LTXVideoGenResolution,
+        aspect_ratio: LtxAspectRatio,
+        fps: LTXVideoGenFps,
+        allow_evict_retry: bool = False,
+        allow_risk: bool | None = None,
+        unmeasured_bet: bool = False,
+    ) -> tuple[int, int]:
+        """Static (min, max) auto seconds, refusing with the enriched budget 422.
+
+        Fallback when the filtered specs dropped every duration at this
+        resolution/fps: the request validated against the static ceiling, so a
+        missing cell is a budget refusal, not a bad request. Re-decides the
+        max cell on live figures — ``_video_job_load_mode`` raises the
+        enriched 422 naming what the job needs vs what the machine has; if it
+        loads now (figures moved since list time), the static range stands.
+        ``allow_risk=None`` follows the filter's live mode; executors pass the
+        stored annotation so a mode flip never re-gates a queued job.
+        """
+        static_item = next(
+            (
+                candidate
+                for candidate in get_local_video_generation_model_specs(
+                    model_id,
+                    duration_head_ready=self._duration_head_ready_for(model_id),
+                    job_filter=None,
+                )
+                if candidate.pipeline == pipeline
+            ),
+            None,
+        )
+        if static_item is None:
+            raise HTTPError(
+                422,
+                LOCAL_GENERATION_UNSUPPORTED_MESSAGE,
+                code=LOCAL_GENERATION_UNSUPPORTED,
+            )
+        try:
+            min_seconds, max_seconds = supported_duration_range(
+                static_item, resolution=resolution, fps=fps
+            )
+        except KeyError as exc:
+            raise HTTPError(
+                422,
+                LOCAL_GENERATION_UNSUPPORTED_MESSAGE,
+                code=LOCAL_GENERATION_UNSUPPORTED,
+            ) from exc
+        budget_width, budget_height = budget_shape(
+            local_caps(model_id), resolution, aspect_ratio, mode="video"
+        )
+        _, _ = self._video_job_load_mode(
+            budget_width,
+            budget_height,
+            compute_num_frames(max_seconds, fps),
+            job_filter=job_filter,
+            allow_evict_retry=allow_evict_retry,
+            allow_risk=allow_risk,
+            unmeasured_bet=unmeasured_bet,
+        )
+        return min_seconds, max_seconds
+
+    def _reject_budget_dropped_a2v_cell(
+        self,
+        job_filter: LocalJobFilter,
+        *,
+        resolution: LTXLocalA2VResolution,
+        aspect_ratio: LTXQueuedAspectRatio,
+        num_frames: int,
+        static_cell_frames: int,
+    ) -> None:
+        """Hard-refuse a resolution the filter dropped entirely.
+
+        The audio-derived frame count is quoted when that shape misses. When
+        it loads, ``static_cell_frames`` (the shortest static cell) is quoted
+        instead, so the figures match the drop that emptied the row.
+        ``allow_risk=False`` so reckless does not annotate a row the picker
+        no longer offers. A partial drop does not come here.
+        """
+        model_id = job_filter.profile.model_id
+        if model_id is None:
+            raise HTTPError(409, "NO_DOWNLOADED_LTX_MODEL")
+        aspect: LtxAspectRatio = "16:9" if aspect_ratio == "auto" else aspect_ratio
+        try:
+            width, height = budget_shape(
+                local_caps(model_id), resolution, aspect, mode="a2v"
+            )
+        except KeyError as exc:
+            raise HTTPError(400, "INVALID_VIDEO_GENERATION_SPEC") from exc
+        quoted_frames = num_frames
+        if not isinstance(job_filter.decide(width, height, num_frames), VideoJobReject):
+            quoted_frames = static_cell_frames
+        self._video_job_load_mode(
+            width,
+            height,
+            quoted_frames,
+            job_filter=job_filter,
+            allow_risk=False,
+        )
+        raise HTTPError(
+            422,
+            LOCAL_GENERATION_UNSUPPORTED_MESSAGE,
+            code=LOCAL_GENERATION_UNSUPPORTED,
+        )
 
     @staticmethod
     def _compute_num_frames(duration: int, fps: int) -> int:

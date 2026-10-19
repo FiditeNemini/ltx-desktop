@@ -11,6 +11,8 @@ from services.dashboard_stats import DashboardSnapshot, DashboardWindow
 from services.records import (
     AssetListPage,
     AssetRecord,
+    AssistantQueueRecord,
+    AssistantRunRecord,
     GenerationErrorCode,
     GenerationRecord,
     MediaKind,
@@ -25,6 +27,63 @@ def _unavailable() -> NoReturn:
 
 
 class UnavailableStore:
+    def list_waiting_assistant_runs(self) -> list[str]:
+        _unavailable()
+
+    def enqueue_assistant_message(self, item_id: str, conversation_id: str, payload: str, *, payload_version: int, title: str) -> bool:
+        _unavailable()
+
+    def list_assistant_queue(self, conversation_id: str) -> list[AssistantQueueRecord]:
+        _unavailable()
+
+    def remove_assistant_queue_item(self, conversation_id: str, item_id: str) -> bool:
+        _unavailable()
+
+    def set_assistant_queue_error(self, conversation_id: str, item_id: str, error: str) -> None:
+        _unavailable()
+
+    def assistant_queue_errors(self, conversation_id: str) -> dict[str, str]:
+        _unavailable()
+
+    def set_assistant_queue_hold(self, conversation_id: str, on_hold: bool) -> None:
+        _unavailable()
+
+    def assistant_queue_on_hold(self, conversation_id: str) -> bool:
+        _unavailable()
+
+    def hold_queued_assistant_conversations(self) -> None:
+        _unavailable()
+
+    def get_asset_producer_id(self, asset_id: str) -> str | None:
+        _unavailable()
+
+    def list_assistant_runs(self, conversation_id: str) -> list[AssistantRunRecord]:
+        _unavailable()
+
+    def list_assistant_job_ids(self, conversation_id: str) -> list[str]:
+        _unavailable()
+
+    def list_assistant_conversations(self) -> list[tuple[str, str, int]]:
+        _unavailable()
+
+    def delete_assistant_conversation(self, conversation_id: str) -> None:
+        _unavailable()
+
+    def get_latest_assistant_run(self, conversation_id: str) -> AssistantRunRecord | None:
+        _unavailable()
+
+    def get_assistant_run(self, run_id: str) -> AssistantRunRecord | None:
+        _unavailable()
+
+    def insert_assistant_run(self, run: AssistantRunRecord, *, title: str, after: str | None, queued: bool = False) -> bool:
+        _unavailable()
+
+    def save_assistant_run(self, run: AssistantRunRecord) -> bool:
+        _unavailable()
+
+    def stop_assistant_run(self, run_id: str, response: str) -> None:
+        _unavailable()
+
     def ingest_upload(self, source_path: str) -> AssetRecord:
         _unavailable()
 
@@ -58,6 +117,7 @@ class UnavailableStore:
         spec: dict[str, JsonValue],
         *,
         contract_version: int = 1,
+        generation_id: str | None = None,
     ) -> GenerationRecord:
         _unavailable()
 
@@ -99,6 +159,7 @@ class UnavailableStore:
         outputs: list[OutputSpec],
         *,
         attempt_count: int,
+        written_prompt: str | None = None,
     ) -> GenerationRecord:
         _unavailable()
 
@@ -124,7 +185,7 @@ class UnavailableStore:
     def get_generation(self, generation_id: str) -> GenerationRecord | None:
         _unavailable()
 
-    def list_generations(self, feature: str) -> list[GenerationRecord]:
+    def list_generations(self, feature: str | None = None, *, limit: int | None = None) -> list[GenerationRecord]:
         _unavailable()
 
     def list_recent_features(

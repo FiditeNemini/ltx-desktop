@@ -364,3 +364,11 @@
 .flushFooter.flushFooter ul {
   gap: var(--spacing-xxs);
 }
+
+// Keeps the key combo (Ctrl+Shift+L) clear of its label in the Support menu.
+// The DS item has no gap between the label and the right text, and the long
+// Windows and Linux combo made the two touch.
+.supportMenuShortcut {
+  padding-inline-start: var(--spacing-lg);
+  white-space: nowrap;
+}

@@ -11,10 +11,12 @@ describe("generationQueryKeys.specs", () => {
     assert.deepEqual(generationQueryKeys.specs(1), [
       "video-generation-model-specs",
       1,
+      "server",
     ]);
     assert.deepEqual(generationQueryKeys.specs(2), [
       "video-generation-model-specs",
       2,
+      "server",
     ]);
     assert.notDeepEqual(
       generationQueryKeys.specs(1),
@@ -26,6 +28,7 @@ describe("generationQueryKeys.specs", () => {
     assert.deepEqual(generationQueryKeys.specs(null), [
       "video-generation-model-specs",
       null,
+      "server",
     ]);
     assert.deepEqual(
       generationQueryKeys.specs(null),
@@ -34,6 +37,13 @@ describe("generationQueryKeys.specs", () => {
     assert.notDeepEqual(
       generationQueryKeys.specs(null),
       generationQueryKeys.specs(0),
+    );
+  });
+
+  it("changes when the budget mode changes so a toggle cannot reuse a stale grid", () => {
+    assert.notDeepEqual(
+      generationQueryKeys.specs(1, "standard"),
+      generationQueryKeys.specs(1, "reckless"),
     );
   });
 });

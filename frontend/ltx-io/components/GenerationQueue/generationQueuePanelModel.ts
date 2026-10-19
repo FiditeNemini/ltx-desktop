@@ -164,13 +164,13 @@ export function progressPercentByGenerationId(
   return map;
 }
 
-/** Short label for the progress control (percentage from steps when available). */
-export function formatActiveQueueProgress(progress: {
-  progress: number;
-  currentStep: number | null;
-  totalSteps: number | null;
-}): string {
-  return `${activeQueueProgressPercent(progress)}%`;
+/**
+ * Label for the progress control. It follows the result placeholder: null until a denoise
+ * step has run, so the queue row and the placeholder never show different percents.
+ */
+export function formatActiveQueueProgress(progress: QueueProgressSnapshot): string | null {
+  const percent = reportedDenoisePercent(progress);
+  return percent == null ? null : `${percent}%`;
 }
 
 export function resultLocationForFeature(
@@ -186,18 +186,8 @@ export function resultLocationForFeature(
   };
 }
 
-export function formatActiveQueueProgressDetail(progress: {
-  progress: number;
-  currentStep: number | null;
-  totalSteps: number | null;
-}): string {
-  const percent = activeQueueProgressPercent(progress);
-  if (
-    progress.currentStep != null &&
-    progress.totalSteps != null &&
-    progress.totalSteps > 1
-  ) {
-    return `Step ${progress.currentStep} of ${progress.totalSteps} (${percent}%)`;
-  }
-  return `${percent}% complete`;
+export function formatActiveQueueProgressDetail(progress: QueueProgressSnapshot): string {
+  const percent = reportedDenoisePercent(progress);
+  if (percent == null) return "Waiting for progress…";
+  return `Step ${progress.currentStep} of ${progress.totalSteps} (${percent}%)`;
 }

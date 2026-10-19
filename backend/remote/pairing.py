@@ -400,6 +400,14 @@ class RemotePairing:
     def revoke(self, device_id: str) -> bool:
         return self._store.revoke_paired_device(device_id, now_ms=_now_ms())
 
+    def is_device_active(self, device_id: str) -> bool:
+        """For long-lived streams, which authenticate only when they open."""
+        try:
+            record = self._store.get_paired_device(device_id)
+        except UnavailableError:
+            return False
+        return record is not None and _is_active(record)
+
     def _insert_session(
         self,
         token: str,

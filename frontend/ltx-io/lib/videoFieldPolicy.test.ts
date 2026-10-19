@@ -1,9 +1,20 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import type {
+  DroppedFastAspectCell,
+  DroppedFastCell,
+  VideoGenerationModelSpecItem,
+  VideoGenerationModelSpecsResponse,
+} from "../../lib/video-generation-model-specs.ts";
 import { specFixture } from "../screens/Feature/definitions/specFixture.ts";
 import { TEXT_TO_VIDEO_DEFAULTS } from "../screens/Feature/definitions/textToVideo.ts";
-import { clampVideoFields, retargetVideoFields } from "./videoFieldPolicy.ts";
+import {
+  clampVideoFields,
+  collectModelDisabledFpsOptions,
+  isLocalVideoSelectionReady,
+  retargetVideoFields,
+} from "./videoFieldPolicy.ts";
 
 type VideoValues = typeof TEXT_TO_VIDEO_DEFAULTS;
 
@@ -116,5 +127,124 @@ describe("retargetVideoFields", () => {
     assert.equal(next.duration, 8);
     assert.equal(next.resolution, "540p");
     assert.equal(next.fps, 24);
+  });
+});
+
+function unionItem(
+  kept: Record<string, { fps_to_durations: Record<string, number[]> }>,
+  dropped: DroppedFastCell[],
+): VideoGenerationModelSpecItem {
+  return {
+    pipeline: "fast",
+    spec: {
+      display_name: "LTX 2.5 Fast",
+      supported_resolutions_durations:
+        kept as VideoGenerationModelSpecItem["spec"]["supported_resolutions_durations"],
+      a2v_supported_resolutions_durations: {},
+      capabilities: null,
+      dropped_cells: dropped,
+    },
+  };
+}
+
+function unionDropped(
+  resolution: DroppedFastCell["resolution"],
+  fps: DroppedFastCell["fps"],
+  duration: DroppedFastCell["duration"],
+  message: string,
+): DroppedFastCell {
+  return { resolution, fps, duration, reason: "stream_over", message, audio: false };
+}
+
+describe("collectModelDisabledFpsOptions", () => {
+  it("lists fps dropped everywhere with the cheapest message, kept nowhere", () => {
+    const item = unionItem({ "540p": { fps_to_durations: { "24": [5] } } }, [
+      unionDropped("540p", 48, 5, "f48"),
+      unionDropped("540p", 24, 10, "d24"),
+    ]);
+
+    assert.deepEqual(collectModelDisabledFpsOptions(item, [24]), [
+      { value: 48, message: "f48" },
+    ]);
+  });
+
+  it("returns empty without specs", () => {
+    assert.deepEqual(collectModelDisabledFpsOptions(undefined, []), []);
+  });
+});
+
+const REFUSED_ASPECTS = ["21:9", "16:9", "3:2", "4:3", "1:1", "4:5", "9:16"] as const;
+
+function specsWithAspectDropped(
+  cells: DroppedFastAspectCell[],
+): VideoGenerationModelSpecsResponse {
+  const base = specFixture();
+  return {
+    ...base,
+    downloaded_local_models: base.downloaded_local_models.map((item) => ({
+      ...item,
+      spec: {
+        ...item.spec,
+        supported_resolutions_durations: {
+          "540p": {
+            fps_to_durations: { "24": [2, 3, 4, 5, 6, 8, 10, 20] },
+            aspect_ratios: [...REFUSED_ASPECTS],
+          },
+        },
+        dropped_cells: [],
+        dropped_aspect_cells: cells,
+      },
+    })),
+  };
+}
+
+function aspectDropped(
+  aspectRatio: DroppedFastAspectCell["aspectRatio"],
+): DroppedFastAspectCell {
+  return {
+    resolution: "540p",
+    fps: 24,
+    duration: 8,
+    aspectRatio,
+    reason: "stream_over",
+    message: `${aspectRatio} cannot run 540p/8s here`,
+    audio: false,
+  };
+}
+
+describe("refused aspects", () => {
+  it("clamps off a refused aspect onto the default", () => {
+    const clamped = clampVideoFields(
+      values({ aspectRatio: "21:9", resolution: "540p", fps: 24, duration: 8 }),
+      specsWithAspectDropped([aspectDropped("21:9")]),
+      TEXT_TO_VIDEO_DEFAULTS,
+    );
+    assert.equal(clamped.aspectRatio, "16:9");
+  });
+
+  it("keeps a refused aspect when every shape is refused", () => {
+    const clamped = clampVideoFields(
+      values({ aspectRatio: "21:9", resolution: "540p", fps: 24, duration: 8 }),
+      specsWithAspectDropped(REFUSED_ASPECTS.map(aspectDropped)),
+      TEXT_TO_VIDEO_DEFAULTS,
+    );
+    assert.equal(clamped.aspectRatio, "21:9");
+  });
+
+  it("reports not ready while a refused aspect is selected", () => {
+    assert.equal(
+      isLocalVideoSelectionReady(
+        values({ aspectRatio: "21:9", resolution: "540p", fps: 24, duration: 8 }),
+        specsWithAspectDropped([aspectDropped("21:9")]),
+      ),
+      false,
+    );
+    assert.equal(
+      isLocalVideoSelectionReady(
+        values({ aspectRatio: "16:9", resolution: "540p", fps: 24, duration: 8 }),
+        specsWithAspectDropped([aspectDropped("21:9")]),
+      ),
+      true,
+    );
   });
 });

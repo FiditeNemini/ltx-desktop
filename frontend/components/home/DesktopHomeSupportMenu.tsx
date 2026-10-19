@@ -4,6 +4,7 @@ import { ItemAction } from "@/ds/DropdownItems/ItemAction/ItemAction";
 import { DropdownMenu } from "@/ds/DropdownMenu/DropdownMenu";
 import HelpIcon from "@/assets/home/icons/Help.svg?react";
 import { getHomeShellEntry } from "../../lib/home-shell";
+import { logsShortcutLabel } from "../../lib/logs-shortcut";
 import { paths } from "../../paths";
 import { useAppChromeControls } from "../AppShell";
 import fabStyles from "./DesktopHomeSupportFab.module.scss";
@@ -76,7 +77,12 @@ export function DesktopHomeSupportMenu({
         },
         {
           render: (
-            <ItemAction text="Diagnostic logs" onClick={() => openLogs()} />
+            <ItemAction
+              text="Diagnostic logs"
+              rightText={logsShortcutLabel(document.documentElement.dataset.platform)}
+              rightTextClassName={styles.supportMenuShortcut}
+              onClick={() => openLogs()}
+            />
           ),
         },
       ]}

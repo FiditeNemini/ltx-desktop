@@ -43,6 +43,7 @@ export function SettingField<
           forcePicker={field.forcePicker}
           maxOptionCount={field.maxOptionCount}
           getOptionIcon={getOptionIcon}
+          showListIcons={field.dataKey === "aspectRatio"}
         />
       </div>
       {issue ? (
