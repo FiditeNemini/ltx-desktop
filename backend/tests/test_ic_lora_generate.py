@@ -6,12 +6,12 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from frame_math import compute_num_frames
+from runtime_config.ic_lora_job_budget import TWO_STAGE_OVER_MEASURED_MESSAGE
 from runtime_config.ic_lora_local_envelope import IC_LORA_SOURCE_TOO_LARGE, IC_LORA_V1_ENVELOPE_MESSAGE
 from runtime_config.video_job_budget import (
     LOCAL_GENERATION_UNSUPPORTED,
     LOCAL_GENERATION_UNSUPPORTED_MESSAGE,
     VIDEO_JOB_TOO_LARGE,
-    VIDEO_JOB_TOO_LARGE_MESSAGE,
 )
 from tests.fakes import FakeCapture
 from tests.http_error_assertions import assert_http_error
@@ -43,6 +43,53 @@ def test_ic_lora_generate_runs_inference(client: TestClient, tmp_path: Path, cre
     assert resp.json()["status"] == "complete"
     # 5s at the IC-LoRA's 24fps maps to 121 frames ((5*24)//8*8 + 1).
     assert fake_services.ic_lora_pipeline.generate_calls[-1]["num_frames"] == 121
+
+
+def test_generate_loops_an_image_entry_at_loop_fps(
+    client: TestClient, tmp_path: Path, create_fake_model_files, fake_services
+):
+    create_fake_model_files()
+    client.post("/api/ic-loras/download", json={"ic_lora_id": "ingredients-v1"})
+    img = tmp_path / "in.png"
+    _write_png(img)
+    resp = client.post(
+        "/api/ic-lora/generate",
+        json={
+            "ic_lora_id": "ingredients-v1",
+            "input_path": str(img),
+            "control_values": {"duration": 5},
+            "loop_fps": 50,
+            "prompt": "a slow orbit",
+            "conditioning_type": "custom",
+        },
+    )
+    assert resp.status_code == 200
+    frames = compute_num_frames(5, 50)
+    assert fake_services.ic_lora_pipeline.generate_calls[-1]["num_frames"] == frames
+    loop = fake_services.video_processor.writers[-1]
+    assert (loop.fps, len(loop.frames)) == (50, frames)
+
+
+def test_generate_refuses_a_loop_fps_outside_the_supported_rates(
+    client: TestClient, tmp_path: Path, create_fake_model_files, fake_services
+):
+    create_fake_model_files()
+    client.post("/api/ic-loras/download", json={"ic_lora_id": "ingredients-v1"})
+    img = tmp_path / "in.png"
+    _write_png(img)
+    resp = client.post(
+        "/api/ic-lora/generate",
+        json={
+            "ic_lora_id": "ingredients-v1",
+            "input_path": str(img),
+            "loop_fps": 30,
+            "prompt": "p",
+            "conditioning_type": "custom",
+        },
+    )
+    assert resp.status_code == 400
+    assert "loop_fps" in resp.json()["message"]
+    assert fake_services.ic_lora_pipeline.generate_calls == []
 
 
 def test_ic_lora_generate_rejects_when_required_ltx_family_missing(
@@ -839,7 +886,10 @@ def test_ic_lora_stream_over_540p_returns_job_too_large(
         resp,
         status_code=422,
         code=VIDEO_JOB_TOO_LARGE,
-        message=VIDEO_JOB_TOO_LARGE_MESSAGE,
+        message=(
+            "This job needs 21.5 GB of GPU memory but this card has 8.0 GB. "
+            "Lower the resolution, duration, frame rate, or aspect width."
+        ),
     )
 
 
@@ -924,33 +974,6 @@ def test_ic_lora_unsupported_oversized_source_is_unsupported_not_spatial(
     assert "resolution" not in body
 
 
-def test_ic_lora_darwin_does_not_422_20s_540p(
-    client: TestClient, tmp_path: Path, create_fake_model_files, fake_services, test_state
-):
-    create_fake_model_files()
-    test_state.config.darwin_unified_memory = True
-    test_state.config.available_ram_gb = 20
-    client.post("/api/ic-loras/download", json={"ic_lora_id": "colorize-v1"})
-    src = tmp_path / "clip.mp4"
-    src.write_bytes(b"\x00" * 100)
-    test_state.video_processor.register_video(
-        str(src), FakeCapture(frames=["f"] * compute_num_frames(20, 24), fps=24, width=960, height=540)
-    )
-    resp = client.post(
-        "/api/ic-lora/generate",
-        json={
-            "ic_lora_id": "colorize-v1",
-            "input_path": str(src),
-            "prompt": "p",
-            "conditioning_type": "custom",
-            "skip_stage_2": True,
-            "resolution_factor": 0,
-        },
-    )
-    assert resp.status_code == 200
-    assert fake_services.ic_lora_pipeline.last_streaming_prefetch_count == 2
-
-
 def test_ic_lora_fps_override_budgets_resampled_frames(
     client: TestClient,
     tmp_path: Path,
@@ -980,11 +1003,55 @@ def test_ic_lora_fps_override_budgets_resampled_frames(
         over,
         status_code=422,
         code=VIDEO_JOB_TOO_LARGE,
-        message=VIDEO_JOB_TOO_LARGE_MESSAGE,
+        message=(
+            "This job needs 21.5 GB of GPU memory but this card has 20.0 GB. "
+            "Lower the resolution, duration, frame rate, or aspect width."
+        ),
     )
     ok = client.post("/api/ic-lora/generate", json={**payload, "fps_override": 12})
     assert ok.status_code == 200
     assert fake_services.ic_lora_pipeline.last_streaming_prefetch_count == 2
+
+
+def test_ic_lora_two_stage_over_priced_ceiling_fenced_before_budget(
+    client: TestClient,
+    tmp_path: Path,
+    create_fake_model_files,
+    create_fake_ic_lora_files,
+    fake_services,
+    test_state,
+):
+    """Two-stage past the 14,880-token ceiling (1920x1080 source -> 960x512
+    stage-1 x 481 frames = 29,280 tokens): a 20s two-stage job 422s with the
+    fence message even where the budget would pass it (31 GB legacy)."""
+    create_fake_model_files()
+    create_fake_ic_lora_files()
+    test_state.config.vram_gb = 31
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"\x00" * 100)
+    frames = compute_num_frames(20, 24)
+    test_state.video_processor.register_video(
+        str(src), FakeCapture(frames=["f"] * frames, fps=24, width=1920, height=1080)
+    )
+    payload = {
+        "video_path": str(src),
+        "conditioning_type": "canny",
+        "prompt": "p",
+        "skip_stage_2": False,
+        "resolution_factor": 1.5,
+    }
+    fenced = client.post("/api/ic-lora/generate", json=payload)
+    assert_http_error(
+        fenced,
+        status_code=422,
+        code=VIDEO_JOB_TOO_LARGE,
+        message=TWO_STAGE_OVER_MEASURED_MESSAGE,
+    )
+    assert fake_services.ic_lora_pipeline.create_count == 0
+    single_stage = client.post(
+        "/api/ic-lora/generate", json={**payload, "skip_stage_2": True}
+    )
+    assert single_stage.status_code == 200
 
 
 def test_ic_lora_rejects_unreadable_image(client: TestClient, tmp_path: Path, create_fake_model_files):

@@ -11,7 +11,15 @@ export type HomeShellNavSlot = "primary" | "footer" | "floating" | "support";
 export type HomeShellLayout = "home" | null;
 
 export type HomeShellEntry = {
-  readonly id: "home" | "assets" | "dashboard" | "projects" | "settings" | "remote" | "support";
+  readonly id:
+    | "home"
+    | "assistant"
+    | "assets"
+    | "dashboard"
+    | "projects"
+    | "settings"
+    | "remote"
+    | "support";
   readonly label: string;
   readonly path: string | null;
   readonly hosts: readonly HomeShellHost[];
@@ -45,6 +53,17 @@ export const HOME_SHELL_ENTRIES = [
     navSlot: "primary",
     layout: "home",
     clearsActiveProject: true,
+  },
+  {
+    id: "assistant",
+    label: "Assistant",
+    path: paths.assistant,
+    hosts: ["desktop", "remote"],
+    nav: "always",
+    outlet: "always",
+    navSlot: "primary",
+    layout: "home",
+    clearsActiveProject: false,
   },
   {
     id: "assets",
@@ -169,7 +188,8 @@ export function homeLayoutRouteSpecs(host: HomeShellHost): HomeLayoutRouteSpec[]
   for (const entry of HOME_SHELL_ENTRIES) {
     if (entry.layout !== "home" || !homeShellEntryServesHost(entry, host)) continue;
     if (entry.path === null) continue;
-    specs.push({ id: entry.id, path: entry.path });
+    // One splat route keeps the chat mounted when a new chat's URL gains its id.
+    specs.push({ id: entry.id, path: entry.id === "assistant" ? `${entry.path}/*` : entry.path });
   }
   return specs;
 }
@@ -180,7 +200,8 @@ export function homeLayoutPageIds(host: HomeShellHost): HomeLayoutPageId[] {
 
 /**
  * The ONLY place that knows which pathnames belong to which shell entry.
- * `projects` owns its subtree: /projects/:projectId renders inside Home too.
+ * `projects` and `assistant` own their subtrees: /projects/:projectId and
+ * /assistant/:chatId render inside Home too.
  * Everything else (nav active state, footer, outlet gate, layout chrome)
  * derives nesting from here — never re-implement the prefix rule.
  */
@@ -189,7 +210,7 @@ export function matchHomeShellEntry(
 ): (typeof HOME_SHELL_ENTRIES)[number] | undefined {
   return HOME_SHELL_ENTRIES.find((entry) => {
     if (entry.path === null) return false;
-    if (entry.id === "projects") {
+    if (entry.id === "projects" || entry.id === "assistant") {
       return pathname === entry.path || pathname.startsWith(`${entry.path}/`);
     }
     return matchPath({ path: entry.path, end: true }, pathname) != null;

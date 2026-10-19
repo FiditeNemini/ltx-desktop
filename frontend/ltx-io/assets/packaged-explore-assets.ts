@@ -6,8 +6,11 @@ import {
   RETAKE_SEED_FILENAME,
   EXTEND_SEED_FILENAME,
   icLoraSeedFilename,
+  INGREDIENTS_SHEET_SEED_FILENAME,
   LAYOUT_TO_RENDER_IMAGE_SEED_FILENAME,
+  MOTION_TRACK_IMAGE_SEED,
   RESTORE_IMAGE_SEED_FILENAME,
+  VIDEO_GUIDE_IMAGE_SEED,
 } from "../../../shared/explore-seed-filenames";
 import audioToVideoSeedAudioUrl from "../../../resources/explore-assets/audio-to-video-input-v2.mp3";
 import audioToVideoSeedImageUrl from "../../../resources/explore-assets/audio-to-video-input.jpg";
@@ -29,10 +32,17 @@ import layoutToRenderSeedImageUrl from "../../../resources/explore-assets/layout
 import layoutToRenderSeedVideoUrl from "../../../resources/explore-assets/layout-to-render-reference.mp4";
 import restoreSeedImageUrl from "../../../resources/explore-assets/restore-first-frame.jpg";
 import restoreSeedVideoUrl from "../../../resources/explore-assets/restore-reference.mp4";
+// Placeholder: a copy of the Restore example clip (restore/example.mp4), a clean 720p clip that
+// suits Refine Details. Replace it with a Refine Details clip.
+import refineDetailsSeedVideoUrl from "../../../resources/explore-assets/refine-details-reference.mp4";
 import extendSeedVideoUrl from "../../../resources/explore-assets/extend-input-v3.mp4";
 import transitionEndFrameUrl from "../../../resources/explore-assets/transition-end-frame.jpg";
 import transitionStartFrameUrl from "../../../resources/explore-assets/transition-start-frame.jpg";
 import vbvrStartFrameUrl from "../../../resources/explore-assets/vbvr-start-frame.jpg";
+import ingredientsSheetUrl from "../../../resources/explore-assets/ingredients-sheet.jpg";
+import motionTrackImageUrl from "../../../resources/explore-assets/motion-track-input.jpg";
+import videoGuideSeedImageUrl from "../../../resources/explore-assets/video-guide-start-frame.jpg";
+import videoGuideSeedVideoUrl from "../../../resources/explore-assets/video-guide-reference.mp4";
 import audioToVideoExamplePosterUrl from "./audio-to-video/example-poster.webp";
 import audioToVideoExampleVideoUrl from "./audio-to-video/example.webm";
 import extendExamplePosterUrl from "./extend/example-poster.webp";
@@ -167,6 +177,31 @@ export const PACKAGED_EXPLORE_SEEDS = {
   "restore-image": {
     filename: RESTORE_IMAGE_SEED_FILENAME,
     url: restoreSeedImageUrl,
+    mimeType: "image/jpeg",
+  },
+  "ingredients-sheet": {
+    filename: INGREDIENTS_SHEET_SEED_FILENAME,
+    url: ingredientsSheetUrl,
+    mimeType: "image/jpeg",
+  },
+  "refine-details-video": {
+    filename: icLoraSeedFilename("refine-details"),
+    url: refineDetailsSeedVideoUrl,
+    mimeType: "video/mp4",
+  },
+  "motion-track-image": {
+    filename: MOTION_TRACK_IMAGE_SEED.filename,
+    url: motionTrackImageUrl,
+    mimeType: "image/jpeg",
+  },
+  "video-guide-video": {
+    filename: icLoraSeedFilename("video-guide"),
+    url: videoGuideSeedVideoUrl,
+    mimeType: "video/mp4",
+  },
+  "video-guide-image": {
+    filename: VIDEO_GUIDE_IMAGE_SEED.filename,
+    url: videoGuideSeedImageUrl,
     mimeType: "image/jpeg",
   },
 } as const;

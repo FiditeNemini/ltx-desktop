@@ -12,6 +12,7 @@ from api_types import (
 )
 from _routes._errors import HTTPError
 from services.audio_trim import extract_audio_asset, trim_audio_asset
+from services.video_frame import extract_frame_asset
 from services.video_trim import trim_video_asset
 from services.store import Store
 from services.records import (
@@ -38,6 +39,7 @@ _MEDIA_ERROR_STATUS = {
     "UNSUPPORTED_MEDIA": 422,
     "INVALID_TRIM_RANGE": 422,
     "TRIM_BUSY": 503,
+    "INVALID_FRAME_TIME": 422,
 }
 
 
@@ -70,6 +72,13 @@ class AssetHandler:
         if record is None:
             raise HTTPError(404, "ASSET_NOT_FOUND")
         return _asset_to_api(record)
+
+    def get_producer_id(self, asset_id: str) -> str | None:
+        """The generation that made this asset, if it was generated."""
+        try:
+            return self._db.get_asset_producer_id(asset_id)
+        except UnavailableError as exc:
+            raise HTTPError(503, "STORE_UNAVAILABLE") from exc
 
     def list_assets(
         self, query: AssetListQuery, *, tombstone_missing: bool = True
@@ -120,6 +129,10 @@ class AssetHandler:
 
     def extract_audio(self, asset_id: str) -> Asset:
         return self._media_transform(lambda: extract_audio_asset(self._db, asset_id))
+
+    def extract_frame(self, asset_id: str, at_sec: float | None) -> Asset:
+        """``at_sec`` None takes the last frame."""
+        return self._media_transform(lambda: extract_frame_asset(self._db, asset_id, at_sec))
 
     def _media_transform(self, produce: Callable[[], AssetRecord]) -> Asset:
         try:

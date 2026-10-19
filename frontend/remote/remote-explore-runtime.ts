@@ -5,6 +5,7 @@ import type { PackagedExploreSeedId } from "../ltx-io/assets/packaged-explore-as
 import { ApiResultError, unwrapApiResult } from "../ltx-io/lib/unwrapApiResult.ts";
 import type {
   ExploreApi,
+  ExploreMediaChooseRequest,
   ExploreMediaInput,
   ExploreRuntime,
 } from "../ltx-io/runtime/ExploreRuntime.tsx";
@@ -35,23 +36,28 @@ export function persistRemoteEnhanceProviderPreference(provider: EnhanceProvider
   }
 }
 
-function waitForMountedInputFile(input: HTMLInputElement): Promise<File | null> {
+function waitForMountedInputFiles(input: HTMLInputElement): Promise<File[]> {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (file: File | null) => {
+    const finish = (files: File[]) => {
       if (settled) return;
       settled = true;
       input.removeEventListener("change", onChange);
       input.removeEventListener("cancel", onCancel);
       input.value = "";
-      resolve(file);
+      resolve(files);
     };
-    const onChange = () => finish(input.files?.[0] ?? null);
-    const onCancel = () => finish(null);
+    // Copy the list first: clearing the input empties the live FileList.
+    const onChange = () => finish(Array.from(input.files ?? []));
+    const onCancel = () => finish([]);
     input.addEventListener("change", onChange);
     input.addEventListener("cancel", onCancel);
     input.click();
   });
+}
+
+async function waitForMountedInputFile(input: HTMLInputElement): Promise<File | null> {
+  return (await waitForMountedInputFiles(input))[0] ?? null;
 }
 
 function remoteWsUrl() {
@@ -70,22 +76,32 @@ export function createRemoteMediaInput(
   waitForFile: (
     input: HTMLInputElement,
   ) => Promise<File | null> = waitForMountedInputFile,
+  waitForFiles: (
+    input: HTMLInputElement,
+  ) => Promise<File[]> = waitForMountedInputFiles,
 ): ExploreMediaInput {
+  const uploadAccepted = async (file: File, request: ExploreMediaChooseRequest) => {
+    if (!isAcceptedMediaFile(file, request)) {
+      throw new ApiResultError(UNSUPPORTED_MEDIA_MESSAGE, {
+        code: "UNSUPPORTED_MEDIA",
+      });
+    }
+    return unwrapApiResult(await exploreApi.uploadAsset(file));
+  };
   return {
     choose: async (request) => {
       if (request.fileInput == null) {
         throw new Error("Remote choose requires a mounted file input");
       }
       const file = await waitForFile(request.fileInput);
-      if (!file) {
-        return null;
+      return file ? uploadAccepted(file, request) : null;
+    },
+    chooseMany: async (request) => {
+      if (request.fileInput == null) {
+        throw new Error("Remote choose requires a mounted file input");
       }
-      if (!isAcceptedMediaFile(file, request)) {
-        throw new ApiResultError(UNSUPPORTED_MEDIA_MESSAGE, {
-          code: "UNSUPPORTED_MEDIA",
-        });
-      }
-      return unwrapApiResult(await exploreApi.uploadAsset(file));
+      const files = await waitForFiles(request.fileInput);
+      return files.map((file) => () => uploadAccepted(file, request));
     },
     ingestDroppedFile: async (file) =>
       unwrapApiResult(await exploreApi.uploadAsset(file)),
@@ -96,6 +112,7 @@ export function createRemoteExploreRuntime(options: {
   loadPackagedFile: (id: PackagedExploreSeedId) => Promise<File>;
   api?: ExploreApi;
   waitForFile?: (input: HTMLInputElement) => Promise<File | null>;
+  waitForFiles?: (input: HTMLInputElement) => Promise<File[]>;
   wsUrl?: (path: string) => Promise<string>;
 }): ExploreRuntime & { modelsVersion: null } {
   const exploreApi = options.api ?? createApiClient(api);
@@ -104,7 +121,11 @@ export function createRemoteExploreRuntime(options: {
     modelsVersion: null,
     api: exploreApi,
     wsUrl: options.wsUrl ?? remoteWsUrl(),
-    mediaInput: createRemoteMediaInput(exploreApi, options.waitForFile),
+    mediaInput: createRemoteMediaInput(
+      exploreApi,
+      options.waitForFile,
+      options.waitForFiles,
+    ),
     loadPackagedAsset: async (id) =>
       unwrapApiResult(await exploreApi.uploadAsset(await options.loadPackagedFile(id))),
     ingestRecordedFile: async (file) =>

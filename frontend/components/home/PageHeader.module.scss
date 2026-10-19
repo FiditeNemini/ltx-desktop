@@ -10,7 +10,7 @@
   padding-block: var(--page-header-padding-block-start, 0)
     var(--page-header-padding-block-end, 0);
   padding-inline: var(--page-header-padding-inline-start, var(--spacing-lg))
-    var(--page-header-padding-inline-end, var(--spacing-lg));
+    max(var(--page-header-padding-inline-end, var(--spacing-lg)), var(--window-chrome-end));
   box-sizing: border-box;
 
   :global(html[data-platform="darwin"]) & {
@@ -25,7 +25,8 @@
   // the result metadata row, which then paints over Done and takes its clicks.
   // Dropdown stays above in-page chrome and below modals.
   z-index: var(--z-dropdown);
-  padding-inline: 0;
+  // No end padding of its own (the page supplies it), so only clear the chrome.
+  padding-inline: 0 var(--window-chrome-end);
   // Unset unless an unpinned sidebar sets it on the content column.
   padding-inline-start: var(--page-header-unpinned-start, 0px);
   background-color: var(--semantic-bg-tertiary);
@@ -83,5 +84,12 @@
     flex-shrink: 1;
     flex-wrap: wrap;
     justify-content: flex-end;
+  }
+
+  // Remote on a phone, inside a feature: the wrapped actions row hugs its
+  // content at the start edge. Auto margin keeps it at the end edge.
+  // The desktop app and other pages are unchanged.
+  :global([data-remote-shell]) .trailingAtEnd {
+    margin-inline-start: auto;
   }
 }

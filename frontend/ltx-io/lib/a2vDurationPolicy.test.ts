@@ -6,18 +6,19 @@ import type {
   VideoGenerationModelSpecsResponse,
 } from "../../lib/video-generation-model-specs.ts";
 import { specFixture } from "../screens/Feature/definitions/specFixture.ts";
+
 import {
+  a2vDisabledResolutionsForOffering,
   a2vEffectiveAudioSeconds,
-  a2vLongestCellSeconds,
-  a2vNumFramesForAudio,
-  advertisedA2vDurationsAt540p24,
-  advertisedA2vDurations,
   a2vResolutionsForOffering,
   a2vTrimCapSeconds,
+  advertisedA2vDurations,
+  advertisedA2vDurationsAt540p24,
   computeA2vMaxFrames,
   formatA2vDurationBadge,
   hasAdvertisedA2vCell,
   numFramesForAudioDuration,
+  resolveA2vAudio,
 } from "./a2vDurationPolicy.ts";
 
 const LOCAL_ASPECTS = ["21:9", "16:9", "3:2", "4:3", "1:1", "4:5", "9:16"] as const;
@@ -99,9 +100,10 @@ describe("a2vDurationPolicy", () => {
       ],
       active_offering: "ltx-2.3-fast",
     };
-    assert.deepEqual(advertisedA2vDurationsAt540p24(specs, "ltx-2.5-fast"), [
-      5, 6, 8, 10, 20,
-    ]);
+    assert.deepEqual(
+      advertisedA2vDurationsAt540p24(specs, "ltx-2.5-fast"),
+      [5, 6, 8, 10, 20],
+    );
     assert.equal(a2vTrimCapSeconds(specs, "ltx-2.5-fast"), 20);
     assert.deepEqual(advertisedA2vDurationsAt540p24(specs, "ltx-2.3-fast"), [5]);
     assert.equal(a2vTrimCapSeconds(specs, "ltx-2.3-fast"), 5);
@@ -111,12 +113,11 @@ describe("a2vDurationPolicy", () => {
   });
 
   it("reads advertised A2V durations at 540p/24 from local fast specs", () => {
-    assert.deepEqual(advertisedA2vDurationsAt540p24(specFixture()), [
-      5, 6, 8, 10, 20,
-    ]);
-    assert.deepEqual(advertisedA2vDurationsAt540p24(a2vSpecs([5, 6, 8, 10, 20])), [
-      5, 6, 8, 10, 20,
-    ]);
+    assert.deepEqual(advertisedA2vDurationsAt540p24(specFixture()), [5, 6, 8, 10, 20]);
+    assert.deepEqual(
+      advertisedA2vDurationsAt540p24(a2vSpecs([5, 6, 8, 10, 20])),
+      [5, 6, 8, 10, 20],
+    );
   });
 
   it("trim cap is the max advertised duration", () => {
@@ -125,18 +126,116 @@ describe("a2vDurationPolicy", () => {
     assert.equal(a2vTrimCapSeconds(a2vSpecs([5, 6, 8, 10, 20])), 20);
   });
 
+  it("lists dropped-only A2V resolutions with the smallest-duration message", () => {
+    const specs = a2vSpecs([5]);
+    specs.downloaded_local_models[0].spec.dropped_cells = [
+      {
+        resolution: "720p",
+        fps: 24,
+        duration: 5,
+        reason: "stream_over",
+        message: "m720",
+        audio: true,
+      },
+      {
+        resolution: "720p",
+        fps: 24,
+        duration: 10,
+        reason: "stream_over",
+        message: "m720b",
+        audio: true,
+      },
+    ];
+    assert.deepEqual(a2vDisabledResolutionsForOffering(specs, "ltx-2.5-fast"), [
+      { value: "720p", message: "m720" },
+    ]);
+  });
+
+  it("excludes kept resolutions and plain-matrix drops", () => {
+    const specs = a2vSpecs([5]);
+    specs.downloaded_local_models[0].spec.dropped_cells = [
+      {
+        resolution: "540p",
+        fps: 24,
+        duration: 20,
+        reason: "stream_over",
+        message: "kept-anyway",
+        audio: true,
+      },
+      {
+        resolution: "1080p",
+        fps: 24,
+        duration: 5,
+        reason: "stream_over",
+        message: "plain",
+        audio: false,
+      },
+    ];
+    assert.deepEqual(a2vDisabledResolutionsForOffering(specs, "ltx-2.5-fast"), []);
+  });
+
   it("floors 10.563s onto 249 frames under the 20s envelope, not 481", () => {
     assert.equal(numFramesForAudioDuration(10.563, 24, 481), 249);
-    assert.equal(a2vNumFramesForAudio(10.563, [6, 8, 10, 20]), 249);
   });
 
   it("reports over-cap when floored frames exceed the envelope", () => {
     assert.equal(numFramesForAudioDuration(10.563, 24, 241), null);
-    assert.equal(a2vNumFramesForAudio(10.563, [10]), null);
+  });
+
+  it("treats 10.2s as the kept 10s cell when a longer static duration exists", () => {
+    const fit = resolveA2vAudio({
+      audioSeconds: 10.2,
+      keptSeconds: [5, 10],
+      ceilingSeconds: [5, 10, 20],
+      longestCeilingSeconds: 20,
+    });
+    assert.equal(fit.pastKept, false);
+    assert.equal(fit.frames, 241);
+    assert.equal(fit.heardSeconds, 10.2);
+  });
+
+  it("marks 10.4s past the kept 10s cell because its frames no longer fit", () => {
+    const fit = resolveA2vAudio({
+      audioSeconds: 10.4,
+      keptSeconds: [5, 10],
+      ceilingSeconds: [5, 10, 20],
+      longestCeilingSeconds: 20,
+    });
+    assert.equal(fit.pastKept, true);
+    assert.equal(fit.frames, 249);
   });
 
   it("floors exact 5s to 113, not the T2V 121 cell", () => {
     assert.equal(numFramesForAudioDuration(5.0, 24, 481), 113);
+  });
+
+  it("frame grid matches backend frame_math exactly", () => {
+    // Cross-language parity: the 8k+1 grid is mirrored in Python
+    // (frame_math.num_frames_for_audio_duration / compute_num_frames) with no
+    // shared code, so these vectors pin the agreement. Expected values from:
+    //   cd backend && uv run python -c "
+    //   from frame_math import compute_num_frames, num_frames_for_audio_duration
+    //   for d, m in [(10.563,481),(5.0,481),(5.0,113),(5.0,112),(5.04,481),(5.375,481),(2.0,481),(0.05,481),(30.0,481)]: print(d, m, num_frames_for_audio_duration(d, 24, max_frames=m))
+    //   for s in [20,5,0]: print(s, compute_num_frames(s,24))"
+    const audioVectors: Array<
+      [duration: number, maxFrames: number, frames: number | null]
+    > = [
+      [10.563, 481, 249],
+      [5.0, 481, 113],
+      [5.0, 113, 113],
+      [5.0, 112, null],
+      [5.04, 481, 113],
+      [5.375, 481, 129],
+      [2.0, 481, 41],
+      [0.05, 481, 9],
+      [30.0, 481, null],
+    ];
+    for (const [duration, maxFrames, frames] of audioVectors) {
+      assert.equal(numFramesForAudioDuration(duration, 24, maxFrames), frames);
+    }
+    assert.equal(computeA2vMaxFrames(20, 24), 481);
+    assert.equal(computeA2vMaxFrames(5, 24), 121);
+    assert.equal(computeA2vMaxFrames(0, 24), 9);
   });
 
   it("keeps the 2s minimum on the 8k+1 grid", () => {
@@ -146,12 +245,35 @@ describe("a2vDurationPolicy", () => {
     assert.equal((frames - 1) % 8, 0);
   });
 
-  it("rejects under 2s and at/over cap +0.1s", () => {
-    assert.equal(a2vNumFramesForAudio(1.0, [6, 8, 10, 20]), null);
-    assert.equal(a2vNumFramesForAudio(20.1, [6, 8, 10, 20]), null);
-    assert.equal(a2vNumFramesForAudio(10.563, []), null);
-    // Within tolerance and frames fit: still valid.
-    assert.equal(a2vNumFramesForAudio(20.05, [6, 8, 10, 20]), 481);
+  it("rejects audio under 2s and past the static ceiling", () => {
+    const cells = [6, 8, 10, 20];
+    assert.equal(
+      resolveA2vAudio({
+        audioSeconds: 1,
+        keptSeconds: cells,
+        ceilingSeconds: cells,
+        longestCeilingSeconds: 20,
+      }).frames,
+      null,
+    );
+    assert.equal(
+      resolveA2vAudio({
+        audioSeconds: 20.1,
+        keptSeconds: cells,
+        ceilingSeconds: cells,
+        longestCeilingSeconds: 20,
+      }).frames,
+      null,
+    );
+    assert.equal(
+      resolveA2vAudio({
+        audioSeconds: 20.05,
+        keptSeconds: cells,
+        ceilingSeconds: cells,
+        longestCeilingSeconds: 20,
+      }).frames,
+      481,
+    );
   });
 
   it("computes max frames from the advertised cap", () => {
@@ -170,13 +292,45 @@ describe("a2vDurationPolicy", () => {
     assert.deepEqual(advertisedA2vDurationsAt540p24(a2vSpecs([5])), [5]);
     assert.equal(a2vTrimCapSeconds(a2vSpecs([5])), 5);
     assert.equal(computeA2vMaxFrames(5, 24), 121);
-    // >=2s and under cap +0.1 may generate.
-    assert.equal(a2vNumFramesForAudio(2.0, [5]), 41);
-    assert.equal(a2vNumFramesForAudio(4.5, [5]), 105);
-    assert.equal(a2vNumFramesForAudio(5.05, [5]), 121);
-    // Under 2s or at/over cap +0.1 stays rejected.
-    assert.equal(a2vNumFramesForAudio(1.9, [5]), null);
-    assert.equal(a2vNumFramesForAudio(5.1, [5]), null);
+    const fit = (audioSeconds: number) =>
+      resolveA2vAudio({
+        audioSeconds,
+        keptSeconds: [5],
+        ceilingSeconds: [5],
+        longestCeilingSeconds: 5,
+      });
+    assert.equal(fit(2).frames, 41);
+    assert.equal(fit(4.5).frames, 105);
+    assert.equal(fit(5.05).frames, 121);
+    assert.equal(fit(1.9).frames, null);
+    assert.equal(fit(5.1).frames, null);
+  });
+
+  it("does not advertise a fully dropped A2V row in reckless", () => {
+    const empty = a2vSpecs([]);
+    const spec = {
+      ...empty.downloaded_local_models[0].spec,
+      a2v_supported_resolutions_durations: {},
+      dropped_cells: [
+        {
+          resolution: "540p" as const,
+          fps: 24 as const,
+          duration: 5 as const,
+          reason: "stream_over" as const,
+          message: "over",
+          audio: true,
+        },
+      ],
+    };
+    const specs: VideoGenerationModelSpecsResponse = {
+      ...empty,
+      budgetMode: "standard",
+      low_performance_machine: false,
+      downloaded_local_models: [{ ...empty.downloaded_local_models[0], spec }],
+      local_models: [{ pipeline: "fast", spec }],
+    };
+    assert.equal(hasAdvertisedA2vCell(specs), false);
+    assert.equal(hasAdvertisedA2vCell({ ...specs, budgetMode: "reckless" }), false);
   });
 
   it("does not use Settings local_models when nothing is downloaded", () => {
@@ -191,10 +345,7 @@ describe("a2vDurationPolicy", () => {
   });
 
   it("returns no cell when the selected offering is not downloaded", () => {
-    assert.deepEqual(
-      advertisedA2vDurationsAt540p24(specFixture(), "ltx-2.3-fast"),
-      [],
-    );
+    assert.deepEqual(advertisedA2vDurationsAt540p24(specFixture(), "ltx-2.3-fast"), []);
     assert.equal(a2vTrimCapSeconds(specFixture(), "ltx-2.3-fast"), null);
   });
 
@@ -214,8 +365,8 @@ describe("a2vDurationPolicy", () => {
 
   it("keeps a 20s clip's first 10s at 1080p and the whole clip at 540p", () => {
     const specs = specFixture();
-    const longest = a2vLongestCellSeconds(specs, "ltx-2.5-fast");
-    assert.equal(longest, 20);
+    assert.equal(advertisedA2vDurations(specs, "ltx-2.5-fast", "540p").at(-1), 20);
+    const longest = 20;
     assert.equal(
       a2vEffectiveAudioSeconds(
         20,
@@ -232,9 +383,6 @@ describe("a2vDurationPolicy", () => {
       ),
       20,
     );
-    assert.equal(
-      a2vEffectiveAudioSeconds(20.1, [5, 10], longest),
-      null,
-    );
+    assert.equal(a2vEffectiveAudioSeconds(20.1, [5, 10], longest), null);
   });
 });

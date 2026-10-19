@@ -5,7 +5,10 @@ import { ItemAction } from "@ds/DropdownItems/ItemAction/ItemAction";
 import { DropdownPicker } from "@ds/DropdownPicker/DropdownPicker";
 import { PickerBox } from "@ds/PickerBox/PickerBox";
 import { useTheme } from "@ds/styles/themes/useTheme";
+import { Tooltip } from "@ds/Tooltip/Tooltip";
 
+import { BudgetFraction } from "@/components/BudgetFraction";
+import { budgetTooltip } from "@/lib/budget-figure";
 import { SlidingSegmentControl } from "../../../components/SlidingSegmentControl/SlidingSegmentControl";
 import type { FieldOption } from "../types";
 import { AspectRatioWarningIcon } from "./AspectRatioWarningIcon";
@@ -45,18 +48,25 @@ function buildOptionListItem<TValue extends string | number>(
   getOptionIcon?: (option: FieldOption<TValue>) => ReactNode,
 ) {
   const icon = getOptionIcon?.(option);
-  return (
+  const budget = option.budget ?? null;
+  const item = (
     <ItemAction
       text={option.label}
       leftIcon={
         icon ? <span className={styles.optionListIcon}>{icon}</span> : undefined
       }
       rightCta={
-        option.warning ? (
-          <AspectRatioWarningIcon warning={option.warning} />
+        budget != null ? (
+          <BudgetFraction readout={budget} />
+        ) : option.warning ? (
+          <AspectRatioWarningIcon
+            warning={option.warning}
+            tone={option.warningTone ?? "caveat"}
+          />
         ) : undefined
       }
-      caption={option.disabledReason}
+      thumbnail={option.thumbnail ? { src: option.thumbnail, alt: option.label } : undefined}
+      caption={budget == null ? (option.disabledReason ?? option.caption) : undefined}
       isDisabled={option.disabledReason != null}
       textVariant="body"
       selectionPosition="right"
@@ -64,6 +74,21 @@ function buildOptionListItem<TValue extends string | number>(
       isSelected={isOptionSelected(value, option)}
       onClick={() => onSelect(option)}
     />
+  );
+  if (option.disabledReason === undefined) {
+    if (budget == null) return item;
+    return (
+      <Tooltip content={budgetTooltip(budget, option.budgetNote)}>
+        <span className={styles.disabledOptionTrigger}>{item}</span>
+      </Tooltip>
+    );
+  }
+  // Plain-span trigger, mirroring AspectRatioWarningIcon: the refusal must
+  // fire even though the row itself is disabled.
+  return (
+    <Tooltip content={budget ? budgetTooltip(budget) : option.disabledReason}>
+      <span className={styles.disabledOptionTrigger}>{item}</span>
+    </Tooltip>
   );
 }
 
@@ -93,6 +118,8 @@ export function FormOptionControl<TValue extends string | number>({
   const pickerClassName = clsx(styles.picker, styles.settingsPicker);
 
   const handleSelect = (option: FieldOption<TValue>) => {
+    // Backstop: the item/segment guards block pointer clicks, but keyboard
+    // selection reaches here directly. Withheld options never commit.
     if (option.disabledReason != null) return;
     onChange(option.value);
   };
@@ -103,10 +130,25 @@ export function FormOptionControl<TValue extends string | number>({
   const selectedKey = selectedOption
     ? toOptionSegmentKey(selectedOption.value)
     : toOptionSegmentKey(value);
+  const riskMarker =
+    selectedOption?.warningTone === "risk" && selectedOption.warning ? (
+      <AspectRatioWarningIcon
+        warning={
+          selectedOption.budget
+            ? budgetTooltip(selectedOption.budget, selectedOption.budgetNote)
+            : selectedOption.warning
+        }
+        tone="risk"
+      />
+    ) : null;
   const selectedIcon =
     showTriggerIcon && selectedOption
       ? getOptionIcon?.(selectedOption)
       : undefined;
+
+  const pickerLeading = selectedOption?.thumbnail
+    ? { thumbnail: { src: selectedOption.thumbnail, alt: selectedOption.label } }
+    : { icon: selectedIcon };
 
   const presentation = getOptionControlPresentation(options, {
     forcePicker,
@@ -114,7 +156,7 @@ export function FormOptionControl<TValue extends string | number>({
   });
 
   if (presentation === "display-only") {
-    return (
+    const box = (
       <PickerBox
         className={pickerClassName}
         value={selectedLabel}
@@ -122,8 +164,21 @@ export function FormOptionControl<TValue extends string | number>({
         hideArrow
         aria-label={ariaLabel}
         icon={selectedIcon}
+        trailing={riskMarker}
         {...PICKER_TEXT}
       />
+    );
+    if (selectedOption?.disabledReason === undefined) return box;
+    return (
+      <Tooltip
+        content={
+          selectedOption.budget
+            ? budgetTooltip(selectedOption.budget)
+            : selectedOption.disabledReason
+        }
+      >
+        {box}
+      </Tooltip>
     );
   }
 
@@ -134,13 +189,26 @@ export function FormOptionControl<TValue extends string | number>({
       return {
         value: toOptionSegmentKey(option.value),
         disabled: option.disabledReason != null,
-        disabledTooltip: option.disabledReason,
+        disabledTooltip: option.budget
+          ? budgetTooltip(option.budget)
+          : option.disabledReason,
         label: (
           <span className={styles.formOptionSegmentLabel}>
             {icon}
             {option.label}
-            {!isSelected && option.warning ? (
-              <AspectRatioWarningIcon warning={option.warning} />
+            {option.budget ? (
+              <>
+                <BudgetFraction readout={option.budget} />
+                {option.budgetNote && option.disabledReason == null ? (
+                  <AspectRatioWarningIcon warning={option.budgetNote} />
+                ) : null}
+              </>
+            ) : option.warning &&
+              (!isSelected || option.warningTone === "risk") ? (
+              <AspectRatioWarningIcon
+                warning={option.warning}
+                tone={option.warningTone ?? "caveat"}
+              />
             ) : null}
           </span>
         ),
@@ -197,7 +265,8 @@ export function FormOptionControl<TValue extends string | number>({
         <PickerBox
           className={pickerClassName}
           value={selectedLabel}
-          icon={selectedIcon}
+          {...pickerLeading}
+          trailing={riskMarker}
           state={isPickerOpen ? "active" : "enabled"}
           shouldRotateArrowOnActive
           {...PICKER_TEXT}

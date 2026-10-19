@@ -14,6 +14,12 @@
 # bundled torch/python/arch exactly. Run AFTER prepare-python.sh, on a macOS
 # Apple-Silicon build machine WITH Xcode Command Line Tools.
 #
+# macOS version: no MACOSX_DEPLOYMENT_TARGET is set, so the .so's minimum macOS
+# (minos) equals the build machine's macOS (26.0 on CI). dyld refuses to load it
+# on an older macOS. The backend therefore gates local generation to macOS 26+
+# (DARWIN_MIN_MACOS_MAJOR in backend/runtime_config/runtime_policy.py). See
+# "macOS version requirement" in docs/mps-attention-memory-leak.md before changing it.
+#
 # Output: <output>/mps_sdpa_zc_ext/{mps_sdpa_zc_ext.so, mpsgraph_zc.o, build.ninja,...}
 # prepare-python.sh calls this with <output> = python-embed/mps-ext-prebuilt so the
 # cache rides the CI python-embed cache and is bundled to resources/python/mps-ext-prebuilt

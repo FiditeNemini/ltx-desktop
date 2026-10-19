@@ -7,6 +7,7 @@ import {
   KeyCombo,
   formatKeyCombo,
   findConflicts,
+  isReservedCombo,
   ActionDefinition,
 } from '../lib/keyboard-shortcuts'
 
@@ -207,6 +208,9 @@ export function KeyboardShortcutsModal() {
       ...(e.shiftKey ? { shift: true } : {}),
       ...(e.altKey ? { alt: true } : {}),
     }
+
+    // A reserved combo is not accepted. Keep recording so the user can press another key.
+    if (isReservedCombo(combo)) return
 
     // If Escape pressed alone, cancel recording
     if (combo.key === 'escape' && !combo.ctrl && !combo.shift && !combo.alt) {

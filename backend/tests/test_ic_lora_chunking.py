@@ -86,9 +86,9 @@ def test_fixed_window_chunks_a_small_canvas_that_the_size_rule_leaves_whole() ->
 
 def test_fixed_window_overrides_the_default_window_length() -> None:
     window = ic_lora_chunk_pixel_frames(
-        1920, 1088, 241, stage_mode=IcLoraStageMode.SINGLE_STAGE, tiling=_restore_tiling(window_frames=49)
+        1920, 1088, 241, stage_mode=IcLoraStageMode.SINGLE_STAGE, tiling=_restore_tiling(window_frames=57)
     )
-    assert window == 49
+    assert window == 57
     assert window != IC_LORA_CHUNK_PIXEL_FRAMES
 
 

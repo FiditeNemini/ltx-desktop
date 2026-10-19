@@ -30,19 +30,25 @@ export function registerLogHandlers(): void {
     }
   })
 
-  handle('getLogPath', () => {
-    const logPath = getCurrentLogFilename()
-    const logDir = getLogDir()
-    return { logPath, logDir }
-  })
-
-  handle('openLogFolder', async () => {
-    const logDir = getLogDir()
-    if (fs.existsSync(logDir)) {
+  // Shows the active session log in the file manager, selected. Falls back to the folder
+  // when the file is not there yet.
+  handle('revealSessionLog', async () => {
+    try {
+      const logPath = getCurrentLogFilename()
+      const logDir = getLogDir()
       const { shell } = await import('electron')
-      shell.openPath(logDir)
-      return true
+      if (fs.existsSync(logPath)) {
+        shell.showItemInFolder(logPath)
+        return true
+      }
+      if (fs.existsSync(logDir)) {
+        await shell.openPath(logDir)
+        return true
+      }
+      return false
+    } catch (error) {
+      logger.error(`Error revealing the session log: ${error}`)
+      return false
     }
-    return false
   })
 }

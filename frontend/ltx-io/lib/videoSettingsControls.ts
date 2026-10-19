@@ -1,18 +1,21 @@
+import { readBudgetMode } from "../../lib/budget-risk.ts";
 import {
   GENSPACE_MIN_SELECTABLE_DURATION_S,
   getOfferingVideoGenerationModelSpecs,
-  isOfferingId,
   offeringSpecsAsPipelineItems,
-  OFFERING_IDS,
   resolveVideoGenerationOptions,
+  VIDEO_GENERATION_RESOLUTION_ORDER,
   untrainedAspectRatioWarning,
   orderAspectRatiosForPicker,
   type OfferingId,
+  type ResolvedVideoGenerationOptions,
   type VideoGenerationDuration,
   type VideoGenerationFps,
   type VideoGenerationModelSpecsResponse,
   type VideoGenerationResolution,
 } from "../../lib/video-generation-model-specs.ts";
+import { videoGenerationResolutionLabel } from "../../lib/video-resolution.ts";
+import { chunkedRunNotice, generationResolutionWarning } from "./lowPerformanceWarning.ts";
 import type {
   FeatureFieldChange,
   FeatureFieldSchema,
@@ -21,23 +24,16 @@ import type {
 } from "../screens/Feature/types.ts";
 import {
   clampVideoFields,
-  collectModelDurationOptions,
+  collectModelDisabledFpsOptions,
   collectModelFpsOptions,
   retargetVideoFields,
   type ClampedVideoFields,
   type VideoFeatureAspectRatio,
 } from "./videoFieldPolicy.ts";
 
-export const VIDEO_SETTING_MODELS: readonly OfferingId[] = OFFERING_IDS;
-export const VIDEO_SETTING_RESOLUTIONS: readonly VideoGenerationResolution[] = [
-  "270p",
-  "360p",
-  "540p",
-  "720p",
-  "1080p",
-  "1440p",
-  "2160p",
-];
+/** Single source: the shared canonical order (one list, not two). */
+export const VIDEO_SETTING_RESOLUTIONS: readonly VideoGenerationResolution[] =
+  VIDEO_GENERATION_RESOLUTION_ORDER;
 export const VIDEO_SETTING_FPS_VALUES: readonly VideoGenerationFps[] = [
   24, 25, 48, 50,
 ];
@@ -109,10 +105,31 @@ export type VideoSettingsOptionField<
   | VideoSettingsDurationField
   | VideoSettingsFpsField;
 
-export function isSupportedVideoModel(
-  value: unknown,
-): value is OfferingId {
-  return isOfferingId(value);
+/** The "runs in N windows" notice of the option's cell, when the backend splits that cell. */
+function chunkedNotice<T extends string | number>(
+  chunked: readonly { value: T; windows: number }[],
+  value: T,
+): string | undefined {
+  const match = chunked.find((option) => option.value === value);
+  return match ? chunkedRunNotice(match.windows) : undefined;
+}
+
+/**
+ * What the backend says about a resolution's cell at the selected fps and duration: its windows,
+ * `null` for a single pass, or `undefined` when unknown. It is unknown with an automatic
+ * duration, and where the resolution does not offer the selected duration.
+ */
+function resolutionChunk(
+  resolved: ResolvedVideoGenerationOptions,
+  resolution: VideoGenerationResolution,
+): { windows: number } | null | undefined {
+  const run = resolved.chunkedResolutionOptions.find((option) => option.value === resolution);
+  if (run != null) return run;
+  return resolved.singlePassResolutionOptions.includes(resolution) ? null : undefined;
+}
+
+function withCaveat(caveat: string | undefined): Pick<FieldOption, "warning"> {
+  return caveat != null ? { warning: caveat } : {};
 }
 
 export function isSupportedVideoResolution(
@@ -161,19 +178,24 @@ export function createVideoSettingsOptionFields<
     modelSpecs: offeringSpecsAsPipelineItems(offeringSpecs),
     hasAudio: false,
     minimumDuration: GENSPACE_MIN_SELECTABLE_DURATION_S,
+    budgetMode: readBudgetMode(specs?.budgetMode),
   });
   const selectedModel =
     resolved.modelOptions.find(
       (item) => item.pipeline === resolved.selectedModel,
     ) ?? resolved.modelOptions[0];
-  const durationOptions = collectModelDurationOptions(
-    selectedModel,
-    resolved.durationOptions,
-  ).filter(isSupportedVideoDuration);
+  const durationOptions = resolved.durationOptions.filter(isSupportedVideoDuration);
   const fpsOptions = collectModelFpsOptions(
     selectedModel,
     resolved.fpsOptions,
   ).filter(isSupportedVideoFps);
+  // Resolution-scoped like the aspect picker: a duration the current cell
+  // cannot run renders greyed with the backend refusal instead of staying
+  // enabled (union) and silently retargeting the resolution on pick.
+  const disabledDurations = resolved.disabledDurationOptions;
+  // Withheld fps values append after keeps (union scope, numeric): the budget
+  // grows monotonically, so drops sit above keeps.
+  const disabledFps = collectModelDisabledFpsOptions(selectedModel, fpsOptions);
 
   return [
     {
@@ -201,11 +223,19 @@ export function createVideoSettingsOptionFields<
           ? [{ value: "auto" as const, label: "Auto" }]
           : []),
         ...orderAspectRatiosForPicker(resolved.aspectRatioOptions).map((aspectRatio) => {
-          const warning = untrainedAspectRatioWarning(aspectRatio);
+          const disabled = resolved.disabledAspectRatioOptions.find(
+            (option) => option.value === aspectRatio,
+          );
           return {
             value: aspectRatio,
             label: aspectRatio,
-            ...(warning ? { warning } : {}),
+            ...withCaveat(untrainedAspectRatioWarning(aspectRatio)),
+            ...(disabled
+              ? {
+                  disabledReason: disabled.message,
+                  ...(disabled.readout ? { budget: disabled.readout } : {}),
+                }
+              : {}),
           };
         }),
       ] as VideoSettingsAspectField<
@@ -218,16 +248,31 @@ export function createVideoSettingsOptionFields<
       label: "Resolution",
       dataKey: "resolution",
       maxOptionCount: VIDEO_SETTING_RESOLUTIONS.length,
-      options: [...resolved.resolutionOptions]
-        .sort(
-          (left, right) =>
-            VIDEO_SETTING_RESOLUTIONS.indexOf(left) -
-            VIDEO_SETTING_RESOLUTIONS.indexOf(right),
-        )
-        .map((resolution) => ({
-          value: resolution,
-          label: resolution,
+      options: [
+        ...[...resolved.resolutionOptions]
+          .sort(
+            (left, right) =>
+              VIDEO_SETTING_RESOLUTIONS.indexOf(left) -
+              VIDEO_SETTING_RESOLUTIONS.indexOf(right),
+          )
+          .map((resolution) => ({
+            value: resolution,
+            label: videoGenerationResolutionLabel(resolution),
+            ...withCaveat(
+              generationResolutionWarning(
+                resolution,
+                specs?.low_performance_machine,
+                resolutionChunk(resolved, resolution),
+              ),
+            ),
+          })),
+        ...resolved.disabledResolutionOptions.map((option) => ({
+          value: option.value,
+          label: videoGenerationResolutionLabel(option.value),
+          disabledReason: option.message,
+          ...(option.readout ? { budget: option.readout } : {}),
         })),
+      ],
     },
     {
       kind: "options",
@@ -235,10 +280,19 @@ export function createVideoSettingsOptionFields<
       label: "Duration",
       dataKey: "duration",
       forcePicker: true,
-      options: durationOptions.map((duration) => ({
-        value: duration,
-        label: `${duration}s`,
-      })),
+      options: [
+        ...durationOptions.map((duration) => ({
+          value: duration,
+          label: `${duration}s`,
+          ...withCaveat(chunkedNotice(resolved.chunkedDurationOptions, duration)),
+        })),
+        ...disabledDurations.map((option) => ({
+          value: option.value,
+          label: `${option.value}s`,
+          disabledReason: option.message,
+          ...(option.readout ? { budget: option.readout } : {}),
+        })),
+      ],
     },
     {
       kind: "options",
@@ -246,10 +300,19 @@ export function createVideoSettingsOptionFields<
       label: "Frame Rate",
       dataKey: "fps",
       maxOptionCount: VIDEO_SETTING_FPS_VALUES.length,
-      options: fpsOptions.map((fps) => ({
-        value: fps,
-        label: String(fps),
-      })),
+      options: [
+        ...fpsOptions.map((fps) => ({
+          value: fps,
+          label: String(fps),
+          ...withCaveat(chunkedNotice(resolved.chunkedFpsOptions, fps)),
+        })),
+        ...disabledFps.map((option) => ({
+          value: option.value,
+          label: String(option.value),
+          disabledReason: option.message,
+          ...(option.readout ? { budget: option.readout } : {}),
+        })),
+      ],
     },
   ];
 }

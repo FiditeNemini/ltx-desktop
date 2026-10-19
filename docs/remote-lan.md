@@ -56,7 +56,9 @@ The Remote server exposes only the Explore surface:
 - `POST /api/pairing/exchange` — public; trades the one-time grant for a
   durable device session.
 - `GET /api/session` — authenticated pairing check.
-- T2V/I2V generation list, create, get, retry, cancel, and delete.
+- Generation list, create, get, retry, cancel, and delete for every tool
+  registered with `remote: true`: text, image, and audio to video, Retake,
+  Extend, and the LoRA and IC-LoRA recipes.
 - `GET /api/generate/models-specs`.
 - `POST /api/assets/upload` — image input upload.
 - `GET /api/assets/{id}` — path-free asset metadata plus signed media URLs.
@@ -67,14 +69,27 @@ The Remote server exposes only the Explore surface:
   available, plus `defaultProvider` (Gemini if a Desktop key is stored,
   otherwise local Gemma when downloaded). Does not return API keys or
   filesystem paths.
-- `POST /api/enhance-prompt` — rewrite the prompt. Image frames are asset ids,
-  never paths. Body `provider` is `local` or `api`; omit it to use
+- `POST /api/enhance-prompt` — rewrite the prompt. Image frames and the source
+  video (`videoAssetId`, with `icLoraId` for an IC-LoRA) are asset ids, never
+  paths. A video can stand in for the prompt. A Retake also sends `replacedWindow`
+  (`start`, `end` in seconds), so the stills come from around the part it replaces. Body `provider` is `local` or `api`; omit it to use
   `defaultProvider`. Explicit `api` without a key returns
   `GEMINI_API_KEY_MISSING` (no silent fallback to Gemma). The Enhance button
   follows the Desktop Auto-Enhance setting (hidden when auto-enhance is on).
 - `GET`/`PATCH /api/feature-flags` — the dev feature flags shared with Desktop
   (`feature_flags.json`). The Dev Panel opens in the Remote with Ctrl+Shift+D
   or `?devpanel=1`, so any paired device can change them.
+- Assistant chat under `/api/assistant` (see `docs/desktop-assistant.md`):
+  - list, get, and delete conversations;
+  - queue, remove, and release queued messages;
+  - `POST /turn`;
+  - get, continue, and stop a run;
+  - `GET /runs/{run_id}/events`, the long-lived event stream described in
+    [Assistant event stream](#assistant-event-stream);
+  - `GET` and `PUT /selection`, the model choice shared with Desktop, and
+    read-only `GET /models`.
+
+  Assistant model download and delete stay on `:41954`.
 - Bundled Remote SPA assets.
 
 These stay off `:41955`:
@@ -83,7 +98,10 @@ These stay off `:41955`:
 - Desktop path ingest (`POST /api/assets`).
 - Model downloads and Hugging Face auth (except the LoRA recipe preflight
   already on this port).
-- Image generation, IC-LoRA, Extend, and Retake.
+- Image generation (Gen Space only).
+
+The assistant's tools run inside the shared `AppHandler`, not through these
+routes. Jobs started from a phone chat report `analytics_client="remote"`.
 
 The separate port is the namespace boundary. Therefore the phone uses normal
 paths such as `/api/generations`; adding `/api/remote/` to every phone route
@@ -212,6 +230,27 @@ feature is not remotely available just because a Desktop route exists.
   limits. Video/audio uploads are not Remote input capabilities; stored
   generated video/audio remains playable through byte endpoints.
 - Desktop and Remote FastAPI apps own their handler/controller instances.
+
+### Assistant event stream
+
+`GET /api/assistant/runs/{run_id}/events` is a server-sent event stream. It
+stays open while a run waits for video jobs, which can take many minutes.
+While the run is quiet, it sends a heartbeat comment every 15 seconds.
+
+The Bearer check runs only when the stream opens, so the stream ends itself:
+
+- **Device revoke**: on the next event or heartbeat, and at most once every 5
+  seconds, the route checks that the paired device is still active. A quiet
+  run yields only on the heartbeat, so a revoked phone stops receiving the
+  reply within about 15 seconds. Its other requests are refused at once.
+- **Shutdown**: the Assistant's shutdown wakes every open stream, and each one
+  closes without a `done` event.
+- **Remote off**: the Remote uvicorn server uses
+  `timeout_graceful_shutdown=2`. Open streams close about 2 seconds after the
+  stop, so the server thread ends within the controller's 5-second join.
+- **Unknown run id**: if a run is neither running nor stored 30 seconds after
+  the stream opens, the stream sends a final `done` event and closes. So a
+  paired device cannot hold idle streams open.
 
 ## Non-goals
 

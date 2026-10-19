@@ -27,6 +27,7 @@ export function SettingsStack({
 export function SettingsSubsection({
   title,
   description,
+  alert,
   icon: Icon,
   badge,
   headerTrailing,
@@ -40,6 +41,7 @@ export function SettingsSubsection({
 }: {
   title: string;
   description?: ReactNode;
+  alert?: ReactNode;
   icon?: LucideIcon;
   badge?: ReactNode;
   headerTrailing?: ReactNode;
@@ -83,6 +85,7 @@ export function SettingsSubsection({
           {description}
         </Text>
       ) : null}
+      {alert ? <p className={styles.saveAlert}>{alert}</p> : null}
       {children}
     </section>
   );
@@ -239,6 +242,58 @@ export function SettingsOptionCard({
       {footer ? (
         <div className={clsx(styles.optionCardFooter, footerClassName)}>{footer}</div>
       ) : null}
+    </div>
+  );
+}
+
+export function SettingsChoiceCard({
+  selected,
+  disabled = false,
+  onClick,
+  title,
+  badge,
+  description,
+  footer,
+}: {
+  selected: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  title: string;
+  badge?: ReactNode;
+  description: string;
+  footer?: ReactNode;
+}) {
+  return (
+    <div className={styles.textEncodingOptionCell}>
+      <SettingsOptionCard
+        selected={selected}
+        disabled={disabled}
+        onClick={onClick}
+        activateOnPointerDown
+        applySelectedClass={false}
+        className={clsx(
+          styles.textEncodingCard,
+          selected && styles.textEncodingCardSelected,
+        )}
+        innerClassName={styles.textEncodingCardHead}
+        footerClassName={styles.textEncodingCardFooter}
+        footer={footer}
+      >
+        <span
+          className={clsx(
+            styles.textEncodingRadio,
+            selected && styles.textEncodingRadioSelected,
+          )}
+          aria-hidden
+        />
+        <div className={styles.textEncodingCardCopy}>
+          <div className={styles.textEncodingCardTitleRow}>
+            <span className={styles.textEncodingCardTitle}>{title}</span>
+            {badge}
+          </div>
+          <p className={styles.textEncodingCardDescription}>{description}</p>
+        </div>
+      </SettingsOptionCard>
     </div>
   );
 }

@@ -23,9 +23,11 @@ export function RemoteShell() {
     useExploreRuntime();
   const shellEntry = matchHomeShellEntry(pathname);
   const isFeatureForm = isHomeFeaturePath(pathname);
+  const isAssistantPage = shellEntry?.id === "assistant";
   // Remote generation always goes through the paired desktop, so workflow
   // pages get the in-page header the same way a viable desktop does.
-  const headerSlot = shellPageHeaderSlot(pathname, true);
+  // The assistant page fills the screen and keeps its own header.
+  const headerSlot = isAssistantPage ? null : shellPageHeaderSlot(pathname, true);
   useHistoryShortcuts();
 
   const queueControl =
@@ -41,7 +43,7 @@ export function RemoteShell() {
 
   return (
     <QuickSearchProvider>
-      <div className={clsx(layout.layout, styles.fillShell)}>
+      <div className={clsx(layout.layout, styles.fillShell)} data-remote-shell="">
         <RemoteLtxioQuickSearch />
         <RemoteHomeSidebar />
         <div className={layout.main}>
@@ -49,13 +51,15 @@ export function RemoteShell() {
             <PageHeader showHistoryNav queueControl={queueControl} />
           ) : null}
           <main
-            className={layout.content}
+            className={clsx(layout.content, isAssistantPage && styles.assistantPage)}
             data-home-scroll-root=""
             data-feature-form={isFeatureForm ? "" : undefined}
             data-home-page={shellEntry?.id === "home" ? "" : undefined}
             data-assets-page={shellEntry?.id === "assets" ? "" : undefined}
           >
-            <div className={layout.contentInner}>
+            <div
+              className={clsx(layout.contentInner, isAssistantPage && styles.assistantPageInner)}
+            >
               <Outlet
                 context={{
                   pageHeaderQueueControl: headerSlot === "page" ? queueControl : null,

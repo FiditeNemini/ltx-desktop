@@ -71,6 +71,7 @@ MediaErrorCode = Literal[
     "UNREADABLE_MEDIA",
     "INVALID_TRIM_RANGE",
     "TRIM_BUSY",
+    "INVALID_FRAME_TIME",
 ]
 
 
@@ -148,6 +149,27 @@ class GenerationRecord(_RecordModel):
     def _failed_has_error_code(self) -> GenerationRecord:
         require_failed_has_error_code(self.status, self.error_code)
         return self
+
+
+class AssistantRunRecord(_RecordModel):
+    id: str = Field(min_length=1)
+    conversation_id: str = Field(min_length=1)
+    payload: str
+    payload_version: int
+    status: str | None = None
+    stopped: bool = False
+    # Job number to generation id, for the jobs this run queued.
+    jobs: dict[str, str] = Field(default_factory=dict)
+    # Jobs whose cards this run shows, oldest first: its own, less any a later run retried, plus any it retried.
+    shown: tuple[str, ...] = ()
+    # Jobs whose create failed: their rows are deleted on save.
+    released: tuple[str, ...] = ()
+
+
+class AssistantQueueRecord(_RecordModel):
+    id: str = Field(min_length=1)
+    payload: str
+    payload_version: int
 
 
 class QueueGenerationRecord(_RecordModel):

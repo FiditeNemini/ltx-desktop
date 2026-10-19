@@ -10,20 +10,17 @@ from handlers.video_resolution import (
     correct_frame_count,
     generation_letterbox,
     read_source_metadata,
-    resolve_home_edit_size,
-)
-from runtime_config.video_job_budget import (
-    VIDEO_JOB_TOO_LARGE,
-    VIDEO_JOB_TOO_LARGE_MESSAGE,
+    resolve_requested_home_edit_size,
 )
 from services.features.video.edit_executor import VideoEditExecutor
 from services.features.video.job_common import model_from_spec
-from services.records import AssetRecord, CapabilityFailedError, GenerationRecord
+from services.fast_video_pipeline.windowed_run import measured_edit
+from services.records import AssetRecord, GenerationRecord
 from services.retake_pipeline.window import (
-    MAX_INPUT_FRAMES,
+    MIN_EXTEND_CONTEXT_FRAMES,
+    EditRefusal,
     ExtendEncodeWindow,
-    duration_to_extend_frames,
-    window_for_extend,
+    prepare_extend_window,
 )
 from services.retake_pipeline.extend_stitch import stitch_extend_output
 from state.app_state_types import RetakePipelineState
@@ -72,6 +69,9 @@ class ExtendExecutor(VideoEditExecutor[ExtendParams, ExtendInputs, _PreparedExte
         seed: int,
         dest: Path,
         windowed_path: str,
+        *,
+        allow_risk: bool,
+        unmeasured_bet: bool = False,
     ) -> _PreparedExtend:
         fps, source_width, source_height, source_frames = read_source_metadata(
             video.path
@@ -79,32 +79,34 @@ class ExtendExecutor(VideoEditExecutor[ExtendParams, ExtendInputs, _PreparedExte
         # Min-length only. Window/stitch math uses the raw count so leftover
         # frames after the 8k+1 snap stay in the original half of the concat.
         correct_frame_count(source_frames)
-        extend_frames = duration_to_extend_frames(params.duration, fps)
-        requested = params.resolution
-        content_width, content_height = resolve_home_edit_size(
-            None if requested is None else requested.width,
-            None if requested is None else requested.height,
+        content_width, content_height = resolve_requested_home_edit_size(
+            params.resolution,
             source_width,
             source_height,
+            high_res=self._pipelines.high_res_video_enabled(),
         )
         box = generation_letterbox(content_width, content_height)
         # A long 1080p source fills the 505-frame window and 422s on 31 GB.
-        # Use the longest window that still loads. A new section that is
-        # already longer than that cannot be saved by more context.
-        frame_cap = self._pipelines.edit_encode_frame_cap(box.canvas_width, box.canvas_height)
-        if frame_cap < MAX_INPUT_FRAMES and extend_frames >= frame_cap:
-            raise CapabilityFailedError(
-                VIDEO_JOB_TOO_LARGE_MESSAGE, code=VIDEO_JOB_TOO_LARGE
-            )
-        try:
-            window = window_for_extend(
-                source_frames=source_frames,
-                extend_frames=extend_frames,
-                mode=params.mode,
-                max_input_frames=frame_cap,
-            )
-        except ValueError as exc:
-            raise CapabilityFailedError(str(exc), code="INVALID_GENERATION_SPEC") from exc
+        # Use the longest window that still loads. Total-gated: the resident
+        # pipeline is still loaded here, so free would shorten the window
+        # before the load gate's evict-retry runs.
+        frame_cap = self._pipelines.edit_encode_frame_cap(
+            box.canvas_width,
+            box.canvas_height,
+            total_only=True,
+        )
+        prepared = prepare_extend_window(
+            fps=fps,
+            source_frames=source_frames,
+            target_width=content_width,
+            target_height=content_height,
+            frame_cap=frame_cap,
+            duration=params.duration,
+            mode=params.mode,
+        )
+        if isinstance(prepared, EditRefusal):
+            prepared.raise_capability_error()
+        window, extend_frames = prepared.window, prepared.extend_frames
         if (
             abs(content_width - source_width) > 31
             or abs(content_height - source_height) > 31
@@ -116,6 +118,58 @@ class ExtendExecutor(VideoEditExecutor[ExtendParams, ExtendInputs, _PreparedExte
                 content_width,
                 content_height,
             )
+        def rewindow(free_cap: int) -> int:
+            nonlocal window, extend_frames
+            original_frames = window.context_frames + extend_frames
+            # Salvage with reduced context: the job was admitted with the
+            # full 121-frame floor, so a free dip shrinks the context
+            # (far-side-trimmed by the window math) instead of failing.
+            # Refuses only when the extension alone exceeds the free cap.
+            shrunk = prepare_extend_window(
+                fps=fps,
+                source_frames=source_frames,
+                target_width=content_width,
+                target_height=content_height,
+                frame_cap=free_cap,
+                duration=params.duration,
+                mode=params.mode,
+                minimum_context_frames=1,
+            )
+            # Unreachable while MAX_SHRINK_GAP_FRAMES < 120 (a passing first
+            # gate leaves extend <= total - 121, which always fits a free cap
+            # within 48): kept so a wider future bound still fails cleanly
+            # with the max named instead of crashing on the refusal below.
+            if isinstance(shrunk, EditRefusal):
+                shrunk.raise_capability_error()
+            if shrunk.window.context_frames < MIN_EXTEND_CONTEXT_FRAMES:
+                logger.warning(
+                    "Extend %s running with %d context frames, below the %d-frame coherence floor (unmeasured regime)",
+                    generation.id,
+                    shrunk.window.context_frames,
+                    MIN_EXTEND_CONTEXT_FRAMES,
+                )
+            logger.info(
+                "Extend %s free gate refused the total-fitting %d-frame window; shrinking to free-gated cap %d (encode %d)",
+                generation.id,
+                original_frames,
+                free_cap,
+                shrunk.window.context_frames + shrunk.extend_frames,
+            )
+            window, extend_frames = shrunk.window, shrunk.extend_frames
+            return window.context_frames + extend_frames
+
+        pipeline_state = self._load_edit_window(
+            local_model_id=local_model_id,
+            width=box.canvas_width,
+            height=box.canvas_height,
+            frames=window.context_frames + extend_frames,
+            total_cap=frame_cap,
+            allow_risk=allow_risk,
+            unmeasured_bet=unmeasured_bet,
+            generation_id=generation.id,
+            log_name="Extend",
+            rewindow=rewindow,
+        )
         logger.info(
             "Extend %s started (%s, source %dx%d → %dx%d canvas %dx%d, %d source frames @ %g fps, %s +%d, encode %d, seed=%d)",
             generation.id,
@@ -136,14 +190,7 @@ class ExtendExecutor(VideoEditExecutor[ExtendParams, ExtendInputs, _PreparedExte
         return _PreparedExtend(
             params=params,
             video=video,
-            pipeline_state=self._pipelines.load_retake_pipeline(
-                distilled=True,
-                ltx_model_id=local_model_id,
-                width=box.canvas_width,
-                height=box.canvas_height,
-                frames=window.context_frames + extend_frames,
-                queued_home=True,
-            ),
+            pipeline_state=pipeline_state,
             seed=seed,
             fps=fps,
             content_width=content_width,
@@ -157,6 +204,11 @@ class ExtendExecutor(VideoEditExecutor[ExtendParams, ExtendInputs, _PreparedExte
         )
 
     def generate(self, prepared: _PreparedExtend) -> None:
+        frames = prepared.window.context_frames + prepared.extend_frames
+        with measured_edit(prepared.canvas_width, prepared.canvas_height, frames):
+            self._generate(prepared)
+
+    def _generate(self, prepared: _PreparedExtend) -> None:
         prepared.pipeline_state.pipeline.extend(
             video_path=prepared.video.path,
             prompt=prepared.params.prompt,

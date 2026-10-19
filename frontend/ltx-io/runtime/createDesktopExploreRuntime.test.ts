@@ -189,6 +189,29 @@ describe("Desktop Explore runtime", () => {
 });
 
 describe("Desktop Explore media input", () => {
+  it("opens the dialog with multi-select and ingests only the paths the caller runs", async () => {
+    const calls: string[] = [];
+    const dialogs: Array<{ properties?: string[] }> = [];
+    const runtime = createDesktopExploreRuntime(1, {
+      api: recordingIngestClient(calls),
+      host: hostStub({
+        showOpenFileDialog: async (input) => {
+          dialogs.push(input);
+          return ["/Users/me/a.png", "/Users/me/b.png", "/Users/me/c.png"];
+        },
+      }),
+      wsUrl: async (path) => `ws://desktop${path}`,
+    });
+
+    const pending = await runtime.mediaInput.chooseMany(chooseRequest);
+
+    assert.deepEqual(dialogs[0]?.properties, ["openFile", "multiSelections"]);
+    assert.equal(pending.length, 3);
+    assert.deepEqual(calls, []);
+    await pending[1]?.();
+    assert.deepEqual(calls, ["/Users/me/b.png"]);
+  });
+
   it("path-ingests a native dialog selection", async () => {
     const calls: string[] = [];
     const runtime = createDesktopExploreRuntime(1, {

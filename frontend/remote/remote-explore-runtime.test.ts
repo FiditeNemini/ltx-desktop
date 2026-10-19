@@ -95,6 +95,30 @@ describe("Remote Explore media input", () => {
     assert.deepEqual(calls, [{ path: "/api/assets/upload", file }]);
   });
 
+  it("returns every file of a multi-pick and uploads only the ones the caller ingests", async () => {
+    const calls: Array<{ path: string; file: unknown }> = [];
+    const files = ["a", "b", "c"].map(
+      (name) => new File(["pixels"], `${name}.png`, { type: "image/png" }),
+    );
+    const runtime = createRemoteExploreRuntime({
+      api: recordingUploadClient(calls),
+      loadPackagedFile: unusedPackagedFile,
+      waitForFiles: async () => files,
+      wsUrl: async (path) => `ws://remote${path}`,
+    });
+
+    const pending = await runtime.mediaInput.chooseMany(chooseRequest);
+
+    assert.equal(pending.length, 3);
+    assert.deepEqual(calls, []);
+    await pending[0]?.();
+    await pending[1]?.();
+    assert.deepEqual(
+      calls.map((call) => call.file),
+      [files[0], files[1]],
+    );
+  });
+
   it("throws when choose is called without a mounted file input", async () => {
     const runtime = createRemoteExploreRuntime({
       api: recordingUploadClient([]),

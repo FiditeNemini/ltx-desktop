@@ -18,6 +18,7 @@ from server_utils.oriented_image import (
     open_oriented_rgb,
     oriented_image_file,
     oriented_image_payload,
+    oriented_image_size,
 )
 from tests.fakes import FakeResponse
 
@@ -61,6 +62,16 @@ def test_open_oriented_image_rotates_phone_orientations(tmp_path: Path) -> None:
         assert loaded.size == expected.size
         assert loaded.tobytes() == expected.tobytes()
         assert loaded.getexif().get(0x0112) in (None, 1)
+
+
+def test_oriented_image_size_swaps_sides_for_phone_orientations(tmp_path: Path) -> None:
+    upright = tmp_path / "upright.png"
+    _marked_image().save(upright, format="PNG")
+    assert oriented_image_size(upright) == _RAW_SIZE
+    for orientation in (6, 8):
+        path = tmp_path / f"phone-{orientation}.jpg"
+        _save_oriented(path, orientation)
+        assert oriented_image_size(path) == _RAW_SIZE[::-1]
 
 
 def test_open_oriented_image_leaves_upright_pixels_and_format(tmp_path: Path) -> None:

@@ -10,9 +10,11 @@ from pathlib import Path
 import av
 import numpy as np
 import imageio.v2 as imageio
+import pytest
 from PIL import Image
 from starlette.testclient import TestClient
 
+from _routes._errors import HTTPError
 from api_types import (
     DownloadSpec,
     DownloadVariant,
@@ -34,8 +36,10 @@ from api_types import (
 from app_factory import create_app
 from app_handler import ServiceBundle
 from handlers.base import resolve_models_dir
+from runtime_config.ic_lora_high_res import HIGH_RES_ONLY_IC_LORAS
 from runtime_config.ltx_capabilities import budget_pixels, local_caps
 from runtime_config.model_download_specs import resolve_ic_lora_path
+from runtime_config.video_job_budget import VIDEO_JOB_TOO_LARGE
 from services.features.ic_lora_recipes import (
     IC_LORA_RECIPES,
     ic_lora_fps_choices,
@@ -249,6 +253,58 @@ def test_create_fills_omitted_audio_and_scale_from_catalog_defaults(
     assert spec["params"]["audioMode"] == "generated"
     assert spec["params"]["loras"][0]["scale"] == 1.5
     assert "scale" not in spec["params"]
+
+
+def _recipe_mirror_inputs(test_state, fake_services, tmp_path: Path, *, frames: int, source_fps: float):
+    """Two-stage catalog item + fake-capture video + stored params for the create mirror."""
+    item = add_ic_lora(fake_services, id="two-stage-test")
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"\x00" * 100)
+    test_state.video_processor.register_video(
+        str(path), FakeCapture(frames=["f"] * frames, fps=source_fps, width=720, height=720)
+    )
+    meta = VideoMeta(
+        width=720, height=720, durationMs=10000, sizeBytes=100, audioStreamCount=0, fps=source_fps
+    )
+    video = AssetRecord(
+        id="v1", media_kind="video", origin="uploaded", path=str(path),
+        mime_type="video/mp4", name="clip.mp4",
+        metadata=VideoAssetMetadata(mediaType="video", metadata=meta), created_at=0,
+    )
+    stored = IcLoraRecipeStoredParams(
+        prompt="p", model="ltx-2.5-fast", resolution="540p",
+        audioMode="generated", fps=24,
+        loras=[LoraEntry(ref="", scale=1.0, catalogId="two-stage-test")],
+    )
+    return item, video, stored
+
+
+def test_recipe_preflight_prices_resampled_frames_not_source_rate(
+    test_state, fake_services, create_fake_model_files, tmp_path: Path
+) -> None:
+    """Two-stage fence: 2000f trips it, decimated ~1000f fits — the mirror must decimate."""
+    create_fake_model_files()
+    item, video, stored = _recipe_mirror_inputs(
+        test_state, fake_services, tmp_path, frames=2000, source_fps=48
+    )
+    test_state.ic_lora.preflight_queued_recipe_job(
+        item=item, video=video, stored=stored, source_fps=48.0
+    )
+
+
+def test_recipe_preflight_still_refuses_when_resampled_exceeds_fence(
+    test_state, fake_services, create_fake_model_files, tmp_path: Path
+) -> None:
+    """Decimation must not blind the fence: resampled-over still 422s."""
+    create_fake_model_files()
+    item, video, stored = _recipe_mirror_inputs(
+        test_state, fake_services, tmp_path, frames=4000, source_fps=48
+    )
+    with pytest.raises(HTTPError) as exc_info:
+        test_state.ic_lora.preflight_queued_recipe_job(
+            item=item, video=video, stored=stored, source_fps=48.0
+        )
+    assert exc_info.value.code == VIDEO_JOB_TOO_LARGE
 
 
 def test_alpha_gen_create_accepts_a_blank_prompt_and_runs_on_2_5_only(
@@ -725,6 +781,31 @@ def test_layout_create_without_the_required_reference_image_is_rejected(
     )
 
 
+def test_layout_create_refuses_a_1440p_cell_because_stage_2_keeps_the_look_still(
+    client, test_state, fake_services, create_fake_model_files, tmp_path: Path
+) -> None:
+    create_fake_model_files()
+    _install_layout_catalog(fake_services)
+    _write_weights(test_state, ic_lora_id="layout-to-render")
+    flag = client.request("PATCH", "/api/feature-flags", json={"highResVideoToVideo": True})
+    assert flag.status_code == 200, flag.text
+    video = client.post("/api/assets", json={"path": str(_mp4(tmp_path / "clip.mp4"))}).json()
+    image = client.post("/api/assets", json={"path": str(_png(tmp_path / "look.png"))}).json()
+    response = client.post(
+        "/api/generations/ic-lora-recipes/layout-to-render",
+        json={
+            "params": _params(resolution="1440p"),
+            "inputs": {"video": {"assetId": video["id"]}, "image": {"assetId": image["id"]}},
+        },
+    )
+    assert_http_error(
+        response,
+        status_code=422,
+        code="IC_LORA_HIGH_RES_UNSUPPORTED",
+        message="Test IC-LoRA cannot render above 1080p. Pick a lower resolution.",
+    )
+
+
 def test_create_rejects_a_reference_image_for_a_recipe_that_takes_none(
     client, test_state, fake_services, create_fake_model_files, tmp_path: Path
 ) -> None:
@@ -841,9 +922,13 @@ def test_create_rejects_an_unreadable_clip_that_has_no_stored_fps(
 
 
 class _RecordingGenerator:
-    def __init__(self) -> None:
+    def __init__(self, ic_lora) -> None:
+        self._ic_lora = ic_lora
         self.fps: float | None = None
         self.frames: int | None = None
+
+    def recipe_run_frames(self, **kwargs: object):
+        return self._ic_lora.recipe_run_frames(**kwargs)
 
     def generate_local_reserved(self, request: object, **_kwargs: object) -> object:
         path = Path(str(getattr(request, "input_path")))
@@ -857,9 +942,10 @@ class _RecordingGenerator:
 
 
 def test_a_slower_rate_is_the_file_the_pipeline_receives(
-    test_state, create_fake_model_files, tmp_path: Path
+    test_state, fake_services, create_fake_model_files, tmp_path: Path
 ) -> None:
     create_fake_model_files()
+    _install_catalog(fake_services)
     source = _mp4(tmp_path / "phone.mp4", fps=30, seconds=1)
     asset = AssetRecord(
         id="clip",
@@ -904,7 +990,7 @@ def test_a_slower_rate_is_the_file_the_pipeline_receives(
         started_at=0,
         outputs=(),
     )
-    generator = _RecordingGenerator()
+    generator = _RecordingGenerator(test_state.ic_lora)
 
     class _Clip:
         def get_asset(self, asset_id: str) -> AssetRecord | None:
@@ -950,11 +1036,153 @@ def test_the_crop_filter_sets_fps_only_when_the_selected_rate_is_slower() -> Non
 def test_ic_lora_recipe_table_matches_shared_json() -> None:
     contract_path = Path(__file__).resolve().parents[2] / "shared" / "ic-lora-recipes.json"
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    expected = {
-        entry["id"]: entry["catalogId"]
-        for entry in contract
-    }
+    expected = {entry["id"]: (entry["catalogId"], entry["kind"]) for entry in contract}
     actual = {
-        recipe.recipe_id: recipe.catalog_id for recipe in IC_LORA_RECIPES.values()
+        recipe.recipe_id: (recipe.catalog_id, recipe.kind) for recipe in IC_LORA_RECIPES.values()
     }
     assert actual == expected
+    # The frontend hides these recipes without the flag. The backend refuses the same set.
+    assert {
+        entry["catalogId"] for entry in contract if entry.get("requiresHighRes") is True
+    } == HIGH_RES_ONLY_IC_LORAS
+
+
+_GIB = 1024**3
+
+
+def _configure_windows(test_state, *, vram_gib: float, total_ram_gib: float) -> None:
+    test_state.config.system = "Windows"
+    test_state.config.vram_gb = int(vram_gib)
+    test_state.config.vram_bytes = int(vram_gib * _GIB)
+    test_state.config.total_ram_bytes = int(total_ram_gib * _GIB)
+    test_state.config.local_generations_mode = "streaming_models_loading"
+
+
+def _wide_mp4(
+    path: Path, *, width: int = 256, height: int = 144, frames: int = 300, fps: int = 30
+) -> Path:
+    writer = imageio.get_writer(str(path), fps=fps, codec="libx264", macro_block_size=None)
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    for _ in range(frames):
+        writer.append_data(frame)
+    writer.close()
+    return path
+
+
+def _create_recipe(client, video_id: str, **param_overrides: object):
+    return client.post(
+        "/api/generations/ic-lora-recipes/day-to-night",
+        json={
+            "params": _params(fps=24, **param_overrides),
+            "inputs": {"video": {"assetId": video_id}},
+        },
+    )
+
+
+def _register_clip(
+    test_state, video_id: str, *, frames: int = 300, fps: int = 30
+) -> None:
+    store = SqliteStore(test_state.config.app_data_dir)
+    asset = store.get_asset(video_id)
+    assert asset is not None
+    test_state.video_processor.register_video(
+        asset.path, FakeCapture(frames=[None] * frames, fps=fps, width=256, height=144)
+    )
+
+
+def test_create_refuses_an_over_budget_recipe_before_anything_enqueues(
+    client, test_state, fake_services, create_fake_model_files, tmp_path: Path
+) -> None:
+    create_fake_model_files()
+    _configure_windows(test_state, vram_gib=10, total_ram_gib=64)
+    _install_catalog(fake_services)
+    _write_weights(test_state)
+    video = client.post("/api/assets", json={"path": str(_wide_mp4(tmp_path / "clip.mp4"))}).json()
+    _register_clip(test_state, video["id"])
+
+    refused = _create_recipe(client, video["id"], resolution="540p")
+
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["code"] == VIDEO_JOB_TOO_LARGE
+    queued = client.get("/api/generations", params={"feature": "day-to-night"})
+    assert queued.status_code == 200, queued.text
+    assert queued.json() == []
+
+
+def test_create_admits_a_recipe_the_card_can_run(
+    client, test_state, fake_services, create_fake_model_files, tmp_path: Path
+) -> None:
+    create_fake_model_files()
+    _configure_windows(test_state, vram_gib=32, total_ram_gib=64)
+    _install_catalog(fake_services)
+    _write_weights(test_state)
+    video = client.post("/api/assets", json={"path": str(_wide_mp4(tmp_path / "clip.mp4"))}).json()
+    _register_clip(test_state, video["id"])
+
+    created = _create_recipe(client, video["id"], resolution="540p")
+
+    assert created.status_code == 200, created.text
+
+
+def test_create_admits_on_total_while_free_depressed(
+    client, test_state, fake_services, create_fake_model_files, tmp_path: Path
+) -> None:
+    # A running job depresses free; the queue exists to wait for it, so create gates on total.
+    create_fake_model_files()
+    _configure_windows(test_state, vram_gib=32, total_ram_gib=64)
+    _install_catalog(fake_services)
+    _write_weights(test_state)
+    fake_services.gpu_info.free_vram_bytes = 4 * _GIB
+    video = client.post("/api/assets", json={"path": str(_wide_mp4(tmp_path / "clip.mp4"))}).json()
+    _register_clip(test_state, video["id"])
+
+    created = _create_recipe(client, video["id"], resolution="540p")
+
+    assert created.status_code == 200, created.text
+
+
+def test_create_budgets_the_recipe_tier_not_one_shared_canvas(
+    client, test_state, fake_services, create_fake_model_files, tmp_path: Path
+) -> None:
+    create_fake_model_files()
+    _configure_windows(test_state, vram_gib=10, total_ram_gib=64)
+    _install_catalog(fake_services)
+    _write_weights(test_state)
+    video = client.post("/api/assets", json={"path": str(_wide_mp4(tmp_path / "clip.mp4"))}).json()
+    _register_clip(test_state, video["id"])
+
+    small = _create_recipe(client, video["id"], resolution="270p")
+    assert small.status_code == 200, small.text
+
+    big = _create_recipe(client, video["id"], resolution="540p")
+    assert big.status_code == 422, big.text
+    assert big.json()["code"] == VIDEO_JOB_TOO_LARGE
+
+
+def test_queued_layout_create_prices_the_look_still(
+    client, test_state, fake_services, create_fake_model_files, tmp_path: Path
+) -> None:
+    # 540p (1024x576 output) over 233 frames asks ~16.87 with the still, ~0.17
+    # less without; a 16.8 GiB card must refuse at create, as execute would.
+    # fps=source keeps the full frame count: with a lower fps the probe would
+    # price the decimated clip and correctly admit (see resampled-frames tests).
+    create_fake_model_files()
+    _configure_windows(test_state, vram_gib=16.8, total_ram_gib=64)
+    _install_layout_catalog(fake_services)
+    _write_weights(test_state, ic_lora_id="layout-to-render")
+    video = client.post("/api/assets", json={"path": str(_wide_mp4(tmp_path / "clip.mp4", frames=240, fps=24))}).json()
+    test_state.video_processor.register_video(
+        video["path"], FakeCapture(frames=[None] * 240, fps=24, width=1920, height=1080)
+    )
+    image = client.post("/api/assets", json={"path": str(_png(tmp_path / "look.png"))}).json()
+
+    refused = client.post(
+        "/api/generations/ic-lora-recipes/layout-to-render",
+        json={
+            "params": _params(fps=24, resolution="540p"),
+            "inputs": {"video": {"assetId": video["id"]}, "image": {"assetId": image["id"]}},
+        },
+    )
+
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["code"] == VIDEO_JOB_TOO_LARGE

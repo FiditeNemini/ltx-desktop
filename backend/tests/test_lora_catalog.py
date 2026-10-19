@@ -3,6 +3,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from api_types import parse_lora_catalog
+from services.features.ic_lora_recipes import (
+    IC_LORA_RECIPES,
+    IcLoraRecipe,
+    IcLoraRecipeKind,
+    get_ic_lora_recipe,
+    ic_lora_skips_prompt_enhancement,
+)
 from services.lora_catalog.file_lora_catalog import FileLoraCatalogProvider
 
 _VALID = """
@@ -49,11 +56,9 @@ def test_supported_models_rejects_empty_and_duplicates():
         parse_lora_catalog(dup)
 
 
-def test_shipped_ingredients_is_2_3_only():
+def test_every_shipped_entry_lists_unique_supported_models():
     catalog = Path(__file__).parent.parent / "runtime_config" / "lora_catalog.json"
     cat = parse_lora_catalog(catalog.read_text(encoding="utf-8"))
-    ing = next(r for r in cat.ic_loras if r.id == "ingredients")
-    assert ing.supported_models == ["LTX-2.3"]
     for item in [*cat.loras, *cat.ic_loras]:
         assert item.supported_models, item.id
         assert len(item.supported_models) == len(set(item.supported_models)), item.id
@@ -75,6 +80,23 @@ def test_shipped_ingredients_ic_lora_is_wired_for_image_input():
     assert [s.utility for s in ing.preprocessing] == ["image_to_frames"]
     duration = next(c for c in ing.controls if c.id == "duration")
     assert duration.default in duration.options
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        # The three wrong shapes an image-list entry can take.
+        lambda text: text.replace('"input": {"kind": "image"}', '"input": {"kind": "video", "max_count": 4}'),
+        lambda text: text.replace(
+            '"preprocessing": [{"utility": "image_to_frames", "params": {}}],', '"preprocessing": [],'
+        ).replace('"input": {"kind": "image"}', '"input": {"kind": "image", "max_count": 4}'),
+        lambda text: text.replace('"input": {"kind": "image"}', '"input": {"kind": "image", "max_count": 11}'),
+    ],
+    ids=["video-input", "no-image-to-frames-step", "over-the-image-limit"],
+)
+def test_catalog_rejects_a_malformed_image_list_entry(broken):
+    with pytest.raises(ValidationError):
+        parse_lora_catalog(broken(_VALID))
+
 
 def test_parse_rejects_unknown_input_kind():
     bad = _VALID.replace('"kind": "image"', '"kind": "audio"')
@@ -262,8 +284,20 @@ def test_shipped_catalog_uses_relative_demo_videos_and_author_affiliation():
         if item.media and item.media.demo_video:
             assert not item.media.demo_video.startswith("http://")
             assert not item.media.demo_video.startswith("https://")
-    official = [r for r in cat.ic_loras if r.author and r.author.affiliation == "ltx"]
-    assert len(official) == 14
+    official_ids = {
+        r.id for r in [*cat.loras, *cat.ic_loras] if r.author and r.author.affiliation == "ltx"
+    }
+    assert {
+        "alpha-gen",
+        "cinemagraph-motion",
+        "day-to-night",
+        "dolly-in",
+        "ingredients",
+        "layout-to-render",
+        "motion-track",
+        "refine-details",
+        "restore",
+    } <= official_ids
     missing = next(r for r in cat.loras if r.id == "fantasy-anime-style")
     assert missing.media is not None and missing.media.demo_video == "fantasy_anime_style_demo.mp4"
 
@@ -529,6 +563,21 @@ def test_shipped_transition_and_vbvr_have_enhancement_examples():
     assert "Home VBVR is image-to-video" not in vbvr_block
 
 
+def test_shipped_free_rewrite_home_ic_loras_carry_card_examples():
+    from services.prompt_enhancement.system_prompt import render_catalog_item_block
+
+    catalog = Path(__file__).parent.parent / "runtime_config" / "lora_catalog.json"
+    cat = parse_lora_catalog(catalog.read_text(encoding="utf-8"))
+    expected = {"clean-plate": 3, "layout-to-render": 3}
+    for lora_id, count in expected.items():
+        item = next(r for r in cat.ic_loras if r.id == lora_id)
+        assert item.prompt_template is None
+        assert len(item.enhancement_examples) == count, lora_id
+        block = render_catalog_item_block(item)
+        for example in item.enhancement_examples:
+            assert example in block
+
+
 def test_input_optional_defaults_false():
     assert parse_lora_catalog(_VALID).ic_loras[0].input.optional is False
 
@@ -597,3 +646,31 @@ def test_catalog_entry_pins_a_reference_image_only_to_frame_0_or_the_still_frame
     for frame in (5, -2):
         with pytest.raises(ValidationError, match="reference_image_frame must be 0 or -1"):
             parse_lora_catalog(entry(frame))
+
+
+@pytest.mark.parametrize(
+    ("kind", "skips"),
+    [("video", True), ("track", False)],
+)
+def test_a_recipe_row_refuses_a_template_that_would_never_apply_or_a_rewrite_would_change(
+    kind: IcLoraRecipeKind, skips: bool
+) -> None:
+    with pytest.raises(ValueError, match="prompt_template"):
+        IcLoraRecipe(
+            recipe_id="x",
+            catalog_id="x",
+            kind=kind,
+            prompt_template="{prompt}",
+            skips_prompt_enhancement=skips,
+        )
+
+
+def test_a_recipe_that_skips_enhancement_is_found_by_both_the_recipe_id_and_the_catalog_id() -> None:
+    # The enhancement handler asks by catalog id and analytics asks by recipe id. A row with
+    # two different ids would skip in one caller and not in the other.
+    for recipe in IC_LORA_RECIPES.values():
+        if not recipe.skips_prompt_enhancement:
+            continue
+        assert get_ic_lora_recipe(recipe.recipe_id) is recipe
+        assert ic_lora_skips_prompt_enhancement(recipe.catalog_id)
+

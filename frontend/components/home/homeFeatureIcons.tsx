@@ -10,6 +10,7 @@ import MagicWandIcon from "@/ds/assets/Icons/MagicWand.svg?react";
 import PhotoIcon from "@/ds/assets/Icons/Photo.svg?react";
 import PickerIcon from "@/ds/assets/Icons/Picker.svg?react";
 import VideoCameraIcon from "@/ds/assets/Icons/VideoCamera.svg?react";
+import WorkflowIcon from "@/ds/assets/Icons/Workflow.svg?react";
 import type { HomeFeatureId } from "@/lib/home-features";
 
 type SvgIcon = ComponentType<SVGProps<SVGSVGElement>>;
@@ -31,6 +32,7 @@ const FEATURE_ICONS: Partial<Record<HomeFeatureId, SvgIcon>> = {
   "clean-plate": BackdropIcon,
   decompression: AdjustIcon,
   "layout-to-render": CubeSketchIcon,
+  "motion-track": WorkflowIcon,
 };
 
 export function homeFeatureIcon(id: HomeFeatureId): ReactNode {

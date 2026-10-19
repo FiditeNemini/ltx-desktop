@@ -37,7 +37,9 @@ DEFAULT_NEGATIVE_PROMPT = (
     "excessive noise, grainy texture"
 )
 
-DEFAULT_APP_SETTINGS = AppSettings()
+# The app defaults to reckless, but these suites assert the standard refusals the
+# budget layer still implements. Tests that need reckless set it explicitly.
+DEFAULT_APP_SETTINGS = AppSettings(budget_mode="standard")
 
 
 class _UnusedReservedVideoGenerator:
@@ -60,8 +62,10 @@ class _UnusedReservedVideoGenerator:
         a2v_num_frames: int | None = None,
         a2v_audio_duration_seconds: float | None = None,
         local_model_id=None,
+        risk_allowance: bool | None = None,
+        unmeasured_bet: bool = False,
     ) -> GenerateVideoCompleteResponse:
-        del req, generation_id, prompt_wrap, a2v_num_frames, a2v_audio_duration_seconds, local_model_id
+        del req, generation_id, prompt_wrap, a2v_num_frames, a2v_audio_duration_seconds, local_model_id, risk_allowance, unmeasured_bet
         return GenerateVideoCompleteResponse(
             status="complete",
             video_path=str(output_path) if output_path is not None else "",
@@ -121,6 +125,8 @@ def test_state(tmp_path: Path, fake_services: FakeServices):
 
     store = SqliteStore(config.app_data_dir)
     bundle = ServiceBundle(
+        assistant_provider=fake_services.assistant_provider,
+        assistant_models=fake_services.assistant_models,
         http=fake_services.http,
         gpu_cleaner=fake_services.gpu_cleaner,
         model_downloader=fake_services.model_downloader,

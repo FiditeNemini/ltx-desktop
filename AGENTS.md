@@ -92,6 +92,13 @@ Key patterns:
 - Video editor (largest frontend file): `frontend/views/VideoEditor.tsx`
 - Project types: `frontend/types/project.ts`
 
+## Measurement evidence archive
+
+Budget constants in `backend/runtime_config/` cite internal measurement run keys.
+Budget comments explain why, not what was measured: mechanism, failure mode,
+and what breaks if the constant changes. No run keys, brackets, or fit math in
+code prose — those live behind the Evidence links and in the budgets ledger.
+
 ## Tests
 
 Before writing tests, list the cases you intend to cover and wait for approval.

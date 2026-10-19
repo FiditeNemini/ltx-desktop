@@ -16,6 +16,7 @@ from services.gemini_text_client import (
     resolve_gemini_model,
 )
 from services.interfaces import HttpTransportError
+from services.storage_info.storage_info_impl import StorageInfoImpl
 from state import build_initial_state
 from app_handler import ServiceBundle
 from services.sqlite_store import SqliteStore
@@ -393,6 +394,21 @@ class TestModelsDirAdminGuard:
         assert loaded.state.app_settings.models_dir == "/tmp/persisted-models"
         assert loaded.models.models_dir == Path("/tmp/persisted-models")
 
+    def test_models_dir_change_reprobes_drive_type(self, client, test_state, tmp_path):
+        """A custom models dir on another drive must not keep the old drive class."""
+        target = tmp_path / "models-alt"
+        target.mkdir()
+        expected = StorageInfoImpl(target).get_drive_type()
+        test_state.config.checkpoint_drive_type = "nvme" if expected != "nvme" else "ssd"
+        r = client.post(
+            "/api/settings",
+            json={"modelsDir": str(target)},
+            headers={"X-Admin-Token": TEST_ADMIN_TOKEN},
+        )
+        assert r.status_code == 200
+        assert test_state.config.checkpoint_drive_type == expected
+        assert test_state.generation_queue._checkpoint_drive_type == expected
+
 
 class TestSettingsPersistence:
     def _new_state(self, test_state, default_app_settings):
@@ -419,6 +435,16 @@ class TestSettingsPersistence:
             store=SqliteStore(test_state.config.app_data_dir),
         )
         return build_initial_state(test_state.config, default_app_settings.model_copy(deep=True), service_bundle=bundle)
+
+    def test_startup_probes_persisted_models_dir_drive_type(self, test_state, default_app_settings, tmp_path):
+        """A persisted custom models dir must route its own drive class at boot."""
+        target = tmp_path / "models-alt"
+        target.mkdir()
+        test_state.config.settings_file.write_text(json.dumps({"modelsDir": str(target)}))
+        expected = StorageInfoImpl(target).get_drive_type()
+        test_state.config.checkpoint_drive_type = "nvme" if expected != "nvme" else "ssd"
+        loaded = self._new_state(test_state, default_app_settings)
+        assert loaded.config.checkpoint_drive_type == expected
 
     def test_load_settings_clamps_from_disk_and_ignores_removed_fields(self, test_state, default_app_settings):
         test_state.config.settings_file.write_text(

@@ -11,6 +11,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  archive-markers:
+    name: Archive markers
+    if: github.repository == 'Lightricks/ltx-desktop-internal'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Check archive markers
+        run: bash .github/sync/check-archive-markers.sh
+
   typecheck:
     name: Type Checking
     runs-on: ubuntu-latest

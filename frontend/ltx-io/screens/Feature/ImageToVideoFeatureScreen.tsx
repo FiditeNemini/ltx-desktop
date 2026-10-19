@@ -53,6 +53,7 @@ export function ImageToVideoFeatureScreen() {
       definition={imageToVideoDefinition}
       context={context}
       contextReady={contextReady}
+      generateEnabled={specsQuery.budgetModeReady}
       resourceError={resourceError}
       createGeneration={createGeneration}
       ResultFrameAdapter={ResultFrame}

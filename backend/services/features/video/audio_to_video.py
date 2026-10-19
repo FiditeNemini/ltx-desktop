@@ -10,15 +10,15 @@ from api_types import (
     GenerateVideoRequest,
 )
 from _routes._errors import HTTPError
-from services.features.video.image_to_video import (
-    AssetResolver,
-    find_closest_aspect_ratio_option,
-)
+from services.aspect_ratio import find_closest_aspect_ratio_option
+from services.features.video.image_to_video import AssetResolver
 from services.features.video.job_common import (
     capability_failed_from_http,
     model_from_spec,
     require_existing_asset,
     resolve_job_local_model_id,
+    spec_risk_allowance,
+    spec_unmeasured_bet,
 )
 from services.features.video.text_to_video import (
     ReservedVideoGenerator,
@@ -29,7 +29,7 @@ from services.features.video.text_to_video import (
 )
 from runtime_config.model_download_specs import local_aspect_ratios
 from services.generation_interrupt import GenerationCancelledError, is_cancel_exception
-from services.generation_queue.types import OutputAllocation, OutputPlan
+from services.generation_queue.types import ExecutionOutcome, OutputAllocation, OutputPlan
 from services.records import AssetRecord, GenerationRecord
 
 FEATURE = "audio-to-video"
@@ -63,7 +63,7 @@ class AudioToVideoExecutor:
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome:
         self.validate_params(
             generation.spec, contract_version=generation.contract_version
         )
@@ -99,6 +99,8 @@ class AudioToVideoExecutor:
                 local_model_id=resolve_job_local_model_id(
                     self._video_generation.models_dir, offering
                 ),
+                risk_allowance=spec_risk_allowance(generation.spec),
+                unmeasured_bet=spec_unmeasured_bet(generation.spec),
             )
         except Exception as exc:
             if is_cancel_exception(exc):
@@ -110,6 +112,7 @@ class AudioToVideoExecutor:
             raise
         if isinstance(result, GenerateVideoCancelledResponse):
             raise GenerationCancelledError()
+        return ExecutionOutcome(load_mode=result.load_mode, offload_mode=result.offload_mode)
 
     def _resolve_audio(self, asset_id: str) -> AssetRecord:
         return require_existing_asset(

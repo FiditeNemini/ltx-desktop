@@ -25,6 +25,8 @@ from services.records import (
     AssetListPage,
     AssetMetadata,
     AssetRecord,
+    AssistantQueueRecord,
+    AssistantRunRecord,
     AttemptError,
     GenerationErrorCode,
     GenerationRecord,
@@ -220,6 +222,320 @@ class SqliteStore:
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
+
+    def _assistant_runs(self, conn: sqlite3.Connection, where: str, params: tuple[object, ...]) -> list[AssistantRunRecord]:
+        # One read transaction, so a save between the two reads cannot mismatch payload and jobs.
+        conn.execute("BEGIN")
+        rows = conn.execute(
+            "SELECT id, conversation_id, payload, payload_version, status, stopped FROM assistant_runs "
+            f"WHERE {where} ORDER BY rowid",
+            params,
+        ).fetchall()
+        ids = json.dumps([str(row["id"]) for row in rows])
+        jobs: dict[str, dict[str, str]] = {}
+        shown: dict[str, list[str]] = {}
+        for job in conn.execute(
+            "SELECT generation_id, run_id, job_number, shown_in_run_id FROM assistant_jobs "
+            "WHERE run_id IN (SELECT value FROM json_each(?)) OR shown_in_run_id IN (SELECT value FROM json_each(?)) "
+            "ORDER BY rowid",
+            (ids, ids),
+        ).fetchall():
+            generation_id = str(job["generation_id"])
+            jobs.setdefault(str(job["run_id"]), {})[str(job["job_number"])] = generation_id
+            shown.setdefault(str(job["shown_in_run_id"]), []).append(generation_id)
+        conn.rollback()
+        return [
+            AssistantRunRecord(
+                id=str(row["id"]), conversation_id=str(row["conversation_id"]), payload=str(row["payload"]),
+                payload_version=_require_int(row["payload_version"]), status=_optional_str(row["status"]),
+                stopped=bool(row["stopped"]), jobs=jobs.get(str(row["id"]), {}), shown=tuple(shown.get(str(row["id"]), [])),
+            )
+            for row in rows
+        ]
+
+    def get_assistant_run(self, run_id: str) -> AssistantRunRecord | None:
+        conn = self._connect()
+        try:
+            runs = self._assistant_runs(conn, "id = ?", (run_id,))
+            return runs[0] if runs else None
+        finally:
+            conn.close()
+
+    def get_latest_assistant_run(self, conversation_id: str) -> AssistantRunRecord | None:
+        conn = self._connect()
+        try:
+            runs = self._assistant_runs(
+                conn, "rowid = (SELECT MAX(rowid) FROM assistant_runs WHERE conversation_id = ?)", (conversation_id,)
+            )
+            return runs[0] if runs else None
+        finally:
+            conn.close()
+
+    def insert_assistant_run(self, run: AssistantRunRecord, *, title: str, after: str | None, queued: bool = False) -> bool:
+        """Insert a conversation's next run only if its latest run is still `after`.
+
+        `queued` runs also consume their queue row, and are not inserted once it is gone
+        (removed, or the chat deleted).
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._open_assistant_conversation(conn, run.conversation_id, title):
+                conn.rollback()
+                return False
+            if queued and conn.execute(
+                "DELETE FROM assistant_queue WHERE id = ? AND conversation_id = ?", (run.id, run.conversation_id)
+            ).rowcount != 1:
+                conn.rollback()
+                return False
+            now = self._now_ms()
+            inserted = conn.execute(
+                "INSERT INTO assistant_runs (id, payload, payload_version, conversation_id, status, stopped, created_at, updated_at) "
+                "SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE "
+                "(SELECT id FROM assistant_runs WHERE conversation_id = ? ORDER BY rowid DESC LIMIT 1) IS ?",
+                (run.id, run.payload, run.payload_version, run.conversation_id, run.status, run.stopped, now, now,
+                 run.conversation_id, after),
+            ).rowcount == 1
+            if inserted:
+                self._write_assistant_jobs(conn, run)
+                self._touch_assistant_conversation(conn, run.conversation_id)
+                conn.commit()
+            else:
+                conn.rollback()
+            return inserted
+        finally:
+            conn.close()
+
+    def _open_assistant_conversation(self, conn: sqlite3.Connection, conversation_id: str, title: str) -> bool:
+        """Create the chat on its first message. False if the chat was deleted."""
+        now = self._now_ms()
+        conn.execute(
+            "INSERT OR IGNORE INTO assistant_conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (conversation_id, title, now, now),
+        )
+        row = conn.execute("SELECT deleted FROM assistant_conversations WHERE id = ?", (conversation_id,)).fetchone()
+        return row is not None and not row["deleted"]
+
+    def _touch_assistant_conversation(self, conn: sqlite3.Connection, conversation_id: str) -> None:
+        conn.execute("UPDATE assistant_conversations SET updated_at = ? WHERE id = ?", (self._now_ms(), conversation_id))
+
+    def _write_assistant_jobs(self, conn: sqlite3.Connection, run: AssistantRunRecord) -> None:
+        """Add the run's new jobs, delete the ones it released, and move the cards of jobs it retried to it."""
+        conn.execute(
+            "DELETE FROM assistant_jobs WHERE run_id = ? AND generation_id IN (SELECT value FROM json_each(?))",
+            (run.id, json.dumps(list(run.released))),
+        )
+        now = self._now_ms()
+        conn.executemany(
+            "INSERT OR IGNORE INTO assistant_jobs (generation_id, conversation_id, run_id, job_number, shown_in_run_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [(generation_id, run.conversation_id, run.id, int(number), run.id, now) for number, generation_id in run.jobs.items()],
+        )
+        # Only retried jobs move, and only forward: a save from an older run never takes a card
+        # back from a later one that retried the job again.
+        conn.execute(
+            "UPDATE assistant_jobs SET shown_in_run_id = ? "
+            "WHERE conversation_id = ? AND run_id != ? AND generation_id IN (SELECT value FROM json_each(?)) "
+            "AND (SELECT rowid FROM assistant_runs WHERE id = shown_in_run_id) < (SELECT rowid FROM assistant_runs WHERE id = ?)",
+            (run.id, run.conversation_id, run.id, json.dumps(list(run.shown)), run.id),
+        )
+
+    def save_assistant_run(self, run: AssistantRunRecord) -> bool:
+        """Update an existing, unstopped run and its jobs. False if it was stopped or deleted.
+
+        Only insert_assistant_run creates runs, so a late save cannot recreate a run in a deleted chat."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            saved = conn.execute(
+                "UPDATE assistant_runs SET payload = ?, payload_version = ?, status = ?, stopped = ?, updated_at = ? "
+                "WHERE id = ? AND stopped = 0",
+                (run.payload, run.payload_version, run.status, run.stopped, self._now_ms(), run.id),
+            ).rowcount == 1
+            if saved:
+                self._write_assistant_jobs(conn, run)
+                self._touch_assistant_conversation(conn, run.conversation_id)
+            conn.commit()
+            return saved
+        finally:
+            conn.close()
+
+    def stop_assistant_run(self, run_id: str, response: str) -> None:
+        """Mark an unfinished run stopped and hold its chat's queue, in one transaction.
+
+        Later saves are rejected by the stopped guard. A drain that sees the stop also sees the hold.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            stopped = conn.execute(
+                "UPDATE assistant_runs SET stopped = 1, status = 'stopped', updated_at = ?, "
+                "payload = json_set(payload, '$.stopped', json('true'), '$.response', json(?)) "
+                "WHERE id = ? AND stopped = 0 AND status IS NOT 'complete' AND json_valid(payload)",
+                (self._now_ms(), response, run_id),
+            ).rowcount == 1
+            if stopped:
+                conn.execute(
+                    "UPDATE assistant_conversations SET on_hold = 1, updated_at = ? "
+                    "WHERE id = (SELECT conversation_id FROM assistant_runs WHERE id = ?)",
+                    (self._now_ms(), run_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_assistant_runs(self, conversation_id: str) -> list[AssistantRunRecord]:
+        conn = self._connect()
+        try:
+            return self._assistant_runs(conn, "conversation_id = ?", (conversation_id,))
+        finally:
+            conn.close()
+
+    def list_assistant_job_ids(self, conversation_id: str) -> list[str]:
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT generation_id FROM assistant_jobs WHERE conversation_id = ? ORDER BY rowid", (conversation_id,)).fetchall()
+            return [str(row["generation_id"]) for row in rows]
+        finally:
+            conn.close()
+
+    def list_assistant_conversations(self) -> list[tuple[str, str, int]]:
+        """Each chat's id, first message text and last update (ms), most recently updated first."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, title, updated_at FROM assistant_conversations AS chat WHERE deleted = 0 AND ("
+                "EXISTS (SELECT 1 FROM assistant_runs WHERE conversation_id = chat.id) OR "
+                "EXISTS (SELECT 1 FROM assistant_queue WHERE conversation_id = chat.id)"
+                ") ORDER BY updated_at DESC, rowid DESC LIMIT 100"
+            ).fetchall()
+            return [(str(row["id"]), str(row["title"]), _require_int(row["updated_at"])) for row in rows]
+        finally:
+            conn.close()
+
+    def delete_assistant_conversation(self, conversation_id: str) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM assistant_runs WHERE conversation_id = ?", (conversation_id,))
+            conn.execute("DELETE FROM assistant_queue WHERE conversation_id = ?", (conversation_id,))
+            conn.execute("DELETE FROM assistant_jobs WHERE conversation_id = ?", (conversation_id,))
+            conn.execute(
+                "UPDATE assistant_conversations SET deleted = 1, on_hold = 0, title = '', updated_at = ? WHERE id = ?",
+                (self._now_ms(), conversation_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def enqueue_assistant_message(self, item_id: str, conversation_id: str, payload: str, *, payload_version: int, title: str) -> bool:
+        """Append to the chat's queue. A resent id is ignored, so client retries never duplicate.
+
+        False if the chat was deleted.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._open_assistant_conversation(conn, conversation_id, title):
+                conn.rollback()
+                return False
+            conn.execute(
+                "INSERT OR IGNORE INTO assistant_queue (id, conversation_id, payload, payload_version, position, created_at) "
+                "VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(position), 0) + 1 FROM assistant_queue WHERE conversation_id = ?), ?)",
+                (item_id, conversation_id, payload, payload_version, conversation_id, self._now_ms()),
+            )
+            self._touch_assistant_conversation(conn, conversation_id)
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def list_assistant_queue(self, conversation_id: str) -> list[AssistantQueueRecord]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, payload, payload_version FROM assistant_queue WHERE conversation_id = ? ORDER BY position", (conversation_id,)
+            ).fetchall()
+            return [
+                AssistantQueueRecord(id=str(row["id"]), payload=str(row["payload"]), payload_version=_require_int(row["payload_version"]))
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
+    def remove_assistant_queue_item(self, conversation_id: str, item_id: str) -> bool:
+        conn = self._connect()
+        try:
+            removed = conn.execute(
+                "DELETE FROM assistant_queue WHERE id = ? AND conversation_id = ?", (item_id, conversation_id)
+            ).rowcount == 1
+            conn.commit()
+            return removed
+        finally:
+            conn.close()
+
+    def set_assistant_queue_error(self, conversation_id: str, item_id: str, error: str) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE assistant_queue SET error = ? WHERE id = ? AND conversation_id = ?", (error, item_id, conversation_id)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def assistant_queue_errors(self, conversation_id: str) -> dict[str, str]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, error FROM assistant_queue WHERE conversation_id = ? AND error IS NOT NULL", (conversation_id,)
+            ).fetchall()
+            return {str(row["id"]): str(row["error"]) for row in rows}
+        finally:
+            conn.close()
+
+    def set_assistant_queue_hold(self, conversation_id: str, on_hold: bool) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE assistant_conversations SET on_hold = ? WHERE id = ? AND deleted = 0", (on_hold, conversation_id)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def assistant_queue_on_hold(self, conversation_id: str) -> bool:
+        conn = self._connect()
+        try:
+            return conn.execute(
+                "SELECT 1 FROM assistant_conversations WHERE id = ? AND on_hold = 1", (conversation_id,)
+            ).fetchone() is not None
+        finally:
+            conn.close()
+
+    def get_asset_producer_id(self, asset_id: str) -> str | None:
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT producer_generation_id FROM assets WHERE id = ?", (asset_id,)).fetchone()
+            return _optional_str(row["producer_generation_id"]) if row is not None else None
+        finally:
+            conn.close()
+
+    def hold_queued_assistant_conversations(self) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("UPDATE assistant_conversations SET on_hold = 1 WHERE id IN (SELECT conversation_id FROM assistant_queue)")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_waiting_assistant_runs(self) -> list[str]:
+        """The ids of runs waiting on their jobs."""
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT id FROM assistant_runs WHERE stopped = 0 AND status = 'waiting'").fetchall()
+            return [str(row["id"]) for row in rows]
+        finally:
+            conn.close()
 
     def _new_id(self) -> str:
         return str(uuid.uuid4())
@@ -502,14 +818,30 @@ class SqliteStore:
         spec: dict[str, JsonValue],
         *,
         contract_version: int = 1,
+        generation_id: str | None = None,
     ) -> GenerationRecord:
         if contract_version < 1:
             raise ValueError("contract_version must be >= 1")
-        generation_id = self._new_id()
+        generation_id = generation_id or self._new_id()
         now = self._now_ms()
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # A logical job keeps its identity across retries. Never reuse it for
+            # different inputs or recreate a deleted job.
+            existing = conn.execute(
+                "SELECT feature, spec, contract_version, deleted_at FROM generations WHERE id = ?", (generation_id,)
+            ).fetchone()
+            if existing is not None:
+                if (existing["deleted_at"] is not None or existing["feature"] != feature
+                        or existing["contract_version"] != contract_version
+                        or json.loads(existing["spec"]) != spec):
+                    raise ValueError("Generation request has already been used")
+                conn.commit()
+                record = self.get_generation(generation_id)
+                if record is None:
+                    raise ValueError("Generation request is no longer available")
+                return record
             queued_at = self._next_queued_at(conn, now)
             queue_rank = self._next_queue_rank(conn)
             for asset_id in collect_asset_ids(spec):
@@ -1059,7 +1391,14 @@ class SqliteStore:
         outputs: list[OutputSpec],
         *,
         attempt_count: int,
+        written_prompt: str | None = None,
     ) -> GenerationRecord:
+        """Mark the attempt succeeded and publish its outputs in one transaction.
+
+        ``written_prompt`` is a prompt the app wrote for a blank one (auto-enhance). It replaces
+        the stored prompt in the same transaction, so a run that does not finalize as succeeded
+        keeps the blank prompt and a retry starts from it.
+        """
         if not outputs:
             raise ValueError("mark_succeeded requires at least one output")
         ordinals = [spec.ordinal for spec in outputs]
@@ -1130,6 +1469,8 @@ class SqliteStore:
                 """,
                 (now, generation_id, attempt_count),
             )
+            if written_prompt is not None:
+                self._replace_prompt(conn, generation_id, written_prompt)
             record = self._commit_loaded(conn, generation_id)
         except Exception:
             try:
@@ -1142,6 +1483,22 @@ class SqliteStore:
             conn.close()
         persisted = tuple(self._persist_thumbnail(output) for output in record.outputs)
         return record.model_copy(update={"outputs": persisted})
+
+    def _replace_prompt(
+        self, conn: sqlite3.Connection, generation_id: str, prompt: str
+    ) -> None:
+        row = conn.execute(
+            "SELECT spec FROM generations WHERE id = ?", (generation_id,)
+        ).fetchone()
+        spec = _parse_json_object(str(row["spec"]))
+        params = spec.get("params")
+        if not isinstance(params, dict):
+            raise ValueError("generation spec has no params")
+        params["prompt"] = prompt
+        conn.execute(
+            "UPDATE generations SET spec = ? WHERE id = ?",
+            (json.dumps(spec), generation_id),
+        )
 
     def mark_failed(
         self,
@@ -1252,17 +1609,20 @@ class SqliteStore:
         finally:
             conn.close()
 
-    def list_generations(self, feature: str) -> list[GenerationRecord]:
+    def list_generations(self, feature: str | None = None, *, limit: int | None = None) -> list[GenerationRecord]:
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive")
         conn = self._connect()
         try:
             gen_rows = conn.execute(
                 """
                 SELECT *
                 FROM generations
-                WHERE feature = ? AND deleted_at IS NULL
+                WHERE (? IS NULL OR feature = ?) AND deleted_at IS NULL
                 ORDER BY created_at DESC, id DESC
+                LIMIT ?
                 """,
-                (feature,),
+                (feature, feature, limit if limit is not None else -1),
             ).fetchall()
             if not gen_rows:
                 return []

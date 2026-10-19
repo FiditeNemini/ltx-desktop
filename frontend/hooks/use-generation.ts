@@ -370,12 +370,13 @@ export function useGeneration(): UseGenerationReturn {
         }
 
       } catch (error) {
+        const genError = createLocalGenerationError(error instanceof Error ? error.message : 'Unknown error')
         setState(prev => ({
           ...prev,
           isGenerating: false,
           isCancelling: false,
           canCancel: false,
-          error: createLocalGenerationError(error instanceof Error ? error.message : 'Unknown error'),
+          error: genError,
         }))
       } finally {
         shouldApplyPollingUpdates = false

@@ -8,11 +8,16 @@ import { Button } from "@ds/Button/Button";
 import ArrowUpIcon from "@ds/assets/Icons/Arrow/Up/Small.svg?react";
 
 import { progressPercentByGenerationId } from "../../../components/GenerationQueue/generationQueuePanelModel";
+import {
+  createToast,
+  DEFAULT_AUTOCLOSE_MS,
+} from "../../../components/shared/Toast/toastService";
 import { useGenerationQueue } from "../../../hooks/useGenerationQueue";
 import { isInFlightGeneration, type Generation } from "../../../lib/resultsFeedModel";
 import { useExploreRuntime } from "../../../runtime/ExploreRuntime";
 import type { ResultFrameProps } from "./ResultFrame";
 import { ResultStatus } from "./ResultStatus";
+import { RESULT_NOT_FOUND_MESSAGE } from "./resultActionsCopy";
 import { isStillFocusingResult, useResultsFeedScroll } from "./useResultsFeedScroll";
 import { useScrollToResultParam } from "./useScrollToResultParam";
 import styles from "./ResultsFeed.module.scss";
@@ -61,6 +66,7 @@ function ScrollUpButton({
 export function ResultsFeed({
   generations,
   isLoading,
+  isFetching,
   loadError,
   onCancel,
   onRetry,
@@ -70,6 +76,7 @@ export function ResultsFeed({
 }: {
   generations: Generation[];
   isLoading: boolean;
+  isFetching: boolean;
   loadError: string | null;
   onCancel: (id: string) => void;
   onRetry: (id: string) => void;
@@ -78,7 +85,7 @@ export function ResultsFeed({
   EmptyStateAdapter?: EmptyStateAdapter;
 }) {
   const reduceMotion = useReducedMotion();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const resultId = searchParams.get("result");
   const [settledResultId, setSettledResultId] = useState<string | null>(null);
   const { api, generationPolling } = useExploreRuntime();
@@ -115,12 +122,36 @@ export function ResultsFeed({
     },
     [newestId, unpinFromNewest],
   );
+  // A Queue link can point at a generation this page does not list, for example one
+  // beyond the finished-results cap. Tell the user, then drop the stale param.
+  const onResultMissing = useCallback(
+    (id: string) => {
+      setSettledResultId(id);
+      createToast({
+        message: RESULT_NOT_FOUND_MESSAGE,
+        toastType: "warning",
+        closeable: true,
+        autoCloseAfter: DEFAULT_AUTOCLOSE_MS,
+      });
+      setSearchParams(
+        (current) => {
+          const next = new URLSearchParams(current);
+          next.delete("result");
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
   useScrollToResultParam(
     feedRootRef,
     generations,
     resultId,
     reduceMotion,
+    !isLoading && !isFetching && !loadError,
     onResultScrolled,
+    onResultMissing,
   );
 
   const isEmpty = generations.length === 0 && !isLoading && !loadError;

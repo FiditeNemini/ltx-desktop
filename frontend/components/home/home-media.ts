@@ -32,6 +32,12 @@ import decompressionDiscoverPosterUrl from '@/assets/home/decompression/discover
 import decompressionDiscoverPreviewUrl from '@/assets/home/decompression/discover-preview.mp4'
 import waterSimulationDiscoverPosterUrl from '@/assets/home/water-simulation/discover-poster.webp'
 import waterSimulationDiscoverPreviewUrl from '@/assets/home/water-simulation/discover-preview.mp4'
+import ingredientsDiscoverPosterUrl from '@/assets/home/ingredients/discover-poster.webp'
+import ingredientsDiscoverPreviewUrl from '@/assets/home/ingredients/discover-preview.mp4'
+import motionTrackDiscoverPosterUrl from '@/assets/home/motion-track/discover-poster.webp'
+import motionTrackDiscoverPreviewUrl from '@/assets/home/motion-track/discover-preview.mp4'
+import videoGuideDiscoverPosterUrl from '@/assets/home/video-guide/discover-poster.webp'
+import videoGuideDiscoverPreviewUrl from '@/assets/home/video-guide/discover-preview.mp4'
 import restoreDiscoverPosterUrl from '@/assets/home/restore/discover-poster.webp'
 import restoreDiscoverPreviewUrl from '@/assets/home/restore/discover-preview.mp4'
 import dayToNightDiscoverPosterUrl from '@/assets/home/day-to-night/discover-poster.webp'
@@ -149,6 +155,23 @@ export const HOME_FEATURE_MEDIA: Record<HomeFeatureId, HomeFeatureMedia> = {
   'restore': {
     previewUrl: restoreDiscoverPreviewUrl,
     posterUrl: restoreDiscoverPosterUrl,
+  },
+  'ingredients': {
+    previewUrl: ingredientsDiscoverPreviewUrl,
+    posterUrl: ingredientsDiscoverPosterUrl,
+  },
+  // Placeholder: the Restore card. Replace it with a Refine Details card.
+  'refine-details': {
+    previewUrl: restoreDiscoverPreviewUrl,
+    posterUrl: restoreDiscoverPosterUrl,
+  },
+  'motion-track': {
+    previewUrl: motionTrackDiscoverPreviewUrl,
+    posterUrl: motionTrackDiscoverPosterUrl,
+  },
+  'video-guide': {
+    previewUrl: videoGuideDiscoverPreviewUrl,
+    posterUrl: videoGuideDiscoverPosterUrl,
   },
   ...({
     'cozy-felt': {

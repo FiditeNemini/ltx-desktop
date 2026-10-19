@@ -25,13 +25,14 @@ padding step.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
 if TYPE_CHECKING:
     from ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
-    from services.prompt_enhancement.i2v_frames import KeyframeStill
+    from services.prompt_enhancement.i2v_frames import KeyframeStill, SceneFrame, VideoRole
 
 
 def _generation_kwargs(text_encoder: "LTXGemmaTextEncoder") -> dict[str, Any]:
@@ -45,6 +46,7 @@ def _generate(
     messages: list[dict[str, object]],
     image: "torch.Tensor | list[torch.Tensor] | None",
     seed: int,
+    max_new_tokens_floor: int | None = None,
 ) -> str:
     # transformers' Gemma3Processor/Gemma3ForConditionalGeneration stubs don't type these
     # dynamically-attached attributes precisely enough for strict mode; loosen locally rather
@@ -61,7 +63,10 @@ def _generate(
     fork_devices = [encoder.model.device] if encoder.model.device.type == "cuda" else []
     with torch.inference_mode(), torch.random.fork_rng(devices=fork_devices):  # type: ignore[reportUnknownMemberType]
         torch.manual_seed(seed)  # type: ignore[reportUnknownMemberType]
-        outputs = encoder.model.generate(**model_inputs, **_generation_kwargs(text_encoder))
+        kwargs = dict(_generation_kwargs(text_encoder))
+        if max_new_tokens_floor is not None:
+            kwargs["max_new_tokens"] = max(int(kwargs.get("max_new_tokens", 0)), max_new_tokens_floor)
+        outputs = encoder.model.generate(**model_inputs, **kwargs)
         generated_ids = outputs[0][len(model_inputs.input_ids[0]) :]
         return cast(str, encoder.processor.tokenizer.decode(generated_ids, skip_special_tokens=True))
 
@@ -72,6 +77,13 @@ def _default_system_prompt(text_encoder: "LTXGemmaTextEncoder", *, t2v: bool) ->
     # ``_default_system_prompt`` method, so reach into it like the other upstream-internals
     # call sites in this module.
     return cast(Any, text_encoder)._default_system_prompt(t2v=t2v)
+
+
+def _image_tensor(path: str) -> torch.Tensor:
+    from ltx_pipelines.utils.media_io import decode_image, resize_aspect_ratio_preserving
+
+    image = decode_image(image_path=path)
+    return resize_aspect_ratio_preserving(torch.tensor(image), 896).to(torch.uint8)
 
 
 class LtxPromptEnhancerPipeline:
@@ -127,13 +139,7 @@ class LtxPromptEnhancerPipeline:
         duration: int | None = None,
         fps: int | None = None,
     ) -> str:
-        from ltx_pipelines.utils.gpu_model import gpu_model
-        from ltx_pipelines.utils.media_io import decode_image, resize_aspect_ratio_preserving
         from services.prompt_enhancement import build_i2v_user_prompt_text, resolve_i2v_frames
-
-        def _tensor(path: str) -> torch.Tensor:
-            image = decode_image(image_path=path)
-            return resize_aspect_ratio_preserving(torch.tensor(image), 896).to(torch.uint8)
 
         frames = resolve_i2v_frames(image_path, last_image_path, keyframes, fps=fps)
         user_text = build_i2v_user_prompt_text(
@@ -143,20 +149,62 @@ class LtxPromptEnhancerPipeline:
             duration=duration,
             fps=fps,
         )
+        return self._generate_with_images(frames, user_text, system_prompt, seed)
+
+    def enhance_with_video_frames(
+        self,
+        prompt: str,
+        frames: Sequence[SceneFrame],
+        system_prompt: str | None,
+        seed: int,
+        role: VideoRole,
+    ) -> str:
+        from services.prompt_enhancement import build_video_user_prompt_text, resolve_video_frames
+
+        return self._generate_with_images(
+            resolve_video_frames(frames),
+            build_video_user_prompt_text(
+                prompt, role=role, has_look_reference=any(frame.is_reference for frame in frames)
+            ),
+            system_prompt,
+            seed,
+            role=role,
+        )
+
+    def _generate_with_images(
+        self,
+        frames: Sequence[tuple[str, str | None]],
+        user_text: str,
+        system_prompt: str | None,
+        seed: int,
+        role: VideoRole | None = None,
+    ) -> str:
+        from ltx_pipelines.utils.gpu_model import gpu_model
+
+        from services.prompt_enhancement import video_role_max_output_tokens, with_video_role_rules
+
         user_content: list[dict[str, object]] = []
         tensors: list[torch.Tensor] = []
         for path, label in frames:
             if label is not None:
                 user_content.append({"type": "text", "text": label})
             user_content.append({"type": "image"})
-            tensors.append(_tensor(path))
+            tensors.append(_image_tensor(path))
         user_content.append({"type": "text", "text": user_text})
 
         with gpu_model(self._build_text_encoder()) as text_encoder:
             resolved_system_prompt = system_prompt or _default_system_prompt(text_encoder, t2v=False)
+            if role is not None:
+                resolved_system_prompt = with_video_role_rules(resolved_system_prompt, role)
             messages: list[dict[str, object]] = [
                 {"role": "system", "content": resolved_system_prompt},
                 {"role": "user", "content": user_content},
             ]
             images: torch.Tensor | list[torch.Tensor] = tensors if len(tensors) > 1 else tensors[0]
-            return _generate(text_encoder, messages, image=images, seed=seed)
+            return _generate(
+                text_encoder,
+                messages,
+                image=images,
+                seed=seed,
+                max_new_tokens_floor=None if role is None else video_role_max_output_tokens(role),
+            )

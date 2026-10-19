@@ -14,6 +14,7 @@ import { Button } from "@/ds/Button/Button";
 import { useKeyboardShortcut } from "@ds/lib/useKeyboardShortcut";
 import { useThemedPortalContainer } from "@ds/styles/themes/useTheme";
 import { useRecentSidebarTools } from "@/components/home/useRecentSidebarTools";
+import { useHighResVideoToVideoEnabled } from "../../hooks/useHighResVideoToVideoEnabled.ts";
 
 import type { QuickSearchNavigateOptions } from "./quickSearchNavigation.ts";
 
@@ -51,15 +52,17 @@ export function LtxioQuickSearch({
   const stickActiveItem = useRef(false);
   const trimmedQuery = query.trim();
 
+  const highResVideoToVideo = useHighResVideoToVideoEnabled();
+
   const browseSections = useMemo(
-    () => buildQuickSearchBrowseSections(recentFeatureIds),
-    [recentFeatureIds],
+    () => buildQuickSearchBrowseSections(recentFeatureIds, highResVideoToVideo),
+    [recentFeatureIds, highResVideoToVideo],
   );
 
   const rows = useMemo(() => {
-    if (trimmedQuery) return searchQuickSearchRows(trimmedQuery);
+    if (trimmedQuery) return searchQuickSearchRows(trimmedQuery, highResVideoToVideo);
     return browseSectionsToRows(browseSections);
-  }, [browseSections, trimmedQuery]);
+  }, [browseSections, trimmedQuery, highResVideoToVideo]);
 
   const filters = useMemo(
     () =>

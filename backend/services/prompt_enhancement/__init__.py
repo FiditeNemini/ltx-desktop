@@ -1,4 +1,10 @@
-from services.prompt_enhancement.i2v_frames import KeyframeStill, resolve_i2v_frames
+from services.prompt_enhancement.i2v_frames import (
+    KeyframeStill,
+    SceneFrame,
+    VideoRole,
+    resolve_i2v_frames,
+    resolve_video_frames,
+)
 from services.prompt_enhancement.system_prompt import (
     build_audio_visual_caption_system_prompt,
     build_conditioning_system_prompt,
@@ -10,11 +16,14 @@ from services.prompt_enhancement.system_prompt import (
     build_keyframe_enhancement_system_prompt,
     build_lora_enhancement_system_prompt,
     build_template_fill_system_prompt,
+    build_video_user_prompt_text,
     enforce_trigger_placement,
     enforce_trigger_placements,
     fill_prompt_template,
     parse_template_fill_response,
     render_catalog_item_block,
+    video_role_max_output_tokens,
+    with_video_role_rules,
 )
 
 __all__ = [
@@ -28,11 +37,17 @@ __all__ = [
     "build_keyframe_enhancement_system_prompt",
     "build_lora_enhancement_system_prompt",
     "build_template_fill_system_prompt",
+    "build_video_user_prompt_text",
     "enforce_trigger_placement",
     "enforce_trigger_placements",
     "fill_prompt_template",
     "parse_template_fill_response",
     "render_catalog_item_block",
+    "video_role_max_output_tokens",
+    "with_video_role_rules",
     "KeyframeStill",
+    "SceneFrame",
+    "VideoRole",
     "resolve_i2v_frames",
+    "resolve_video_frames",
 ]

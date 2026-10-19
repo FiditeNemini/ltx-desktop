@@ -1,7 +1,11 @@
 import { create } from "zustand";
 
 import type { HomeFeatureId } from "@/lib/home-features";
-import type { IcLoraRecipeId } from "@/lib/ic-lora-recipes";
+import type {
+  IcLoraSheetRecipeId,
+  IcLoraTrackRecipeId,
+  IcLoraVideoRecipeId,
+} from "@/lib/ic-lora-recipes";
 import type { LoraRecipeId } from "@/lib/lora-recipes";
 import type { PromptHistoryState } from "@/lib/prompt-provenance";
 
@@ -9,6 +13,8 @@ import type { AudioToVideoSchema } from "../screens/Feature/definitions/audioToV
 import type { ImageToVideoSchema } from "../screens/Feature/definitions/imageToVideo";
 import type { LoraRecipeSchema } from "../screens/Feature/definitions/loraRecipe";
 import type { IcLoraRecipeSchema } from "../screens/Feature/definitions/icLoraRecipe";
+import type { IcLoraSheetSchema } from "../screens/Feature/definitions/icLoraSheet";
+import type { IcLoraTrackSchema } from "../screens/Feature/definitions/icLoraTrack";
 import type { ExtendSchema } from "../screens/Feature/definitions/extend";
 import type { RetakeSchema } from "../screens/Feature/definitions/retake";
 import type { TextToVideoSchema } from "../screens/Feature/definitions/textToVideo";
@@ -28,9 +34,13 @@ export type FeatureSchemaMap = {
             ? RetakeSchema
             : K extends "extend"
               ? ExtendSchema
-              : K extends IcLoraRecipeId
+              : K extends IcLoraVideoRecipeId
                 ? IcLoraRecipeSchema
-                : never;
+                : K extends IcLoraSheetRecipeId
+                  ? IcLoraSheetSchema
+                  : K extends IcLoraTrackRecipeId
+                    ? IcLoraTrackSchema
+                    : never;
 };
 
 type FeatureFormStore = {

@@ -23,6 +23,7 @@ describe("HOME_SHELL_ENTRIES", () => {
     const ids = HOME_SHELL_ENTRIES.map((entry) => entry.id);
     assert.deepEqual(ids, [
       "home",
+      "assistant",
       "assets",
       "dashboard",
       "remote",
@@ -38,13 +39,14 @@ describe("HOME_SHELL_ENTRIES", () => {
   it("lists Home-layout pages, including Activity Dashboard on desktop and remote", () => {
     assert.deepEqual(homeLayoutPageIds("desktop"), [
       "home",
+      "assistant",
       "assets",
       "dashboard",
       "remote",
       "projects",
       "settings",
     ]);
-    assert.deepEqual(homeLayoutPageIds("remote"), ["home", "assets", "dashboard"]);
+    assert.deepEqual(homeLayoutPageIds("remote"), ["home", "assistant", "assets", "dashboard"]);
   });
 
   it("keeps Projects under the Home sidebar, with no separate app shell", () => {
@@ -126,7 +128,15 @@ describe("home shell nav visibility", () => {
     const visible = HOME_SHELL_ENTRIES.filter((entry) =>
       isHomeShellNavVisible(entry, "desktop", false),
     ).map((entry) => entry.id);
-    assert.deepEqual(visible, ["home", "assets", "dashboard", "projects", "settings", "support"]);
+    assert.deepEqual(visible, [
+      "home",
+      "assistant",
+      "assets",
+      "dashboard",
+      "projects",
+      "settings",
+      "support",
+    ]);
     assert.equal(areHomeFeaturesInNav("desktop", false), false);
   });
 
@@ -138,11 +148,11 @@ describe("home shell nav visibility", () => {
     );
   });
 
-  it("shows Home, features, and Assets on Remote, never Projects or Remote pairing", () => {
+  it("shows Home, Assistant, features, and Assets on Remote, never Projects or Remote pairing", () => {
     const visible = HOME_SHELL_ENTRIES.filter((entry) =>
       isHomeShellNavVisible(entry, "remote", true),
     ).map((entry) => entry.id);
-    assert.deepEqual(visible, ["home", "assets", "dashboard"]);
+    assert.deepEqual(visible, ["home", "assistant", "assets", "dashboard"]);
     assert.equal(areHomeFeaturesInNav("remote", true), true);
   });
 });

@@ -1,9 +1,16 @@
 import { useEffect, useMemo, type ComponentType } from "react";
 import type { UseMutationResult, UseQueryResult } from "@tanstack/react-query";
 
-import type { IcLoraRecipeId } from "@/lib/ic-lora-recipes";
+import {
+  selectFreshPreflight,
+  selectTrimMaxSeconds,
+} from "../../lib/editPreflight";
+import type { IcLoraVideoRecipeId } from "@/lib/ic-lora-recipes";
 
 import { useAsset } from "../../hooks/useAsset";
+import { useFeatureFlags } from "../../hooks/useFeatureFlags";
+import { useExploreRuntime } from "../../runtime/ExploreRuntime";
+import { useEditPreflight } from "../../hooks/useEditPreflight";
 import { useGenerations } from "../../hooks/useGenerations";
 import { useVideoGenerationModelSpecs } from "../../hooks/useVideoGenerationModelSpecs";
 import type { Generation } from "../../lib/resultsFeedModel";
@@ -12,7 +19,10 @@ import {
   useFeatureFormStore,
 } from "../../stores/featureFormStore";
 import type { AssetRef, FeatureDefinition, FeatureValues } from "./types";
-import type { VideoInputContext } from "./definitions/videoFeature";
+import {
+  editResolutionPreflightCandidates,
+  type VideoInputContext,
+} from "./definitions/videoFeature";
 import { assetDurationSeconds } from "./fields/prepareDurationLimitedMediaImport.ts";
 import { FeatureFormScreen } from "./FeatureFormScreen";
 import type {
@@ -21,9 +31,16 @@ import type {
 } from "./FeatureFormView";
 import { ResultFrame } from "./results/ResultFrame";
 
-type VideoFeatureId = "retake" | "extend" | IcLoraRecipeId;
+type VideoFeatureId = "retake" | "extend" | IcLoraVideoRecipeId;
 
 type VideoToVideoSchema = FeatureSchemaMap[VideoFeatureId];
+
+/** Selection slice the preflight matrix needs. Durations include the minimum. */
+export type VideoPreflightSelection = {
+  startTime: number;
+  mode: "start" | "end";
+  durations: number[];
+};
 
 type SeedPlanInput = {
   hasStoredValues: boolean;
@@ -59,6 +76,7 @@ export function useVideoToVideoFeature<
   writeAppliedRevision,
   seedValues,
   videoRange,
+  selectPreflightInput,
 }: {
   featureId: VideoFeatureId;
   definition: FeatureDefinition<TSchema, TRequest, VideoInputContext, VideoFeatureId>;
@@ -71,8 +89,18 @@ export function useVideoToVideoFeature<
   writeAppliedRevision: () => void;
   seedValues: (context: VideoInputContext) => FeatureValues<TSchema>;
   videoRange?: VideoAssetRangeBinding<TSchema>;
+  // Edit-only: retake/extend pass a selector so the hook fetches advisory
+  // verdicts; IC-LoRA recipe screens omit it and preflight stays null.
+  selectPreflightInput?: (
+    values: FeatureValues<TSchema> | undefined,
+  ) => VideoPreflightSelection;
 }) {
   const specsQuery = useVideoGenerationModelSpecs();
+  const { api } = useExploreRuntime();
+  const flagsQuery = useFeatureFlags(api);
+  // Only retake and extend read this flag. IC-LoRA recipes ignore it.
+  const editsFeature = featureId === "retake" || featureId === "extend";
+  const highResVideoToVideo = editsFeature && flagsQuery.data?.highResVideoToVideo === true;
   const hasStoredValues = useFeatureFormStore((state) =>
     state.hasValues(featureId),
   );
@@ -155,6 +183,32 @@ export function useVideoToVideoFeature<
     writeAppliedRevision,
   ]);
 
+  const storedValues = useFeatureFormStore((state) =>
+    state.getValues(featureId),
+  );
+  const preflightSelection = selectPreflightInput?.(
+    storedValues as FeatureValues<TSchema> | undefined,
+  );
+  const preflightCandidates = useMemo(
+    () =>
+      videoWidth == null || videoHeight == null
+        ? []
+        : editResolutionPreflightCandidates(videoWidth, videoHeight, highResVideoToVideo),
+    [videoWidth, videoHeight, highResVideoToVideo],
+  );
+  const preflightResult = useEditPreflight({
+    // Without a selector the request stays disabled (assetId null, no
+    // durations), so the fallback feature value below never fires.
+    feature:
+      featureId === "retake" || featureId === "extend" ? featureId : "retake",
+    assetId: preflightSelection == null ? null : videoAssetId,
+    startTime: preflightSelection?.startTime ?? 0,
+    mode: preflightSelection?.mode ?? "end",
+    candidates: preflightCandidates,
+    durations: preflightSelection?.durations ?? [],
+  });
+  const preflight = selectFreshPreflight(preflightResult, videoAssetId);
+
   const context = useMemo<VideoInputContext>(
     () => ({
       specs: specsQuery.data,
@@ -163,9 +217,12 @@ export function useVideoToVideoFeature<
       videoDurationPending,
       videoWidth,
       videoHeight,
+      preflight,
       videoFps,
+      highResVideoToVideo,
     }),
     [
+      highResVideoToVideo,
       seedQuery.data,
       specsQuery.data,
       videoDuration,
@@ -173,16 +230,33 @@ export function useVideoToVideoFeature<
       videoFps,
       videoHeight,
       videoWidth,
+      preflight,
     ],
   );
 
+  // The form normalizes a stored resolution against the offered cells. It must not do that
+  // before the flag is known, or a saved 2160p source would fall back on every start.
+  const storedResolution = storedValues?.resolution ?? null;
+  const effectiveVideoRange = useMemo(() => {
+    if (videoRange == null || storedResolution == null) return videoRange;
+    const max = selectTrimMaxSeconds(
+      preflight,
+      storedResolution,
+      videoRange.minDuration,
+    );
+    if (max == null) return videoRange;
+    return { ...videoRange, maxDurationSeconds: max };
+  }, [videoRange, storedResolution, preflight]);
+
   const contextReady =
     specsQuery.isSuccess &&
+    (!editsFeature || flagsQuery.isSuccess) &&
     (seedPlan === "skip" ||
       (seedPlan === "wait" && (hasStoredValues || seedQuery.isSuccess)) ||
       (seedPlan === "ingest" && seedQuery.isSuccess));
   const resourceError =
     specsQuery.error ??
+    (editsFeature ? flagsQuery.error : null) ??
     (seedPlan === "ingest" ? seedQuery.error : null) ??
     (hasStoredValues ? null : generationsQuery.error);
 
@@ -198,11 +272,12 @@ export function useVideoToVideoFeature<
     >,
     context,
     contextReady,
+    generateEnabled: specsQuery.budgetModeReady,
     resourceError,
     createGeneration,
     EmptyStateAdapter,
     presentation: presentation as unknown as FeatureFormPresentationAdapter<VideoToVideoSchema>,
-    videoRange: videoRange as unknown as
+    videoRange: effectiveVideoRange as unknown as
       | VideoAssetRangeBinding<VideoToVideoSchema>
       | undefined,
   };

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import type { VideoGenerationModelSpecsResponse } from "../../../../lib/video-generation-model-specs.ts";
+import type { EditPreflightState } from "../../../lib/editPreflight.ts";
 import { resolveFeatureSeedValues } from "../types.ts";
 import { specFixture, specFixtureBothOfferings } from "./specFixture.ts";
 import {
@@ -21,6 +22,10 @@ import {
   type RetakeContext,
   type RetakeValues,
 } from "./retake.ts";
+import {
+  editResolutionFieldOptions,
+  editResolutionPreflightCandidates,
+} from "./videoFeature.ts";
 
 const videoAsset = { assetId: "video-1" };
 
@@ -233,6 +238,29 @@ describe("retake definition", () => {
     assert.equal(issues[0]?.alwaysRevealed, true);
   });
 
+  it("flags a selection whose wire end exceeds the video", () => {
+    const issues = validateRetake(
+      values({ startTime: 3.5, duration: 5.1 }),
+      context({ videoDurationSeconds: 8.4 }),
+    );
+    assert.ok(
+      issues.some((issue) => issue.id === "retake-selection-out-of-range"),
+      "wire start 3.5 + duration 5.1 ends at 8.6, past the 8.5 backend limit",
+    );
+  });
+
+  it("allows a tail selection the 0.5s wire grid would push past the end", () => {
+    // 6.3s on an 8.3s clip wired as 6.5s + 2.0s = 8.5s > 8.4s and refused;
+    // the 0.1s wire grid keeps it at 8.3s.
+    const issues = validateRetake(
+      values({ startTime: 6.3, duration: 2.0 }),
+      context({ videoDurationSeconds: 8.3 }),
+    );
+    assert.ok(
+      issues.every((issue) => issue.id !== "retake-selection-out-of-range"),
+    );
+  });
+
   it("is unavailable when no downloaded offering advertises retake", () => {
     assert.equal(
       retakeDefinition.isUnavailable?.(values(), context({ specs: specFixture() })),
@@ -300,6 +328,14 @@ describe("retake definition", () => {
     assert.equal(body.params.duration, 4.7);
   });
 
+  it("sends startTime on the 0.1s grid so tail trims are not refused", () => {
+    // 1.3s on the old 0.5s wire grid became 1.5s; at the tail that +0.2s
+    // pushed the wire end past the video. Only the preflight request
+    // rounds to 0.5s now.
+    const body = toCreateBody(values({ startTime: 1.3, duration: 3 }));
+    assert.equal(body.params.startTime, 1.3);
+  });
+
   it("restores a generation spec without inventing filesystem paths", () => {
     const restored = fromGeneration(
       {
@@ -363,8 +399,9 @@ describe("retake definition", () => {
       videoWidth: number,
       videoHeight: number,
       lowPerformanceMachine: boolean,
+      highResVideoToVideo = false,
     ) => {
-      const base = context({ videoWidth, videoHeight });
+      const base = context({ videoWidth, videoHeight, highResVideoToVideo });
       const form = retakeDefinition.form(values(), {
         ...base,
         specs: base.specs && {
@@ -379,12 +416,20 @@ describe("retake definition", () => {
     };
     assert.deepEqual(warned(1920, 1080, true), ["720p", "original"]);
     assert.deepEqual(warned(3840, 2160, true), ["720p", "original"]);
+    assert.deepEqual(warned(3840, 2160, true, true), ["720p", "1080p", "1440p", "original"]);
     assert.deepEqual(warned(1280, 720, true), ["original"]);
     assert.deepEqual(warned(1920, 1080, false), []);
   });
 
-  function resolutionLabels(videoWidth: number, videoHeight: number): string[] {
-    const form = retakeDefinition.form(values(), context({ videoWidth, videoHeight }));
+  function resolutionLabels(
+    videoWidth: number,
+    videoHeight: number,
+    highResVideoToVideo = false,
+  ): string[] {
+    const form = retakeDefinition.form(
+      values(),
+      context({ videoWidth, videoHeight, highResVideoToVideo }),
+    );
     const resolution = form.fields.find((field) => field.id === "resolution");
     assert.equal(resolution?.kind, "options");
     if (resolution?.kind !== "options") return [];
@@ -401,6 +446,32 @@ describe("retake definition", () => {
     ]);
     // The local cap is 1080p, so a 4K clip tags 1080p as Original.
     assert.deepEqual(resolutionLabels(3840, 2160), [
+      "270p",
+      "360p",
+      "540p",
+      "720p",
+      "1080p (Original)",
+    ]);
+    // With the highResVideoToVideo flag the cap is 4K, and 1440p is a lower tier.
+    assert.deepEqual(resolutionLabels(3840, 2160, true), [
+      "270p",
+      "360p",
+      "540p",
+      "720p",
+      "1080p",
+      "1440p",
+      "4K (Original)",
+    ]);
+    // With the flag a 1440p clip keeps its size. Without it the clip tags 1080p as Original.
+    assert.deepEqual(resolutionLabels(2560, 1440, true), [
+      "270p",
+      "360p",
+      "540p",
+      "720p",
+      "1080p",
+      "1440p (Original)",
+    ]);
+    assert.deepEqual(resolutionLabels(2560, 1440), [
       "270p",
       "360p",
       "540p",
@@ -448,5 +519,139 @@ describe("retake definition", () => {
       videoHeight: 1080,
     }));
     assert.equal(original.params.resolution, undefined);
+  });
+});
+
+describe("retake preflight", () => {
+  const dims = { videoWidth: 1920, videoHeight: 1080 };
+  const source = {
+    width: 1920,
+    height: 1080,
+    fps: 24,
+    frames: 481,
+    durationSeconds: 20,
+  };
+
+  function preflight(
+    cells: EditPreflightState["response"]["cells"],
+  ): EditPreflightState {
+    return {
+      assetId: "video-1",
+      response: { source, resolutions: [], cells },
+    };
+  }
+
+  function cell(
+    key: string,
+    duration: number,
+    ok: boolean,
+    message?: string,
+  ): EditPreflightState["response"]["cells"][number] {
+    return {
+      key,
+      duration,
+      ok,
+      message: message ?? null,
+      code: ok ? null : "VIDEO_JOB_TOO_LARGE",
+    };
+  }
+
+  it("blocks a selection whose cell fails and allows a missing cell", () => {
+    const selected = values({
+      startTime: 0,
+      duration: 8,
+      resolution: "original",
+    });
+    const failing = context({
+      ...dims,
+      preflight: preflight([
+        cell("original", 2, true),
+        cell(
+          "original",
+          8,
+          false,
+          "Retake selection of 8s is too long for 1920x1056 on this machine (at most 6s).",
+        ),
+      ]),
+    });
+    const issues = validateRetake(selected, failing);
+    assert.deepEqual(
+      issues.map((issue) => issue.id),
+      ["retake-selection-too-long"],
+    );
+    assert.equal(
+      issues[0]?.message,
+      "Retake selection of 8s is too long for 1920x1056 on this machine (at most 6s).",
+    );
+    assert.equal(issues[0]?.alwaysRevealed, true);
+    assert.equal(retakeDefinition.isReady?.(selected, failing), false);
+
+    const missing = context({
+      ...dims,
+      preflight: preflight([cell("original", 2, true)]),
+    });
+    assert.deepEqual(validateRetake(selected, missing), []);
+    assert.equal(retakeDefinition.isReady?.(selected, missing), true);
+  });
+
+  it("looks up the preflight cell for the wire duration, not the 0.5 grid", () => {
+    const selected = values({
+      startTime: 0,
+      duration: 3.2,
+      resolution: "original",
+    });
+    const ctx = context({
+      ...dims,
+      preflight: preflight([
+        cell("original", 2, true),
+        cell("original", 3.0, true),
+        cell("original", 3.2, false, "Retake selection of 3.2s is too long."),
+      ]),
+    });
+    const issues = validateRetake(selected, ctx);
+    assert.deepEqual(
+      issues.map((issue) => issue.id),
+      ["retake-selection-too-long"],
+    );
+  });
+
+  it("asks preflight about exactly the offered tiers, with no size for Original", () => {
+    const candidates = editResolutionPreflightCandidates(1920, 1080);
+    const offered = editResolutionFieldOptions(1920, 1080).map((option) => option.value);
+    assert.deepEqual(
+      candidates.map((candidate) => candidate.key),
+      offered,
+    );
+    const original = candidates.find((candidate) => candidate.key === "original");
+    assert.deepEqual(original, { key: "original", width: null, height: null });
+    const p540 = candidates.find((candidate) => candidate.key === "540p");
+    assert.deepEqual(p540, { key: "540p", width: 960, height: 540 });
+  });
+
+  it("reveals a failing single tier as a disabled resolution", () => {
+    const small = { videoWidth: 480, videoHeight: 270 };
+    const form = retakeDefinition.form(
+      values({ resolution: "original" }),
+      context({
+        ...small,
+        preflight: preflight([
+          cell("original", 2, false, "Original is too large for this machine."),
+        ]),
+      }),
+    );
+    const resolution = form.fields.find((field) => field.id === "resolution");
+    assert.equal(resolution?.kind, "options");
+    if (resolution?.kind !== "options") return;
+    assert.equal(resolution.options.length, 1);
+    assert.equal(
+      resolution.options[0]?.disabledReason,
+      "Original is too large for this machine.",
+    );
+
+    const hidden = retakeDefinition.form(values(), context(small));
+    assert.equal(
+      hidden.fields.some((field) => field.id === "resolution"),
+      false,
+    );
   });
 });

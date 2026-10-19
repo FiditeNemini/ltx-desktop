@@ -36,6 +36,7 @@ import {
   resolveVideoGenerationOptions,
   sanitizeVideoGenerationSettings,
 } from '../../lib/video-generation-model-specs'
+import { localUnavailableMessage } from '../../lib/local-generation-availability'
 import {
   PRIMARY_TOOLS, TRIM_TOOLS,
   CUT_POINT_TOLERANCE, DEFAULT_DISSOLVE_DURATION,
@@ -477,6 +478,7 @@ export function VideoEditorTimelineEditingPanel(props: VideoEditorTimelineEditin
         modelSpecs: gapVideoModelSpecs,
         minimumDuration: gapDuration,
         durationSelection: 'smallest_valid',
+        budgetMode: 'reckless',
       })
   const gapCanGenerateVideo = Boolean(
     gapResolvedVideoOptions
@@ -484,13 +486,18 @@ export function VideoEditorTimelineEditingPanel(props: VideoEditorTimelineEditin
     && !isLoadingVideoGenerationModelSpecs
     && !videoGenerationModelSpecsErrorMessage
   )
+  // Local-mode only: an empty cloud grid is not a hardware problem.
+  const gapLocalUnavailable = shouldVideoGenerateWithLtxApi
+    ? null
+    : localUnavailableMessage(videoGenerationModelSpecsResponse, window.electronAPI.platform, 'reckless')
   const gapVideoSettingsMessage = isLoadingVideoGenerationModelSpecs
     ? 'Loading generation settings...'
     : videoGenerationModelSpecsErrorMessage
       ? `Could not load generation settings: ${videoGenerationModelSpecsErrorMessage}`
-      : gapGenerateMode !== 'text-to-image' && selectedGap && !gapCanGenerateVideo
-        ? 'This gap is too long to fill with a single video generation.'
-        : null
+      : (gapLocalUnavailable
+        ?? (gapGenerateMode !== 'text-to-image' && selectedGap && !gapCanGenerateVideo
+          ? 'This gap is too long to fill with a single video generation.'
+          : null))
 
   const selectedGapRef = useRef<GapSelection>(selectedGap)
   selectedGapRef.current = selectedGap

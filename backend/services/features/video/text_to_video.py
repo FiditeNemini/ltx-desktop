@@ -21,9 +21,11 @@ from runtime_config.offerings import OFFERING_IDS, local_pipeline_for_offering
 from services.features.video.job_common import (
     model_from_spec,
     resolve_job_local_model_id,
+    spec_risk_allowance,
+    spec_unmeasured_bet,
 )
 from services.generation_interrupt import GenerationCancelledError, is_cancel_exception
-from services.generation_queue.types import OutputAllocation, OutputPlan
+from services.generation_queue.types import ExecutionOutcome, OutputAllocation, OutputPlan
 from services.records import CapabilityFailedError, GenerationRecord
 
 FEATURE = "text-to-video"
@@ -55,6 +57,8 @@ class ReservedVideoGenerator(Protocol):
         a2v_num_frames: int | None = None,
         a2v_audio_duration_seconds: float | None = None,
         local_model_id: LTXLocalModelId,
+        risk_allowance: bool | None = None,
+        unmeasured_bet: bool = False,
     ) -> GenerateVideoResponse: ...
 
 
@@ -98,7 +102,7 @@ class TextToVideoExecutor:
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome:
         params = self._params(generation)
         output = require_video_output(outputs)
         try:
@@ -114,6 +118,8 @@ class TextToVideoExecutor:
                 output_path=Path(output.dest_path),
                 prompt_wrap=self._prompt_wrap,
                 local_model_id=local_model_id,
+                risk_allowance=spec_risk_allowance(generation.spec),
+                unmeasured_bet=spec_unmeasured_bet(generation.spec),
             )
         except Exception as exc:
             if is_cancel_exception(exc):
@@ -123,6 +129,7 @@ class TextToVideoExecutor:
             raise
         if isinstance(result, GenerateVideoCancelledResponse):
             raise GenerationCancelledError()
+        return ExecutionOutcome(load_mode=result.load_mode, offload_mode=result.offload_mode)
 
     def _params(self, generation: GenerationRecord) -> TextToVideoParams:
         require_supported_contract_version(generation.contract_version)

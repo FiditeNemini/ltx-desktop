@@ -371,6 +371,52 @@ function makeEndpointClient<
 export function createApiClient(fetchImpl: BackendFetch) {
   return {
     getHealth: makeEndpointClient(fetchImpl, '/health', 'get'),
+    assistantTurn: makeEndpointClient(fetchImpl, '/api/assistant/turn', 'post'),
+    listAssistantConversations: makeEndpointClient(fetchImpl, '/api/assistant/conversations', 'get'),
+    getAssistantConversation(id: string): Promise<EndpointResult<'/api/assistant/conversations/{conversation_id}', 'get'>> {
+      return requestEndpointResult(fetchImpl, '/api/assistant/conversations/{conversation_id}', 'get', [] as const,
+        undefined, `/api/assistant/conversations/${encodeURIComponent(id)}`)
+    },
+    deleteAssistantConversation(id: string): Promise<EndpointResult<'/api/assistant/conversations/{conversation_id}', 'delete'>> {
+      return requestEndpointResult(fetchImpl, '/api/assistant/conversations/{conversation_id}', 'delete', [] as const,
+        undefined, `/api/assistant/conversations/${encodeURIComponent(id)}`)
+    },
+    enqueueAssistantMessage(
+      conversationId: string,
+      body: JsonBodyFor<'/api/assistant/conversations/{conversation_id}/queue', 'post'>,
+    ): Promise<EndpointResult<'/api/assistant/conversations/{conversation_id}/queue', 'post'>> {
+      return makeEndpointClient(fetchImpl, '/api/assistant/conversations/{conversation_id}/queue', 'post')(
+        body, undefined, `/api/assistant/conversations/${encodeURIComponent(conversationId)}/queue`)
+    },
+    removeQueuedAssistantMessage(
+      conversationId: string,
+      itemId: string,
+    ): Promise<EndpointResult<'/api/assistant/conversations/{conversation_id}/queue/{item_id}', 'delete'>> {
+      return requestEndpointResult(fetchImpl, '/api/assistant/conversations/{conversation_id}/queue/{item_id}', 'delete', [] as const,
+        undefined, `/api/assistant/conversations/${encodeURIComponent(conversationId)}/queue/${encodeURIComponent(itemId)}`)
+    },
+    releaseAssistantQueue(
+      conversationId: string,
+    ): Promise<EndpointResult<'/api/assistant/conversations/{conversation_id}/queue/release', 'post'>> {
+      return requestEndpointResult(fetchImpl, '/api/assistant/conversations/{conversation_id}/queue/release', 'post', [] as const,
+        undefined, `/api/assistant/conversations/${encodeURIComponent(conversationId)}/queue/release`)
+    },
+    getAssistantSelection: makeEndpointClient(fetchImpl, '/api/assistant/selection', 'get'),
+    setAssistantSelection: makeEndpointClient(fetchImpl, '/api/assistant/selection', 'put'),
+    listAssistantModels: makeEndpointClient(fetchImpl, '/api/assistant/models', 'get'),
+    downloadAssistantModel: makeEndpointClient(fetchImpl, '/api/assistant/models/download', 'post'),
+    deleteAssistantModel: makeEndpointClient(fetchImpl, '/api/assistant/models/delete', 'post'),
+    continueAssistant(runId: string): Promise<EndpointResult<'/api/assistant/runs/{run_id}/continue', 'post'>> {
+      return requestEndpointResult(fetchImpl, '/api/assistant/runs/{run_id}/continue', 'post', [] as const,
+        undefined, `/api/assistant/runs/${encodeURIComponent(runId)}/continue`)
+    },
+    stopAssistant(runId: string): Promise<EndpointResult<'/api/assistant/runs/{run_id}/stop', 'post'>> {
+      return requestEndpointResult(fetchImpl, '/api/assistant/runs/{run_id}/stop', 'post', [] as const,
+        undefined, `/api/assistant/runs/${encodeURIComponent(runId)}/stop`)
+    },
+    streamAssistantEvents(runId: string, init?: RequestInit): Promise<Response> {
+      return fetchImpl(`/api/assistant/runs/${encodeURIComponent(runId)}/events`, init)
+    },
 
     getModelDownloadProgress(
       query: QueryFor<'/api/models/download/progress', 'get'>,
@@ -491,6 +537,8 @@ export function createApiClient(fetchImpl: BackendFetch) {
     generateIcLora: makeEndpointClient(fetchImpl, '/api/ic-lora/generate', 'post'),
 
     extractIcLoraConditioning: makeEndpointClient(fetchImpl, '/api/ic-lora/extract-conditioning', 'post'),
+
+    preflightIcLora: makeEndpointClient(fetchImpl, '/api/ic-lora/preflight', 'post'),
 
     listIcLoras(
       query?: QueryFor<'/api/ic-loras', 'get'>,
@@ -697,6 +745,11 @@ export function createApiClient(fetchImpl: BackendFetch) {
 
     createTextToVideo: makeEndpointClient(fetchImpl, '/api/generations/text-to-video', 'post'),
 
+    getGeneration(generationId: string): Promise<EndpointResult<'/api/generations/{generation_id}', 'get'>> {
+      return requestEndpointResult(fetchImpl, '/api/generations/{generation_id}', 'get', [] as const,
+        undefined, `/api/generations/${encodeURIComponent(generationId)}`)
+    },
+
     createImageToVideo: makeEndpointClient(fetchImpl, '/api/generations/image-to-video', 'post'),
 
     createLoraRecipe(
@@ -728,6 +781,7 @@ export function createApiClient(fetchImpl: BackendFetch) {
       )
     },
     createExtend: makeEndpointClient(fetchImpl, '/api/generations/extend', 'post'),
+    preflightEdit: makeEndpointClient(fetchImpl, '/api/generations/edit/preflight', 'post'),
 
     deleteGeneration(
       generationId: string,

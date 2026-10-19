@@ -13,12 +13,14 @@ from fastapi import APIRouter, Depends, Path, Query
 from _routes._errors import HTTPError
 from api_types import (
     CreateAudioToVideoRequest,
-    CreateIcLoraRecipeRequest,
+    IcLoraRecipeCreate,
     CreateExtendRequest,
     CreateImageToVideoRequest,
     CreateLoraRecipeRequest,
     CreateRetakeRequest,
     CreateTextToVideoRequest,
+    EditPreflightRequest,
+    EditPreflightResponse,
     Generation,
     QueueSnapshot,
     ReorderGenerationQueueRequest,
@@ -258,12 +260,24 @@ def route_create_extend(
 
 
 @router.post(
+    "/generations/edit/preflight",
+    response_model=EditPreflightResponse,
+    tags=["generations"],
+)
+def route_preflight_edit(
+    req: EditPreflightRequest, handler: AppHandler = Depends(get_state_service)
+) -> EditPreflightResponse:
+    # Path-free DTO (dims + verdicts only): no remote projection needed.
+    return handler.queued_generations.preflight_edit(req)
+
+
+@router.post(
     "/generations/ic-lora-recipes/{recipe_id}",
     response_model=RemoteGeneration,
     tags=["generations"],
 )
 def route_create_ic_lora_recipe(
-    req: CreateIcLoraRecipeRequest,
+    req: IcLoraRecipeCreate,
     recipe_id: str = Path(pattern=r"^[a-z0-9-]+$", max_length=64),
     handler: AppHandler = Depends(get_state_service),
     remote: RemoteContext = Depends(get_remote_context),

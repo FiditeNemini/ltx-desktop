@@ -9,7 +9,7 @@ export type AssetPickerDrop =
  * A drag onto the picker is either an in-app asset (`asset` JSON from
  * GenSpace / the editor) or a file from outside the app. An asset whose
  * kind we can read is used only when it matches; anything else is ignored
- * so a photo drop does not replace a video source.
+ * so a photo drop does not replace a video source. A `null` kind takes any.
  */
 export function resolveAssetPickerDrop({
   assetPayload,
@@ -19,12 +19,12 @@ export function resolveAssetPickerDrop({
 }: {
   assetPayload: string;
   file: File | null;
-  mediaKind: AssetsMediaKind;
+  mediaKind: AssetsMediaKind | null;
   isEligibleFile: (file: File) => boolean;
 }): AssetPickerDrop {
   const dropped = parseDroppedAsset(assetPayload);
   if (dropped != null) {
-    return dropped.mediaKind === mediaKind
+    return mediaKind === null || dropped.mediaKind === mediaKind
       ? { kind: "asset", id: dropped.id }
       : { kind: "ignore" };
   }

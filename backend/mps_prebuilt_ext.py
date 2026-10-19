@@ -17,6 +17,11 @@ bundled. Here we intercept ``cpp_extension.load(name="mps_sdpa_zc_ext", ...)`` a
 rebuilding it. The .so resolves its libtorch symbols from the already-loaded torch
 in-process, so it's location-independent and needs no toolchain. Import this at
 backend startup, BEFORE mps-sdpa is first imported.
+
+macOS version: the bundled .so carries the build machine's macOS as its minimum
+(26.0 on CI), so it cannot load on an older macOS and this module falls back to
+the JIT build. Local generation is gated to macOS 26+ for that reason
+(``DARWIN_MIN_MACOS_MAJOR`` in runtime_config/runtime_policy.py).
 """
 
 from __future__ import annotations

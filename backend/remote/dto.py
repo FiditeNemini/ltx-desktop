@@ -7,16 +7,18 @@ arbitrary stored spec JSON.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import cast, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_serializer
 
 from api_types import (
     Asset,
     AssetCore,
     ExtendMode,
     IcLoraAudioMode,
+    IcLoraControlType,
     Generation,
     GenerationCore,
     QueueEntry,
@@ -24,7 +26,10 @@ from api_types import (
     QueueSnapshot,
     RetakeMode,
 )
+from api_motion_path import MotionPath
 from remote.media_urls import MediaUrlSigner
+
+logger = logging.getLogger(__name__)
 
 _SAFE_PARAM_STRINGS = frozenset(
     {
@@ -34,9 +39,11 @@ _SAFE_PARAM_STRINGS = frozenset(
         "promptProvenance",
         "mode",
         "audioMode",
+        "controlType",
     }
 )
 _REMOTE_AUDIO_MODES = frozenset(get_args(IcLoraAudioMode))
+_REMOTE_CONTROL_TYPES = frozenset(get_args(IcLoraControlType))
 _SAFE_PARAM_NUMBERS = frozenset({"duration", "fps", "startTime"})
 _REMOTE_MODES = frozenset((*get_args(RetakeMode), *get_args(ExtendMode)))
 
@@ -93,6 +100,7 @@ class RemoteVideoParams(BaseModel):
     startTime: int | float | None = None
     seed: int | None = None
     audioMode: IcLoraAudioMode | None = None
+    controlType: IcLoraControlType | None = None
 
 
 class RemoteVideoInputs(BaseModel):
@@ -103,6 +111,9 @@ class RemoteVideoInputs(BaseModel):
     audio: RemoteInputAssetRef | None = None
     video: RemoteInputAssetRef | None = None
     image: RemoteInputAssetRef | None = None
+    images: list[RemoteInputAssetRef] | None = None
+    # Motion Track: coordinates and pacing only, so Reuse can draw the paths again.
+    paths: list[MotionPath] | None = None
 
 
 class RemoteGenerationSpec(BaseModel):
@@ -188,6 +199,7 @@ def to_remote_generation(
         attempt_count=generation.attempt_count,
         started_at=generation.started_at,
         finished_at=generation.finished_at,
+        risk=generation.risk,
         outputs=[
             to_remote_asset(asset, signer=signer, device_id=device_id)
             for asset in generation.outputs
@@ -284,6 +296,7 @@ def _project_params(value: object) -> RemoteVideoParams:
         startTime=_non_negative_number(numbers.get("startTime")),
         seed=_optional_int(mapping.get("seed")),
         audioMode=_project_audio_mode(strings.get("audioMode")),
+        controlType=_project_control_type(strings.get("controlType")),
     )
 
 
@@ -306,11 +319,41 @@ def _project_inputs(value: object) -> RemoteVideoInputs | None:
     audio = _input_asset_ref(mapping.get("audio"))
     video = _input_asset_ref(mapping.get("video"))
     image = _input_asset_ref(mapping.get("image"))
-    if all(ref is None for ref in (start, end, audio, video, image)):
+    images = _input_asset_refs(mapping.get("images"))
+    paths = _motion_paths(mapping.get("paths"))
+    if images is None and paths is None and all(
+        ref is None for ref in (start, end, audio, video, image)
+    ):
         return None
     return RemoteVideoInputs(
-        startFrame=start, endFrame=end, audio=audio, video=video, image=image
+        startFrame=start,
+        endFrame=end,
+        audio=audio,
+        video=video,
+        image=image,
+        images=images,
+        paths=paths,
     )
+
+
+def _motion_paths(value: object) -> list[MotionPath] | None:
+    if not isinstance(value, list):
+        return None
+    try:
+        paths = [MotionPath.model_validate(item) for item in cast(list[object], value)]
+    except ValidationError:
+        # Create validated every path, so a stored set that fails is a damaged row. Reuse
+        # then has no tracks to draw again. It never gets a part of the tracks.
+        logger.warning("Dropping stored motion paths that no longer validate")
+        return None
+    return paths or None
+
+
+def _input_asset_refs(value: object) -> list[RemoteInputAssetRef] | None:
+    if not isinstance(value, list):
+        return None
+    refs = [_input_asset_ref(item) for item in cast(list[object], value)]
+    return [ref for ref in refs if ref is not None] or None
 
 
 def _input_asset_ref(value: object) -> RemoteInputAssetRef | None:
@@ -371,6 +414,12 @@ def _project_mode(value: str | None) -> RetakeMode | ExtendMode | None:
 def _project_audio_mode(value: str | None) -> IcLoraAudioMode | None:
     if value in _REMOTE_AUDIO_MODES:
         return cast(IcLoraAudioMode, value)
+    return None
+
+
+def _project_control_type(value: str | None) -> IcLoraControlType | None:
+    if value in _REMOTE_CONTROL_TYPES:
+        return cast(IcLoraControlType, value)
     return None
 
 

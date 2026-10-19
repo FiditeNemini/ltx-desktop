@@ -1160,6 +1160,31 @@ class TestActiveModelResolution:
         assert by_model["ltx-2.3-fast"]["spec"]["capabilities"]["auto_duration"] is False
         assert data["local_models"][0]["spec"]["capabilities"]["auto_duration"] is False
 
+    def test_downloaded_2_5_row_uses_measured_profile_when_2_3_active(
+        self, client, test_state, create_fake_model_files
+    ):
+        """Downloaded rows follow their own model's profile, not the active one.
+
+        Windows 2.3 and 2.5 share the measured grid. 720p/10s at 12 GB is the
+        cell the rough curve would still offer, so either row growing it means
+        that row fell off the measured rules.
+        """
+        create_fake_model_files()
+        create_fake_model_files(model_id="ltx-2.3-22b-distilled-1.1")
+        test_state.state.app_settings.active_ltx_model_id = "ltx-2.3-22b-distilled-1.1"
+        test_state.config.system = "Windows"
+        test_state.config.vram_gb = 12
+        test_state.config.vram_bytes = 12 * 1024**3
+        test_state.config.total_ram_bytes = 48 * 1024**3
+        test_state.config.local_generations_mode = "streaming_models_loading"
+
+        data = client.get("/api/generate/models-specs").json()
+        by_model = {item["model"]: item for item in data["downloaded_local_models"]}
+        fast_25 = by_model["ltx-2.5-fast"]["spec"]["supported_resolutions_durations"]
+        assert fast_25["720p"]["fps_to_durations"]["24"] == [2, 3, 4, 5, 6, 8]
+        fast_23 = data["local_models"][0]["spec"]["supported_resolutions_durations"]
+        assert fast_23["720p"]["fps_to_durations"]["24"] == [2, 3, 4, 5, 6, 8]
+
     def test_downloaded_local_models_only_includes_installed_offerings(
         self, client, create_fake_model_files
     ):

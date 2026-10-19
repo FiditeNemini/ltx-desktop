@@ -191,6 +191,42 @@ def test_ended_detail_keys_match_the_shared_contract() -> None:
     assert json.loads(contract_path.read_text()) == list(ENDED_DETAIL_KEYS)
 
 
+def test_started_detail_keys_match_the_shared_contract() -> None:
+    """Every started key the backend emits must survive Electron's allowlist.
+
+    A writer key missing from shared/generation-detail-keys.json is silently
+    dropped from generate_started; a contract key nothing emits is dead.
+    outcome/runtime_ms/error_code/output_count are ended-only by design.
+    """
+    record = _home_record(
+        feature="text-to-video",
+        params={
+            "prompt": "a fox",
+            "promptProvenance": "typed",
+            "model": "ltx-2.5-fast",
+            "resolution": "1080p",
+            "duration": 5,
+            "fps": 24,
+            "loras": [{"catalogId": "cozy-felt"}, {"path": "/tmp/custom.safetensors"}],
+        },
+    )
+    details = queued_generation_details(
+        record,
+        enhancement=_LOCAL_ENHANCE,
+        hardware={
+            "gpu_model": "NVIDIA GeForce RTX 5090",
+            "total_vram_bytes": 34089730048,
+            "free_vram_bytes": 30000000000,
+            "drive_type": "nvme",
+        },
+        modes={"load_mode": "streaming_models_loading", "offload_mode": "DISK"},
+    )
+    assert details is not None
+    contract_path = Path(__file__).resolve().parents[2] / "shared" / "generation-detail-keys.json"
+    contract = set(json.loads(contract_path.read_text()))
+    assert set(details) == contract - {"outcome", "runtime_ms", "error_code", "output_count"}
+
+
 def test_video_generation_feature_prefers_keyframes_then_audio() -> None:
     assert video_generation_feature(
         audio_path="clip.wav",
@@ -234,7 +270,8 @@ def test_home_queue_records_stored_prompt_provenance() -> None:
     assert "prompt_provenance" not in (queued_generation_details(typed) or {})
     assert queued_generation_details(enhanced, enhancement=_LOCAL_ENHANCE)["prompt_provenance"] == "manually-enhanced"
     assert queued_generation_details(typed, enhancement=_LOCAL_ENHANCE)["prompt_provenance"] == "auto-enhanced"
-    assert queued_generation_details(retake, enhancement=_LOCAL_ENHANCE)["prompt_provenance"] == "raw"
+    # Retake and extend rewrite from stills of their source video, so a typed prompt is auto-enhanced.
+    assert queued_generation_details(retake, enhancement=_LOCAL_ENHANCE)["prompt_provenance"] == "auto-enhanced"
     assert queued_generation_details(
         typed,
         enhancement=QueuedEnhancement(
@@ -260,13 +297,19 @@ def test_home_queue_records_stored_prompt_provenance() -> None:
     assert queued_generation_details(typed, enhancement=_API_ENHANCE)["prompt_provenance"] == "auto-enhanced"
 
 
-def _home_record(*, feature: str, params: dict[str, object]) -> GenerationRecord:
+def _home_record(
+    *, feature: str, params: dict[str, object], inputs: dict[str, object] | None = None
+) -> GenerationRecord:
     return GenerationRecord(
         id="generation-1",
         feature=feature,
         contract_version=1,
         status="running",
-        spec={"_analytics": {"client": "desktop"}, "params": params},
+        spec={
+            "_analytics": {"client": "desktop"},
+            "params": params,
+            **({"inputs": inputs} if inputs is not None else {}),
+        },
         created_at=1,
         queued_at=1,
         attempt_count=1,
@@ -385,3 +428,109 @@ def test_desktop_create_response_omits_internal_analytics(client, test_state) ->
     details = queued_generation_details(stored)
     assert details is not None
     assert "prompt" not in details
+
+
+def test_started_details_carry_backend_hardware_snapshot() -> None:
+    """Hardware passed to the builder must land on the started event, not vanish."""
+    record = _home_record(feature="text-to-video", params={"model": "ltx-2.5-fast"})
+
+    details = queued_generation_details(
+        record,
+        hardware={
+            "gpu_model": "NVIDIA GeForce RTX 5090",
+            "total_vram_bytes": 34089730048,
+            "free_vram_bytes": 30000000000,
+            "drive_type": "nvme",
+        },
+    )
+
+    assert details is not None
+    assert details["gpu_model"] == "NVIDIA GeForce RTX 5090"
+    assert details["total_vram_bytes"] == 34089730048
+    assert details["free_vram_bytes"] == 30000000000
+    assert details["drive_type"] == "nvme"
+
+
+def test_started_details_omit_unknown_hardware_fields() -> None:
+    """Absent snapshot values must stay absent, not flow as explicit nulls."""
+    record = _home_record(feature="text-to-video", params={"model": "ltx-2.5-fast"})
+
+    details = queued_generation_details(
+        record,
+        hardware={"gpu_model": None, "total_vram_bytes": None},
+    )
+
+    assert details is not None
+    assert "gpu_model" not in details
+    assert "total_vram_bytes" not in details
+
+
+def test_ended_event_keeps_load_and_offload_modes() -> None:
+    """Modes must survive the ended allowlist filter to the sink payload."""
+    http = FakeHTTPClient()
+    http.queue("post", FakeResponse())
+    service = _service(http)
+    record = _home_record(feature="text-to-video", params={"model": "ltx-2.5-fast"})
+    details = queued_generation_details(
+        record,
+        modes={"load_mode": "streaming_models_loading", "offload_mode": "DISK"},
+    )
+    assert details is not None
+
+    service.send_generation_ended(details, outcome="succeeded", runtime_ms=1000)
+
+    assert len(http.calls) == 1
+    payload = http.calls[0].json_payload
+    assert payload is not None
+    ended = payload["extraDetails"]
+    assert isinstance(ended, dict)
+    assert ended["load_mode"] == "streaming_models_loading"
+    assert ended["offload_mode"] == "DISK"
+
+
+def test_extend_with_gemini_video_enhance_is_auto_enhanced_even_with_api_text_encoding() -> None:
+    extend = _home_record(
+        feature="extend",
+        params={"prompt": "a fox", "promptProvenance": "typed", "model": "ltx-2.5-fast"},
+        inputs={"video": {"assetId": "asset-1"}},
+    )
+    gemini = QueuedEnhancement(
+        explore_auto_enhance_prompts=True,
+        prompt_enhancer_enabled=True,
+        use_local_encoding=False,
+        gemini_video_enhance=True,
+    )
+
+    assert queued_generation_details(extend, enhancement=gemini)["prompt_provenance"] == "auto-enhanced"
+    assert queued_generation_details(extend, enhancement=_API_ENHANCE)["prompt_provenance"] == "raw"
+
+
+def test_sheet_recipe_with_gemini_media_enhance_is_auto_enhanced_not_raw() -> None:
+    ingredients = _home_record(
+        feature="ingredients",
+        params={"prompt": "a fox runs", "promptProvenance": "typed", "model": "ltx-2.3-fast"},
+        inputs={"images": [{"assetId": "asset-1"}, {"assetId": "asset-2"}]},
+    )
+
+    def enhancement(*, gemini_video_enhance: bool) -> QueuedEnhancement:
+        return QueuedEnhancement(
+            explore_auto_enhance_prompts=True,
+            prompt_enhancer_enabled=False,
+            use_local_encoding=False,
+            gemini_video_enhance=gemini_video_enhance,
+        )
+
+    details = queued_generation_details(ingredients, enhancement=enhancement(gemini_video_enhance=True))
+    assert details["prompt_provenance"] == "auto-enhanced"
+    details = queued_generation_details(ingredients, enhancement=enhancement(gemini_video_enhance=False))
+    assert details["prompt_provenance"] == "raw"
+
+
+def test_motion_track_is_raw_even_when_auto_enhance_would_rewrite_a_typed_prompt() -> None:
+    # The job wraps the scene with the camera lock and never rewrites it.
+    params = {"prompt": "a frog", "promptProvenance": "typed", "model": "ltx-2.5-fast"}
+    typed = _home_record(feature="motion-track", params=params)
+    manual = _home_record(feature="motion-track", params={**params, "promptProvenance": "enhanced"})
+
+    assert queued_generation_details(typed, enhancement=_LOCAL_ENHANCE)["prompt_provenance"] == "raw"
+    assert queued_generation_details(manual, enhancement=_LOCAL_ENHANCE)["prompt_provenance"] == "manually-enhanced"

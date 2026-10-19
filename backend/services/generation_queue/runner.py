@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
-from typing import Literal
+from typing import Literal, TypeVar
 
 from services.store import Store
 from services.records import (
@@ -18,23 +18,64 @@ from services.records import (
     StatusError,
     UnavailableError,
 )
+from _routes._errors import HTTPError
 from logging_policy import log_background_exception
-from services.analytics import AnalyticsService, QueuedEnhancement, queued_generation_details
+from runtime_config.reject_reasons import BUDGET_MISS_CODES
+from services.analytics import (
+    AnalyticsService,
+    QueuedEnhancement,
+    QueuedExecutionModes,
+    QueuedHardwareSnapshot,
+    queued_generation_details,
+)
 from services.generation_queue.control import (
     GenerationSlotWaitAborted,
     SharedGenerationSlot,
 )
 from services.generation_queue.output_names import output_asset_name
 from services.generation_queue.registry import ExecutorRegistry
-from services.generation_queue.types import OutputAllocation
+from services.generation_queue.types import ExecutionOutcome, OutputAllocation
 from services.generation_interrupt import is_cancel_exception
+from services.gpu_info.gpu_info import GpuInfo
+from services.patches import diffusion_stage_cache
+from services.patches.pinned_pool_fix import is_cuda_oom_error
+from services.storage_info.storage_info import DriveType
 
 logger = logging.getLogger(__name__)
 _BACKGROUND_TASK_NAME = "generation-queue-runner"
 _EXECUTOR_FAILURE_CODE: GenerationErrorCode = "EXECUTOR_FAILED"
+_OOM_CODE: GenerationErrorCode = "CUDA_OOM"
 _CAPABILITY_FAILURE_CODE: GenerationErrorCode = "CAPABILITY_FAILED"
+_JOB_TOO_LARGE_CODE: GenerationErrorCode = "JOB_TOO_LARGE"
+# BUDGET_MISS_CODES (imported above) are budget verdicts, not true failures:
+# an executor raising one means the job stopped fitting between create and
+# execute. Mapped to JOB_TOO_LARGE with the enriched detail preserved in
+# the log; anything else keeps the branch default.
 _LTX_INVALID_API_KEY_CODE: GenerationErrorCode = "LTX_INVALID_API_KEY"
 _LTX_API_PROMPT_EMBEDDING_FAILED_CODE: GenerationErrorCode = "LTX_API_PROMPT_EMBEDDING_FAILED"
+
+
+def _error_code_for(exc: BaseException, default: GenerationErrorCode) -> GenerationErrorCode:
+    """OOM takes precedence over the branch default.
+
+    Edit executors re-raise torch OOMs (a RuntimeError subclass) as
+    capability failures, so the capability branch must check too — otherwise
+    the policy-miss signal hides as a generic failure.
+    """
+    if is_cuda_oom_error(exc):
+        return _OOM_CODE
+    return default
+
+
+_T = TypeVar("_T")
+
+
+def _probe_or_none(probe: Callable[[], _T | None]) -> _T | None:
+    """One tolerant probe: exceptions and missing values both become None."""
+    try:
+        return probe()
+    except Exception:
+        return None
 
 
 def _capability_error_code(exc: CapabilityFailedError) -> GenerationErrorCode:
@@ -42,7 +83,16 @@ def _capability_error_code(exc: CapabilityFailedError) -> GenerationErrorCode:
         return _LTX_INVALID_API_KEY_CODE
     if exc.code == _LTX_API_PROMPT_EMBEDDING_FAILED_CODE:
         return _LTX_API_PROMPT_EMBEDDING_FAILED_CODE
+    if exc.code in BUDGET_MISS_CODES:
+        return _JOB_TOO_LARGE_CODE
     return _CAPABILITY_FAILURE_CODE
+
+
+def _http_budget_error_code(exc: HTTPError) -> GenerationErrorCode:
+    """Budget-verdict HTTP codes map to JOB_TOO_LARGE; the rest are true failures."""
+    if exc.code in BUDGET_MISS_CODES:
+        return _JOB_TOO_LARGE_CODE
+    return _EXECUTOR_FAILURE_CODE
 
 
 @dataclass
@@ -60,6 +110,8 @@ class QueueRunner:
         executors: ExecutorRegistry,
         analytics: AnalyticsService | None = None,
         enhancement_policy: Callable[[GenerationRecord], QueuedEnhancement] | None = None,
+        gpu_info: GpuInfo | None = None,
+        checkpoint_drive_type: DriveType | None = None,
         idle_wait_seconds: float = 0.25,
         stop_join_timeout_seconds: float = 600.0,
     ) -> None:
@@ -68,6 +120,8 @@ class QueueRunner:
         self._executors = executors
         self._analytics = analytics
         self._enhancement_policy = enhancement_policy
+        self._gpu_info = gpu_info
+        self._checkpoint_drive_type: DriveType | None = checkpoint_drive_type
         self._idle_wait_seconds = idle_wait_seconds
         self._stop_join_timeout_seconds = stop_join_timeout_seconds
 
@@ -80,6 +134,10 @@ class QueueRunner:
 
     def set_finished_listener(self, listener: Callable[[str], None] | None) -> None:
         self._finished_listener = listener
+
+    def set_checkpoint_drive_type(self, drive_type: DriveType | None) -> None:
+        """Refresh the telemetry snapshot's drive class (models dir moved)."""
+        self._checkpoint_drive_type = drive_type
 
     def start(self) -> None:
         try:
@@ -216,7 +274,24 @@ class QueueRunner:
                     )
                 )
                 partial_paths.append(dest_path)
-            executor.execute(claimed, tuple(allocations))
+            # Release dead pools (cached transformer + allocator reserved)
+            # before the execute-time budget samples free: start_generation
+            # evicts after the sample, so sampling first charges the job
+            # for D it never sees. Warm live weights W still count against the
+            # first sample; asks landing in (free', free'+W] get one
+            # evict-and-resample inside the budget gates themselves (see
+            # runtime_config.evict_retry) instead of failing outright.
+            # Best-effort: a reclaim failure must never fail the job it was
+            # trying to save.
+            try:
+                diffusion_stage_cache.evict()
+            except Exception:
+                logger.warning(
+                    "Generation %s reclaim before execute failed; continuing",
+                    claimed.id,
+                    exc_info=True,
+                )
+            outcome = executor.execute(claimed, tuple(allocations))
             allocations = [
                 allocation
                 for allocation in allocations
@@ -232,23 +307,39 @@ class QueueRunner:
                     claimed.attempt_count,
                     exc.detail,
                 )
-                self._mark_failed(claimed, _capability_error_code(exc), partial_paths)
+                self._mark_failed(
+                    claimed, _error_code_for(exc, _capability_error_code(exc)), partial_paths
+                )
+            elif isinstance(exc, HTTPError):
+                logger.warning(
+                    "Generation %s attempt %s HTTP error at execute time: %s",
+                    claimed.id,
+                    claimed.attempt_count,
+                    exc.detail,
+                )
+                self._mark_failed(
+                    claimed, _error_code_for(exc, _http_budget_error_code(exc)), partial_paths
+                )
             else:
                 log_background_exception(_BACKGROUND_TASK_NAME, exc)
-                self._mark_failed(claimed, _EXECUTOR_FAILURE_CODE, partial_paths)
+                self._mark_failed(claimed, _error_code_for(exc, _EXECUTOR_FAILURE_CODE), partial_paths)
             return
 
-        self._mark_succeeded(claimed, allocations)
+        self._mark_succeeded(claimed, allocations, outcome)
 
     def _mark_succeeded(
         self,
         claimed: GenerationRecord,
         allocations: list[OutputAllocation],
+        outcome: ExecutionOutcome | None,
     ) -> None:
         params = claimed.spec.get("params")
         prompt: object = None
         if isinstance(params, dict):
             prompt = params.get("prompt")
+        written_prompt = outcome.written_prompt if outcome is not None else None
+        if written_prompt is not None:
+            prompt = written_prompt
         outputs = [
             OutputSpec(
                 asset_id=allocation.asset_id,
@@ -273,6 +364,7 @@ class QueueRunner:
                 claimed.id,
                 outputs,
                 attempt_count=claimed.attempt_count,
+                written_prompt=written_prompt,
             )
         except MarkSucceededError as exc:
             self._mark_failed(claimed, exc.error_code, paths)
@@ -283,7 +375,7 @@ class QueueRunner:
             self._unlink_unless_succeeded(claimed.id, paths)
         else:
             self._notify_finished(claimed.id)
-            self._send_generation_ended(completed)
+            self._send_generation_ended(completed, outcome)
 
     def _is_cancelling_attempt(self, claimed: GenerationRecord) -> bool:
         try:
@@ -397,19 +489,43 @@ class QueueRunner:
             return None
         return self._enhancement_policy(generation)
 
+    def _snapshot_hardware(self) -> QueuedHardwareSnapshot | None:
+        """Best-effort hardware snapshot for the started event.
+
+        Per-probe tolerance: each field degrades to None independently, and
+        anything unexpected degrades the whole snapshot. Telemetry never
+        breaks generation.
+        """
+        if self._gpu_info is None:
+            return None
+        try:
+            return QueuedHardwareSnapshot(
+                gpu_model=_probe_or_none(self._gpu_info.get_device_name),
+                total_vram_bytes=_probe_or_none(self._gpu_info.get_cuda_total_vram_bytes),
+                free_vram_bytes=_probe_or_none(self._gpu_info.get_free_cuda_vram_bytes),
+                drive_type=self._checkpoint_drive_type,
+            )
+        except Exception as exc:
+            log_background_exception(_BACKGROUND_TASK_NAME, exc)
+            return None
+
     def _send_generation_started(self, generation: GenerationRecord) -> None:
         if self._analytics is None:
             return
         try:
             details = queued_generation_details(
-                generation, enhancement=self._enhancement(generation)
+                generation,
+                enhancement=self._enhancement(generation),
+                hardware=self._snapshot_hardware(),
             )
             if details is not None:
                 self._analytics.send_generation_started(details)
         except Exception as exc:
             log_background_exception(_BACKGROUND_TASK_NAME, exc)
 
-    def _send_generation_ended(self, generation: GenerationRecord) -> None:
+    def _send_generation_ended(
+        self, generation: GenerationRecord, summary: ExecutionOutcome | None = None
+    ) -> None:
         if (
             self._analytics is None
             or generation.started_at is None
@@ -417,8 +533,13 @@ class QueueRunner:
         ):
             return
         try:
+            modes: QueuedExecutionModes | None = (
+                {"load_mode": summary.load_mode, "offload_mode": summary.offload_mode}
+                if summary is not None
+                else None
+            )
             details = queued_generation_details(
-                generation, enhancement=self._enhancement(generation)
+                generation, enhancement=self._enhancement(generation), modes=modes
             )
             if details is None:
                 return

@@ -14,8 +14,14 @@ export const paths = {
   waterSimulation: '/water-simulation',
   layoutToRender: '/layout-to-render',
   restore: '/restore',
+  ingredients: '/ingredients',
+  refineDetails: '/refine-details',
+  motionTrack: '/motion-track',
+  videoGuide: '/video-guide',
   assets: '/assets',
   dashboard: '/activity-dashboard',
+  assistant: '/assistant',
+  assistantChat: '/assistant/:chatId',
   fetcherTool: '/fetcher/:tool',
   remote: '/remote',
   settings: '/settings',
@@ -35,3 +41,7 @@ export const paths = {
   projects: '/projects',
   project: '/projects/:projectId',
 } as const
+
+export function assistantChatPath(chatId: string): string {
+  return `${paths.assistant}/${encodeURIComponent(chatId)}`
+}

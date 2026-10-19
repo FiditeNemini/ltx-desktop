@@ -16,6 +16,12 @@ import layoutToRenderExamplePosterUrl from "../../assets/layout-to-render/exampl
 import layoutToRenderExampleVideoUrl from "../../assets/layout-to-render/example.mp4";
 import restoreExamplePosterUrl from "../../assets/restore/example-poster.webp";
 import restoreExampleVideoUrl from "../../assets/restore/example.mp4";
+import ingredientsExamplePosterUrl from "../../assets/ingredients/example-poster.webp";
+import ingredientsExampleVideoUrl from "../../assets/ingredients/example.mp4";
+import motionTrackExamplePosterUrl from "../../assets/motion-track/example-poster.webp";
+import motionTrackExampleVideoUrl from "../../assets/motion-track/example.webm";
+import videoGuideExamplePosterUrl from "../../assets/video-guide/example-poster.webp";
+import videoGuideExampleVideoUrl from "../../assets/video-guide/example.mp4";
 import dayToNightExamplePosterUrl from "../../assets/day-to-night/example-poster.webp";
 import dayToNightExampleVideoUrl from "../../assets/day-to-night/example.mp4";
 
@@ -63,5 +69,22 @@ export const IC_LORA_RECIPE_EXAMPLE_MEDIA: Record<
   "restore": {
     videoUrl: restoreExampleVideoUrl,
     posterUrl: restoreExamplePosterUrl,
+  },
+  "ingredients": {
+    videoUrl: ingredientsExampleVideoUrl,
+    posterUrl: ingredientsExamplePosterUrl,
+  },
+  // Placeholder: the Restore example. Replace it with a Refine Details example.
+  "refine-details": {
+    videoUrl: restoreExampleVideoUrl,
+    posterUrl: restoreExamplePosterUrl,
+  },
+  "motion-track": {
+    videoUrl: motionTrackExampleVideoUrl,
+    posterUrl: motionTrackExamplePosterUrl,
+  },
+  "video-guide": {
+    videoUrl: videoGuideExampleVideoUrl,
+    posterUrl: videoGuideExamplePosterUrl,
   },
 };

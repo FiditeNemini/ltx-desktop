@@ -12,7 +12,7 @@ from typing import Any
 import _routes.assets as assets_module
 from _routes.assets import _MULTIPART_OVERHEAD_BYTES, _UPLOAD_TEMP_PREFIX
 from remote.app import create_remote_app
-from services.media_probe import MAX_AUDIO_BYTES, MAX_IMAGE_BYTES, MAX_VIDEO_BYTES
+from services.media_probe import MAX_AUDIO_BYTES, MAX_IMAGE_BYTES, MAX_VIDEO_UPLOAD_BYTES
 from starlette.testclient import TestClient
 from tests.http_error_assertions import assert_http_error
 
@@ -133,7 +133,7 @@ def _call_remote_upload_asgi(
 def test_upload_body_limit_derived_from_existing_constants() -> None:
     assert (
         assets_module.MAX_REMOTE_UPLOAD_BODY_BYTES
-        == max(MAX_IMAGE_BYTES, MAX_AUDIO_BYTES, MAX_VIDEO_BYTES)
+        == max(MAX_IMAGE_BYTES, MAX_AUDIO_BYTES, MAX_VIDEO_UPLOAD_BYTES)
         + _MULTIPART_OVERHEAD_BYTES
     )
 

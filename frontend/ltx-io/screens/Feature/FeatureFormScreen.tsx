@@ -9,7 +9,7 @@ import {
   restorePromptHistory,
 } from "@/lib/prompt-provenance";
 
-import { useManualEnhance } from "../../hooks/useManualEnhance";
+import { type PromptValues as ManualEnhancePromptValues, useManualEnhance } from "../../hooks/useManualEnhance";
 import { type Generation, readGenerationParams } from "../../lib/resultsFeedModel";
 import {
   type FeatureSchemaMap,
@@ -104,11 +104,7 @@ export function FeatureFormScreen<TId extends HomeFeatureId, TCreateBody, TConte
 
   const enhance = useManualEnhance({
     featureId: definition.id,
-    values: form.values as {
-      prompt?: string;
-      startFrame?: { assetId: string } | null;
-      endFrame?: { assetId: string } | null;
-    },
+    values: form.values as ManualEnhancePromptValues,
     promptHistory,
     historyIndex,
     onPromptHistoryChange,
@@ -121,7 +117,7 @@ export function FeatureFormScreen<TId extends HomeFeatureId, TCreateBody, TConte
   }, [definition.id, form, setPromptHistoryState]);
 
   const generateNow = useCallback(() => {
-    form.generateWithProvenance(enhance.promptProvenance);
+    return form.generateWithProvenance(enhance.promptProvenance);
   }, [enhance.promptProvenance, form]);
   const generateNowRef = useRef(generateNow);
   generateNowRef.current = generateNow;
@@ -162,6 +158,7 @@ export function FeatureFormScreen<TId extends HomeFeatureId, TCreateBody, TConte
       actionError={actionErrorOverride ?? form.actionError}
       generations={form.generations}
       isGenerationsLoading={form.isGenerationsLoading}
+      isGenerationsFetching={form.isGenerationsFetching}
       generationsError={form.generationsError}
       onCancel={form.cancel}
       onRetry={form.retry}

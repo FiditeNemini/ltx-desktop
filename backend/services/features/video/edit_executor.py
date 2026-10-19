@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, Generic, Protocol, TypeVar
+from typing import ClassVar, Generic, Literal, Protocol, Self, TypeVar
 
-from api_types import LTXLocalModelId, OfferingId
+from api_types import LTXLocalModelId, OfferingId, PromptProvenance
 from _routes._errors import HTTPError
 from runtime_config.ltx_capabilities import LtxCapabilityFeature
+from runtime_config.video_job_budget import (
+    LOCAL_GENERATION_RAM_SHORTFALL,
+    VIDEO_JOB_TOO_LARGE,
+)
 from server_utils.heartbeat import log_heartbeat
 from services.features.video.job_common import (
     AssetLookup,
@@ -17,6 +23,8 @@ from services.features.video.job_common import (
     require_capable_local_model,
     require_existing_asset,
     resolve_generation_seed,
+    spec_risk_allowance,
+    spec_unmeasured_bet,
 )
 from services.features.video.text_to_video import (
     VIDEO_OUTPUT_PLAN,
@@ -24,7 +32,8 @@ from services.features.video.text_to_video import (
     require_video_output,
 )
 from services.generation_interrupt import GenerationCancelledError, is_cancel_exception
-from services.generation_queue.types import OutputAllocation, OutputPlan
+from services.generation_queue.types import ExecutionOutcome, OutputAllocation, OutputPlan
+from services.prompt_enhancement.source_video import SourceVideo
 from services.records import (
     AssetRecord,
     CapabilityFailedError,
@@ -32,6 +41,21 @@ from services.records import (
     MediaError,
 )
 from state.app_state_types import RetakePipelineState
+
+logger = logging.getLogger(__name__)
+
+# Widest total-cap/free-cap gap the shrink retry bridges. Shrink exists for
+# small structural gaps (a Windows desktop holds ~1.7GB ≈ 24 frames at
+# 1080p; this allows 2x that, ≈3.5GB): under heavy external pressure the
+# salvaged window would run on slivers, so fail with the max named instead
+# of generating mush. Single choke point for retake and extend.
+MAX_SHRINK_GAP_FRAMES = 48
+
+
+@dataclass(frozen=True)
+class _AfterProbe:
+    kind: Literal["shrink", "bet"]
+    free_cap: int | None = None
 
 
 class GpuJobSlot(Protocol):
@@ -52,9 +76,15 @@ class RetakePipelineLoader(Protocol):
         height: int | None = None,
         frames: int | None = None,
         queued_home: bool = False,
+        allow_risk: bool | None = None,
+        unmeasured_bet: bool = False,
     ) -> RetakePipelineState: ...
 
-    def edit_encode_frame_cap(self, width: int, height: int) -> int: ...
+    def edit_encode_frame_cap(
+        self, width: int, height: int, *, total_only: bool = False
+    ) -> int: ...
+
+    def high_res_video_enabled(self) -> bool: ...
 
 
 class TextEncodingPrep(Protocol):
@@ -68,10 +98,34 @@ class TextEncodingPrep(Protocol):
     def clear_api_embeddings(self) -> None: ...
 
 
+class _ResolvedPrompt(Protocol):
+    @property
+    def prompt(self) -> str: ...
+
+
+class SourceVideoPromptResolver(Protocol):
+    """The app's one auto-enhance policy, fed the job's source video for scene context."""
+
+    def resolve_for_generation(
+        self,
+        prompt: str,
+        *,
+        provenance: PromptProvenance,
+        generation_seed: int,
+        explicit_generation_seed: bool,
+        local_model_id: LTXLocalModelId | None,
+        explore_generation: bool,
+        source_video: SourceVideo | None,
+    ) -> _ResolvedPrompt: ...
+
+
 class VideoEditParams(Protocol):
     model: OfferingId
     seed: int | None
     prompt: str
+    promptProvenance: PromptProvenance
+
+    def model_copy(self, *, update: Mapping[str, object]) -> Self: ...
 
 
 class _VideoRef(Protocol):
@@ -104,6 +158,7 @@ class VideoEditExecutor(ABC, Generic[PParams, PInputs, PPrepared]):
         models_dir: Callable[[], Path],
         default_negative_prompt: str,
         generation: GpuJobSlot,
+        prompt_enhancement: SourceVideoPromptResolver,
     ) -> None:
         self._pipelines = pipelines
         self._assets = assets
@@ -111,6 +166,7 @@ class VideoEditExecutor(ABC, Generic[PParams, PInputs, PPrepared]):
         self._models_dir = models_dir
         self._default_negative_prompt = default_negative_prompt
         self._generation = generation
+        self._prompt_enhancement = prompt_enhancement
 
     def validate_params(
         self, spec: Mapping[str, object], *, contract_version: int
@@ -125,11 +181,141 @@ class VideoEditExecutor(ABC, Generic[PParams, PInputs, PPrepared]):
         )
         return (VIDEO_OUTPUT_PLAN,)
 
+    def _load_pipeline(
+        self,
+        *,
+        local_model_id: LTXLocalModelId,
+        width: int,
+        height: int,
+        frames: int,
+        allow_risk: bool,
+        unmeasured_bet: bool = False,
+    ) -> RetakePipelineState:
+        return self._pipelines.load_retake_pipeline(
+            distilled=True,
+            ltx_model_id=local_model_id,
+            width=width,
+            height=height,
+            frames=frames,
+            queued_home=True,
+            allow_risk=allow_risk,
+            unmeasured_bet=unmeasured_bet,
+        )
+
+    def _after_probe(
+        self,
+        exc: HTTPError,
+        *,
+        width: int,
+        height: int,
+        total_cap: int,
+        allow_risk: bool,
+    ) -> _AfterProbe:
+        """What to do after the no-bet probe refuses.
+
+        Re-raises ``exc`` when that refusal stands. A free gap past
+        ``MAX_SHRINK_GAP_FRAMES`` always stands, stored over or not: the guard
+        exists so that window does not run. A smaller free dip returns the cap
+        to re-window. A RAM shortfall, or a VRAM miss where free is not below
+        total, reloads the original window with the bet.
+        """
+        if exc.code == LOCAL_GENERATION_RAM_SHORTFALL:
+            if not allow_risk:
+                raise exc
+            return _AfterProbe(kind="bet")
+        if exc.code != VIDEO_JOB_TOO_LARGE:
+            raise exc
+        free_cap = self._pipelines.edit_encode_frame_cap(width, height)
+        if free_cap >= total_cap:
+            if not allow_risk:
+                raise exc
+            return _AfterProbe(kind="bet")
+        if total_cap - free_cap > MAX_SHRINK_GAP_FRAMES:
+            logger.info(
+                "Edit shrink skipped: free cap %d too far below total cap %d for %dx%d "
+                "(gap %d > %d); failing instead of running on slivers",
+                free_cap,
+                total_cap,
+                width,
+                height,
+                total_cap - free_cap,
+                MAX_SHRINK_GAP_FRAMES,
+            )
+            raise exc
+        return _AfterProbe(kind="shrink", free_cap=free_cap)
+
+    def _load_edit_window(
+        self,
+        *,
+        local_model_id: LTXLocalModelId,
+        width: int,
+        height: int,
+        frames: int,
+        total_cap: int,
+        allow_risk: bool,
+        unmeasured_bet: bool = False,
+        generation_id: str,
+        log_name: str,
+        rewindow: Callable[[int], int],
+    ) -> RetakePipelineState:
+        """Probe without the bet, then shrink or cover what shrink cannot.
+
+        The first load passes ``allow_risk=False`` so a free-gate refusal is
+        visible. A re-windowable dip calls ``rewindow`` and loads that frame
+        count with the real bet. A mask ``rewindow`` cannot fit raises there
+        and does not fall through to the original window.
+        """
+        try:
+            return self._load_pipeline(
+                local_model_id=local_model_id,
+                width=width,
+                height=height,
+                frames=frames,
+                allow_risk=False,
+                unmeasured_bet=unmeasured_bet,
+            )
+        except HTTPError as exc:
+            decision = self._after_probe(
+                exc,
+                width=width,
+                height=height,
+                total_cap=total_cap,
+                allow_risk=allow_risk,
+            )
+            if decision.kind == "bet":
+                logger.info(
+                    "%s %s stored over covers a refusal shrink cannot re-window (%s); loading %d frames",
+                    log_name,
+                    generation_id,
+                    exc.code,
+                    frames,
+                )
+                try:
+                    return self._load_pipeline(
+                        local_model_id=local_model_id,
+                        width=width,
+                        height=height,
+                        frames=frames,
+                        allow_risk=True,
+                        unmeasured_bet=unmeasured_bet,
+                    )
+                except HTTPError as bet_exc:
+                    raise bet_exc from exc
+            assert decision.free_cap is not None
+            return self._load_pipeline(
+                local_model_id=local_model_id,
+                width=width,
+                height=height,
+                frames=rewindow(decision.free_cap),
+                allow_risk=allow_risk,
+                unmeasured_bet=unmeasured_bet,
+            )
+
     def execute(
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome | None:
         self.validate_params(
             generation.spec, contract_version=generation.contract_version
         )
@@ -153,6 +339,25 @@ class VideoEditExecutor(ABC, Generic[PParams, PInputs, PPrepared]):
             raise capability_failed_from_http(exc) from exc
         output = require_video_output(outputs)
         seed = resolve_generation_seed(params.seed)
+        # The video gives scene context only: the typed prompt keeps the most weight. Runs
+        # before the retake pipeline loads and before start_generation, as the enhancer needs
+        # the VRAM a resident pipeline holds. The server-side API flag stays off (it cannot see
+        # the video), so enhance_prompt=False below is unchanged.
+        typed_prompt = params.prompt
+        enhanced_prompt = self._prompt_enhancement.resolve_for_generation(
+            typed_prompt,
+            provenance=params.promptProvenance,
+            generation_seed=seed,
+            explicit_generation_seed=params.seed is not None,
+            local_model_id=local_model_id,
+            explore_generation=True,
+            source_video=SourceVideo(
+                path=video.path,
+                replaced_window=self.replaced_window(params),
+                writes_blank_prompt=True,
+            ),
+        ).prompt
+        params = params.model_copy(update={"prompt": enhanced_prompt})
         try:
             self._text.prepare_text_encoding(
                 params.prompt, enhance_prompt=False, model_id=local_model_id
@@ -172,6 +377,8 @@ class VideoEditExecutor(ABC, Generic[PParams, PInputs, PPrepared]):
                 seed,
                 dest,
                 windowed_path,
+                allow_risk=spec_risk_allowance(generation.spec),
+                unmeasured_bet=spec_unmeasured_bet(generation.spec),
             )
 
             def _infer() -> None:
@@ -183,6 +390,11 @@ class VideoEditExecutor(ABC, Generic[PParams, PInputs, PPrepared]):
                     Path(windowed_path).unlink(missing_ok=True)
 
             run_gpu_job(self._generation, generation.id, str(dest), _infer)
+            if not typed_prompt.strip() and enhanced_prompt.strip():
+                return ExecutionOutcome(written_prompt=enhanced_prompt)
+            # Modes unknown: the retake pipeline does not surface its load/offload
+            # decisions. Nulls mean unknown — a follow-up can thread them through.
+            return ExecutionOutcome()
         except Exception as exc:
             if is_cancel_exception(exc):
                 raise GenerationCancelledError() from exc
@@ -202,6 +414,11 @@ class VideoEditExecutor(ABC, Generic[PParams, PInputs, PPrepared]):
     @abstractmethod
     def parse_inputs(self, spec: Mapping[str, object]) -> PInputs: ...
 
+    def replaced_window(self, params: PParams) -> tuple[float, float] | None:
+        """``(start, end)`` seconds of the source video that this job replaces, if it is a part."""
+        del params
+        return None
+
     @abstractmethod
     def prepare(
         self,
@@ -212,6 +429,9 @@ class VideoEditExecutor(ABC, Generic[PParams, PInputs, PPrepared]):
         seed: int,
         dest: Path,
         windowed_path: str,
+        *,
+        allow_risk: bool,
+        unmeasured_bet: bool = False,
     ) -> PPrepared: ...
 
     @abstractmethod

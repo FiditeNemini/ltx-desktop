@@ -5,6 +5,7 @@ import { Text } from "@/ds/Text/Text";
 import { Info } from "../../components/shared/Info/Info.tsx";
 
 import type { components } from "../../../generated/backend-openapi.ts";
+import { videoGenerationResolutionLabel } from "../../../lib/video-resolution.ts";
 
 import {
   ACTIVITY_SERIES,
@@ -138,9 +139,7 @@ function ActivityPanel({ snapshot, width }: { snapshot: Snapshot; width: number 
   }, [snapshot.activity.length]);
   return (
     <div>
-      <Text as="h2" variant="heading" size="sm" className={styles.panelTitle}>
-        Generations
-      </Text>
+      <SectionTitle title="Generations" info={DASHBOARD_INFO.activity} />
       <div ref={scrollRef} className={styles.chartScroll}>
         <div className={styles.chart}>
           {snapshot.activity.map((day) => {
@@ -215,7 +214,7 @@ function LoraPanel({ snapshot }: { snapshot: Snapshot }) {
       </Text>
       {loras.top.length === 0 ? (
         <Text as="p" variant="body" size="md" className={styles.muted}>
-          No LoRA runs in this range.
+          No LoRA or IC-LoRA runs in this range.
         </Text>
       ) : (
         <ol className={`${styles.list} ${styles.scrollList}`}>
@@ -293,7 +292,7 @@ function KeepPanel({ snapshot }: { snapshot: Snapshot }) {
           <Info content={DASHBOARD_INFO.usual} side="top" align="start" maxWidth={320} />
         </span>
         {usual
-          ? `: ${usual.resolution}, ${usual.aspect_ratio}, ${formatSeconds(usual.duration_s)}, ${usual.fps} fps`
+          ? `: ${usual.model ? `${usual.model}, ` : ""}${videoGenerationResolutionLabel(usual.resolution)}, ${usual.aspect_ratio}, ${formatSeconds(usual.duration_s)}, ${usual.fps} fps`
           : null}
       </Text>
       {usual ? null : (

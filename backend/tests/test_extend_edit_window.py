@@ -10,9 +10,34 @@ import pytest
 
 from services.retake_pipeline.window import (
     MAX_INPUT_FRAMES,
+    MIN_EXTEND_CONTEXT_FRAMES,
     duration_to_extend_frames,
+    extend_exceeds_cap,
+    extend_too_long_message,
+    max_extend_frames,
     window_for_extend,
 )
+
+
+def test_min_context_is_8k1_aligned() -> None:
+    """121 survives the VAE snap exactly, so the floor is exact, not ~."""
+    assert (MIN_EXTEND_CONTEXT_FRAMES - 1) % 8 == 0
+
+
+def test_max_extend_leaves_exactly_min_context() -> None:
+    assert max_extend_frames(505) == 384
+    assert not extend_exceeds_cap(384, 505)
+    assert extend_exceeds_cap(385, 505)
+
+
+def test_extend_at_max_keeps_full_min_context() -> None:
+    window = window_for_extend(
+        source_frames=1001,
+        extend_frames=max_extend_frames(MAX_INPUT_FRAMES),
+        mode="end",
+        max_input_frames=MAX_INPUT_FRAMES,
+    )
+    assert window.context_frames == MIN_EXTEND_CONTEXT_FRAMES
 
 
 def test_uncapped_window_encodes_the_whole_source() -> None:
@@ -92,3 +117,20 @@ def test_duration_to_extend_frames_snaps_up_to_multiple_of_8() -> None:
     assert duration_to_extend_frames(3.1, 24.0) == 80
     assert duration_to_extend_frames(4.0, 24.0) == 96
     assert duration_to_extend_frames(4.0, 24.0) % 8 == 0
+
+
+def test_extend_too_long_at_hard_cap_is_machine_neutral() -> None:
+    """The 121-context rule binds on every machine; the copy must not blame this one."""
+    message = extend_too_long_message(
+        duration_s=17.0, target_width=1280, target_height=720,
+        frame_cap=MAX_INPUT_FRAMES, fps=24.0,
+    )
+    assert message == "Extend of 17s is too long for 1280x720 (at most 16s)."
+
+
+def test_extend_too_long_at_shortened_cap_names_the_machine() -> None:
+    message = extend_too_long_message(
+        duration_s=10.0, target_width=1920, target_height=1080,
+        frame_cap=300, fps=24.0,
+    )
+    assert message == "Extend of 10s is too long for 1920x1080 on this machine (at most 7s)."

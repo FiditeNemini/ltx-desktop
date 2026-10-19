@@ -2,15 +2,33 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from services.retake_pipeline.window import (
     MASK_DELTA_SECONDS,
     MAX_INPUT_FRAMES,
     RETAKE_BLEND_SECONDS,
+    SELECTION_OUT_OF_RANGE_MESSAGE,
     feathered_mask_times,
     window_for_retake,
 )
+
+
+def test_retake_out_of_range_matches_home_advisory_copy() -> None:
+    """The Home advisory hardcodes its own out-of-range line: a drift means
+    the picker and create-time enforcement disagree on the same error."""
+    advisor = (
+        Path(__file__).resolve().parents[2]
+        / "frontend"
+        / "ltx-io"
+        / "screens"
+        / "Feature"
+        / "definitions"
+        / "retake.ts"
+    )
+    assert SELECTION_OUT_OF_RANGE_MESSAGE in advisor.read_text(encoding="utf-8")
 
 
 def test_short_clip_keeps_the_full_source_and_splits_context() -> None:

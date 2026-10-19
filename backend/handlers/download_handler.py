@@ -6,9 +6,9 @@ import logging
 import shutil
 import time
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING
-from pathlib import Path
 from uuid import uuid4
 
 import requests as http_requests
@@ -25,15 +25,13 @@ from api_types import (
     ModelCheckpointID,
 )
 from handlers.base import StateHandlerBase, with_state_lock
+from handlers.checkpoint_files import commit_staged_checkpoint, stage_checkpoint
 from handlers.hf_auth_utils import optional_hf_token, require_hf_token
 from handlers.models_handler import ModelsHandler
 from runtime_config.model_download_specs import (
     ALL_MODEL_CP_IDS,
     get_model_cp_spec,
-    is_cp_downloaded,
     resolve_downloading_dir,
-    resolve_downloading_path,
-    resolve_downloading_target_path,
     resolve_model_path,
 )
 from services.interfaces import ModelDownloader, TaskRunner
@@ -215,72 +213,23 @@ class DownloadHandler(StateHandlerBase):
 
         raise ValueError(f"Unknown download session: {session_id}")
 
+    @property
+    def _staging_dir(self) -> Path:
+        return resolve_downloading_dir(self.models_dir)
+
     def cleanup_downloading_dir(self) -> None:
-        downloading_dir = resolve_downloading_dir(self.models_dir)
-        if downloading_dir.exists():
-            shutil.rmtree(downloading_dir)
+        if self._staging_dir.exists():
+            shutil.rmtree(self._staging_dir)
 
     def _download_to_staging(self, cp_id: ModelCheckpointID, hf_token: str | None) -> None:
-        spec = get_model_cp_spec(cp_id)
-        self.start_file(cp_id, spec.name)
-        progress_cb = self._make_progress_callback(cp_id)
-
-        resolve_downloading_dir(self.models_dir).mkdir(parents=True, exist_ok=True)
-
-        if spec.is_folder:
-            self._model_downloader.download_snapshot(
-                repo_id=spec.repo_id,
-                local_dir=str(resolve_downloading_path(self.models_dir, cp_id)),
-                on_progress=progress_cb,
-                token=hf_token,
-            )
-        else:
-            staging_root = resolve_downloading_dir(self.models_dir)
-            self._model_downloader.download_file(
-                repo_id=spec.repo_id,
-                filename=spec.download_filename,
-                local_dir=str(staging_root),
-                on_progress=progress_cb,
-                token=hf_token,
-            )
-            # Nested HF paths land under staging_root/<repo_filename> (e.g. vae/foo.safetensors
-            # for LTX 2.5); move to the spec's local relative_path before commit (e.g.
-            # ltx-2.5/foo.safetensors).
-            downloaded = staging_root / Path(spec.download_filename)
-            target = resolve_downloading_target_path(self.models_dir, cp_id)
-            if downloaded != target and downloaded.exists():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if target.exists():
-                    target.unlink()
-                downloaded.replace(target)
-                parent = downloaded.parent
-                while parent != staging_root and parent.exists() and not any(parent.iterdir()):
-                    parent.rmdir()
-                    parent = parent.parent
-
-    def _commit_staged_checkpoint(self, cp_id: ModelCheckpointID) -> bool:
-        src = resolve_downloading_target_path(self.models_dir, cp_id)
-        dst = resolve_model_path(self.models_dir, cp_id)
-        spec = get_model_cp_spec(cp_id)
-
-        if is_cp_downloaded(self.models_dir, cp_id):
-            if src.exists():
-                if spec.is_folder:
-                    shutil.rmtree(src)
-                else:
-                    src.unlink(missing_ok=True)
-            return False
-
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if spec.is_folder:
-            if dst.exists():
-                shutil.rmtree(dst)
-            src.rename(dst)
-        else:
-            if dst.exists():
-                dst.unlink()
-            src.rename(dst)
-        return True
+        self.start_file(cp_id, get_model_cp_spec(cp_id).name)
+        stage_checkpoint(
+            self._model_downloader,
+            self._staging_dir,
+            cp_id,
+            hf_token,
+            self._make_progress_callback(cp_id),
+        )
 
     def _rollback_committed_checkpoints(self, cp_ids: Iterable[ModelCheckpointID]) -> None:
         for cp_id in cp_ids:
@@ -322,7 +271,7 @@ class DownloadHandler(StateHandlerBase):
                 committed_cp_ids: list[ModelCheckpointID] = []
                 try:
                     for cp_id in cp_ids:
-                        if self._commit_staged_checkpoint(cp_id):
+                        if commit_staged_checkpoint(self.models_dir, self._staging_dir, cp_id):
                             committed_cp_ids.append(cp_id)
                 except Exception:
                     self._rollback_committed_checkpoints(committed_cp_ids)
@@ -331,7 +280,7 @@ class DownloadHandler(StateHandlerBase):
                 for cp_id in cp_ids:
                     logger.info("Downloading %s from %s", cp_id, get_model_cp_spec(cp_id).repo_id)
                     self._download_to_staging(cp_id, hf_token)
-                    self._commit_staged_checkpoint(cp_id)
+                    commit_staged_checkpoint(self.models_dir, self._staging_dir, cp_id)
         except Exception:
             self.cleanup_downloading_dir()
             raise

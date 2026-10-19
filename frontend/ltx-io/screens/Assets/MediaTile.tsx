@@ -1,6 +1,7 @@
 import { type ReactNode, useState } from "react";
 
 import type { ExploreListedAsset } from "@/lib/explore-contract";
+import { setAssetDragData } from "@/lib/asset-drag";
 import { useExploreRuntime } from "@/ltx-io/runtime/ExploreRuntime";
 
 import { AssetImageTile } from "./AssetImageTile";
@@ -67,6 +68,14 @@ export function MediaTile({
   return (
     <div
       className={styles.tile}
+      draggable={!isDeletePending}
+      onDragStart={(event) => {
+        if (isNestedInteractiveTarget(event.target, event.currentTarget)) {
+          event.preventDefault();
+          return;
+        }
+        setAssetDragData(event.dataTransfer, asset.id);
+      }}
       role="button"
       tabIndex={0}
       aria-label={`${labelVerb} ${asset.name}`}

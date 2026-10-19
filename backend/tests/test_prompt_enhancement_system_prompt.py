@@ -28,6 +28,7 @@ from services.prompt_enhancement import (
     render_catalog_item_block,
     resolve_i2v_frames,
 )
+from services.prompt_enhancement.i2v_frames import strip_panel_labels
 
 
 def _dl(filename: str = "x.safetensors") -> DownloadSpec:
@@ -111,9 +112,16 @@ def test_block_includes_enhancement_examples():
     assert "ex two" in block
 
 
+def test_examples_are_framed_as_style_targets_not_text_to_copy():
+    block = render_catalog_item_block(_lora(enhancement_examples=["ex one"]))
+    assert "Match their style and level of detail" in block
+    assert "Do not copy their wording" in block
+    assert block.index("Do not copy their wording") < block.index("ex one")
+
+
 def test_block_has_no_examples_section_when_none_given():
     lora = _lora()
-    assert "Additional examples" not in render_catalog_item_block(lora)
+    assert "Example prompts" not in render_catalog_item_block(lora)
 
 
 # ============================================================
@@ -163,6 +171,15 @@ def test_fill_prompt_template_substitutes_free_text_placeholders():
     )
     result = fill_prompt_template(spec, {"reference": "a grey rabbit", "result": "a brown rabbit"})
     assert result == "Reference shows a grey rabbit. COLORIZE a brown rabbit."
+
+
+def test_fill_prompt_template_does_not_double_the_period_after_a_value_that_ends_with_one():
+    spec = PromptTemplateSpec(
+        template="Reference sheet: {panels}. Generated video: {action}.",
+        placeholders={"panels": PromptTemplatePlaceholder(), "action": PromptTemplatePlaceholder()},
+    )
+    result = fill_prompt_template(spec, {"panels": "a dog; a ball.", "action": "the dog runs.."})
+    assert result == "Reference sheet: a dog; a ball. Generated video: the dog runs."
 
 
 def test_fill_prompt_template_degenerate_no_placeholders():
@@ -512,3 +529,14 @@ def test_resolve_i2v_frames_single_keyframe_includes_clock_when_fps_is_known():
     ) == [
         ("/opening.png", "Keyframe 1: frame 0 (0.00s), strength 1."),
     ]
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        ('{"panels": "Panel 1 of a golden dog; Panel 2 of a red ball"}', '{"panels": "a golden dog; a red ball"}'),
+        ('{"panels": "Panel 1 of 2: a golden dog; Panel 2 of 2: a red ball"}', '{"panels": "a golden dog; a red ball"}'),
+    ],
+)
+def test_strip_panel_labels_removes_labels_the_rewriter_copied_into_its_reply(reply: str, expected: str):
+    assert strip_panel_labels(reply) == expected

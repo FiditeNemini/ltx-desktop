@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import type { VideoGenerationModelSpecsResponse } from "../../../../lib/video-generation-model-specs.ts";
+import type { EditPreflightState } from "../../../lib/editPreflight.ts";
 import { resolveFeatureSeedValues } from "../types.ts";
 import { specFixture, specFixtureBothOfferings } from "./specFixture.ts";
 import {
@@ -295,5 +296,144 @@ describe("extend definition", () => {
       videoHeight: 720,
     }));
     assert.deepEqual(body.params.resolution, { width: 960, height: 540 });
+  });
+});
+
+describe("extend preflight", () => {
+  const dims = { videoWidth: 1920, videoHeight: 1080 };
+  const source = {
+    width: 1920,
+    height: 1080,
+    fps: 24,
+    frames: 481,
+    durationSeconds: 20,
+  };
+
+  function preflight(
+    cells: EditPreflightState["response"]["cells"],
+    budgetMode: "standard" | "reckless" = "standard",
+  ): EditPreflightState {
+    return {
+      assetId: "video-1",
+      response: { source, resolutions: [], cells, budgetMode },
+    };
+  }
+
+  function cell(
+    key: string,
+    duration: number,
+    ok: boolean,
+    message?: string,
+    tier?: "over" | "unmeasured",
+  ): EditPreflightState["response"]["cells"][number] {
+    return {
+      key,
+      duration,
+      ok,
+      message: message ?? null,
+      code: ok ? null : "VIDEO_JOB_TOO_LARGE",
+      tier: tier ?? null,
+    };
+  }
+
+  it("disables presets above the preflight max with the cell message", () => {
+    const form = extendDefinition.form(
+      values({ resolution: "original", duration: 4 }),
+      context({
+        ...dims,
+        preflight: preflight([
+          cell("original", 4, true),
+          cell("original", 6, true),
+          cell(
+            "original",
+            8,
+            false,
+            "Extend of 8s is too long for 1920x1056 on this machine (at most 6s).",
+          ),
+        ]),
+      }),
+    );
+    const duration = form.fields.find((field) => field.id === "duration");
+    assert.equal(duration?.kind, "options");
+    if (duration?.kind !== "options") return;
+    const byValue = new Map(
+      duration.options.map((option) => [option.value, option]),
+    );
+    assert.equal(byValue.get(4)?.disabledReason, undefined);
+    assert.equal(byValue.get(6)?.disabledReason, undefined);
+    assert.equal(
+      byValue.get(8)?.disabledReason,
+      "Extend of 8s is too long for 1920x1056 on this machine (at most 6s).",
+    );
+    // Missing cells are unknown, not failed.
+    assert.equal(byValue.get(10)?.disabledReason, undefined);
+    assert.equal(byValue.get(12)?.disabledReason, undefined);
+  });
+
+  it("falls back to the highest passing tier and largest passing preset", () => {
+    const state = preflight([
+      cell("original", 4, false, "Original is too large for this machine."),
+      cell("720p", 4, true),
+      cell("720p", 6, true),
+      cell("720p", 8, false, "too long"),
+      cell("720p", 10, false, "too long"),
+      cell("720p", 12, false, "too long"),
+      cell("540p", 4, true),
+    ]);
+    const normalized = extendDefinition.normalize(
+      values({ resolution: "original", duration: 12 }),
+      context({ ...dims, preflight: state }),
+    );
+    assert.equal(normalized.resolution, "720p");
+    assert.equal(normalized.duration, 6);
+  });
+
+  it("keeps a passing selection and keeps everything while unknown", () => {
+    const state = preflight([
+      cell("original", 4, false, "too large"),
+      cell("720p", 4, true),
+      cell("720p", 6, true),
+      cell("720p", 8, false, "too long"),
+      cell("720p", 10, false, "too long"),
+      cell("720p", 12, false, "too long"),
+    ]);
+    const passing = extendDefinition.normalize(
+      values({ resolution: "720p", duration: 6 }),
+      context({ ...dims, preflight: state }),
+    );
+    assert.equal(passing.resolution, "720p");
+    assert.equal(passing.duration, 6);
+
+    const unknown = extendDefinition.normalize(
+      values({ resolution: "original", duration: 12 }),
+      context(dims),
+    );
+    assert.equal(unknown.resolution, "original");
+    assert.equal(unknown.duration, 12);
+  });
+
+  it("does not snap a reckless over-budget preset off the selection", () => {
+    const state = preflight(
+      [
+        cell("original", 4, true),
+        cell("original", 6, true),
+        cell("original", 8, false, "over budget", "over"),
+        cell("original", 10, false, "no pipeline"),
+        cell("original", 12, false, "no pipeline"),
+      ],
+      "reckless",
+    );
+    const kept = extendDefinition.normalize(
+      values({ resolution: "original", duration: 8 }),
+      context({ ...dims, preflight: state }),
+    );
+    assert.equal(kept.resolution, "original");
+    assert.equal(kept.duration, 8);
+
+    const snapped = extendDefinition.normalize(
+      values({ resolution: "original", duration: 12 }),
+      context({ ...dims, preflight: state }),
+    );
+    assert.equal(snapped.duration, 8);
   });
 });

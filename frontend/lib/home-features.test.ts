@@ -5,7 +5,6 @@ import {
   getHomeFeature,
   HOME_FEATURE_SECTIONS,
   HOME_FEATURES,
-  isHomeFeatureEnabled,
   isHomeFeatureId,
   matchHomeFeature,
 } from './home-features.ts'
@@ -131,16 +130,14 @@ describe('home feature registry', () => {
 })
 
 describe('home feature sections', () => {
-  it('puts every enabled first-class feature in exactly one section', () => {
+  it('puts every first-class feature in exactly one section', () => {
     const sectioned = HOME_FEATURE_SECTIONS.flatMap((section) =>
       section.features.map((feature) => feature.id),
     )
     assert.equal(new Set(sectioned).size, sectioned.length)
     assert.deepEqual(
       [...sectioned].sort(),
-      FIRST_CLASS_HOME_FEATURES.map((feature) => feature.id)
-        .filter(isHomeFeatureEnabled)
-        .sort(),
+      FIRST_CLASS_HOME_FEATURES.map((feature) => feature.id).sort(),
     )
   })
 
@@ -152,7 +149,7 @@ describe('home feature sections', () => {
       ]),
       [
         ['Workflows', ['text-to-video', 'image-to-video', 'audio-to-video']],
-        ['VFX', ['layout-to-render', 'restore']],
+        ['VFX', ['alpha-gen', 'layout-to-render', 'restore', 'motion-track', 'video-guide']],
         [
           'Post production',
           [
@@ -164,8 +161,10 @@ describe('home feature sections', () => {
             'clean-plate',
             'decompression',
             'water-simulation',
+            'refine-details',
           ],
         ],
+        ['Marketing', ['ingredients']],
       ],
     )
   })

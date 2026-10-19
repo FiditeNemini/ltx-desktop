@@ -8,19 +8,36 @@ video-only denoising with frozen audio, returning original audio).
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import torch
 
 from services.audio_channels import stereo_waveform
-from services.ltx_pipeline_common import offload_mode_for_prefetch_count
 from services.services_utils import AudioOrNone, TilingConfigType
 
 if TYPE_CHECKING:
+    from ltx_core.conditioning import ConditioningItem
     from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
+    from ltx_core.types import Audio as LtxAudio
+    from ltx_pipelines.chunks import Chunk, ChunkConfig, DecodedChunk
     from ltx_pipelines.utils.model_paths import ModelPaths
     from ltx_pipelines.utils.types import ImageConditioningInput as LtxImageInput
+    from ltx_pipelines.utils.types import OffloadMode
+
+
+@dataclass(frozen=True)
+class _A2VInputs:
+    """What both run paths need after the prompt, the stills and the source audio are encoded."""
+
+    images: list[LtxImageInput]
+    generator: torch.Generator
+    noiser: Any
+    video_context: torch.Tensor
+    audio_context: torch.Tensor
+    decoded_audio: LtxAudio
+    encoded_audio_latent: torch.Tensor
+    audio_spec: Any
 
 
 class _ImageCrfResolver(Protocol):
@@ -84,6 +101,8 @@ class DistilledA2VPipeline:
         device: torch.device | None = None,
         quantization: Any | None = None,
         streaming_prefetch_count: int | None = None,
+        *,
+        offload_mode: OffloadMode,
     ) -> None:
         from ltx_pipelines.utils.blocks import (
             AudioConditioner,
@@ -100,7 +119,6 @@ class DistilledA2VPipeline:
 
         self.device = device
         self.dtype = torch.bfloat16
-        offload_mode = offload_mode_for_prefetch_count(streaming_prefetch_count, device)
 
         self.prompt_encoder = PromptEncoder(
             model_paths, self.dtype, device, offload_mode=offload_mode,
@@ -126,9 +144,9 @@ class DistilledA2VPipeline:
             model_paths.video_vae(), self.dtype, device,
         )
 
-    @torch.inference_mode()
-    def __call__(
+    def _prepare(
         self,
+        *,
         prompt: str,
         seed: int,
         height: int,
@@ -137,25 +155,22 @@ class DistilledA2VPipeline:
         frame_rate: float,
         images: list[tuple[str, int, float]],
         audio_path: str,
-        audio_start_time: float = 0.0,
-        audio_max_duration: float | None = None,
-        tiling_config: TilingConfigType | None = None,
-    ) -> tuple[Iterator[torch.Tensor], AudioOrNone]:
+        audio_start_time: float,
+        audio_max_duration: float | None,
+    ) -> _A2VInputs:
+        """Validate, encode the prompt, the stills and the source audio. Shared by both run paths."""
         from ltx_core.components.noisers import GaussianNoiser
         from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
-        from ltx_core.types import Audio, AudioLatentShape
-        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
-        from ltx_pipelines.utils.denoisers import SimpleDenoiser
-        from ltx_pipelines.utils.helpers import assert_resolution, create_initial_video_latent
+        from ltx_core.types import AudioLatentShape
+        from ltx_pipelines.utils.helpers import assert_resolution
         from ltx_pipelines.utils.media_io import decode_audio_from_file
-        from ltx_pipelines.utils.types import ModalitySpec, VideoAudio
+        from ltx_pipelines.utils.types import ModalitySpec
 
         assert_resolution(height=height, width=width, is_two_stage=True)
 
         ltx_images = resolve_image_conditionings(images, self.image_conditioner)
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
-        dtype = torch.bfloat16
 
         # Text encode (positive only).
         (ctx_p,) = self.prompt_encoder([prompt])
@@ -189,13 +204,61 @@ class DistilledA2VPipeline:
             frozen=True,
             noise_scale=0.0,
         )
+        return _A2VInputs(
+            images=ltx_images,
+            generator=generator,
+            noiser=noiser,
+            video_context=video_context,
+            audio_context=audio_context,
+            decoded_audio=decoded_audio,
+            encoded_audio_latent=encoded_audio_latent,
+            audio_spec=audio_spec,
+        )
+
+    @torch.inference_mode()
+    def __call__(
+        self,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        images: list[tuple[str, int, float]],
+        audio_path: str,
+        audio_start_time: float = 0.0,
+        audio_max_duration: float | None = None,
+        tiling_config: TilingConfigType | None = None,
+    ) -> tuple[Iterator[torch.Tensor], AudioOrNone]:
+        from ltx_core.types import Audio
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
+        from ltx_pipelines.utils.denoisers import SimpleDenoiser
+        from ltx_pipelines.utils.helpers import create_initial_video_latent
+        from ltx_pipelines.utils.types import ModalitySpec, VideoAudio
+
+        run = self._prepare(
+            prompt=prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            images=images,
+            audio_path=audio_path,
+            audio_start_time=audio_start_time,
+            audio_max_duration=audio_max_duration,
+        )
+        dtype = torch.bfloat16
+        video_context, audio_context = run.video_context, run.audio_context
+        decoded_audio = run.decoded_audio
+        audio_spec = run.audio_spec
 
         # Stage 1: Half-resolution video generation with frozen audio.
         stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
         stage_1_w, stage_1_h = width // 2, height // 2
         stage_1_conditionings = self.image_conditioner(
             lambda enc: encode_stage_image_conditionings(
-                ltx_images,
+                run.images,
                 height=stage_1_h,
                 width=stage_1_w,
                 video_encoder=enc,
@@ -217,7 +280,7 @@ class DistilledA2VPipeline:
         video_state, _ = self.stage(
             denoiser=SimpleDenoiser(video_context, audio_context),
             sigmas=stage_1_sigmas,
-            noiser=noiser,
+            noiser=run.noiser,
             modalities=VideoAudio(
                 video=ModalitySpec(
                     latent=stage_1_video_latent,
@@ -237,7 +300,7 @@ class DistilledA2VPipeline:
         stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
         stage_2_conditionings = self.image_conditioner(
             lambda enc: encode_stage_image_conditionings(
-                ltx_images,
+                run.images,
                 height=height,
                 width=width,
                 video_encoder=enc,
@@ -249,7 +312,7 @@ class DistilledA2VPipeline:
         video_state, _ = self.stage(
             denoiser=SimpleDenoiser(video_context, audio_context),
             sigmas=stage_2_sigmas,
-            noiser=noiser,
+            noiser=run.noiser,
             modalities=VideoAudio(
                 video=ModalitySpec(
                     latent=upscaled_video_latent,
@@ -264,7 +327,7 @@ class DistilledA2VPipeline:
 
         # Decode video; return original audio (not VAE-decoded) for fidelity.
         assert video_state is not None
-        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
+        decoded_video = self.video_decoder(video_state.latent, tiling_config, run.generator)
 
         # Trim waveform to target video duration so the muxed output doesn't
         # extend beyond the generated video frames.
@@ -273,3 +336,102 @@ class DistilledA2VPipeline:
         original_audio = Audio(waveform=trimmed_waveform, sampling_rate=decoded_audio.sampling_rate)
 
         return decoded_video, original_audio
+
+    @torch.inference_mode()
+    def stream_chunks(
+        self,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        images: list[tuple[str, int, float]],
+        audio_path: str,
+        chunk_config: ChunkConfig,
+        audio_start_time: float = 0.0,
+        audio_max_duration: float | None = None,
+        tiling_config: TilingConfigType | None = None,
+    ) -> Iterator[DecodedChunk]:
+        """The same two stages in overlapping temporal windows, as ``a2vid_two_stage`` does it.
+
+        Each window takes its slice of the frozen source audio. The decoded windows carry
+        the matching slice of the original waveform, so the stitched track stays contiguous.
+        """
+        from ltx_core.types import Audio, VideoPixelShape
+        from ltx_pipelines.chunks import (
+            decode_chunks,
+            denoise_chunks,
+            generate_uniform_chunks,
+            replace_chunks_audio,
+            spatially_upsample_chunks,
+        )
+        from ltx_pipelines.chunks.conditionings import (
+            assert_image_frames_in_clip,
+            image_conditionings_for_chunk,
+            images_for_chunk,
+        )
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
+        from ltx_pipelines.utils.types import VideoAudio
+
+        run = self._prepare(
+            prompt=prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            images=images,
+            audio_path=audio_path,
+            audio_start_time=audio_start_time,
+            audio_max_duration=audio_max_duration,
+        )
+        assert_image_frames_in_clip(run.images, num_frames)
+
+        def make_video_conditionings(chunk: Chunk) -> list[ConditioningItem]:
+            if chunk.video is None or not images_for_chunk(chunk, run.images):
+                return []
+            return self.image_conditioner(
+                lambda enc: image_conditionings_for_chunk(
+                    chunk, images=run.images, video_encoder=enc, color_space=None
+                )
+            )
+
+        chunks = generate_uniform_chunks(
+            target=VideoPixelShape(
+                batch=1, frames=num_frames, height=height // 2, width=width // 2, fps=frame_rate
+            ),
+            context=VideoAudio(video=run.video_context, audio=run.audio_context),
+            device=self.device,
+            dtype=torch.bfloat16,
+            config=chunk_config,
+            video_scale_factors=self.stage.video_scale_factors,
+            audio_latent=run.encoded_audio_latent,
+            make_video_conditionings=make_video_conditionings,
+        )
+        stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
+        stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+        base = denoise_chunks(
+            chunks, self.stage, sigmas=stage_1_sigmas, noiser=run.noiser, fps=frame_rate, freeze_audio=True
+        )
+        refined = denoise_chunks(
+            spatially_upsample_chunks(base, self.upsampler),
+            self.stage,
+            sigmas=stage_2_sigmas,
+            noiser=run.noiser,
+            fps=frame_rate,
+            freeze_audio=True,
+        )
+        decoded = decode_chunks(
+            refined,
+            self.video_decoder,
+            audio_decoder=None,
+            fps=frame_rate,
+            tiling_config=tiling_config,
+            generator=run.generator,
+            dtype=torch.bfloat16,
+        )
+        source = Audio(
+            waveform=run.decoded_audio.waveform.squeeze(0), sampling_rate=run.decoded_audio.sampling_rate
+        )
+        return replace_chunks_audio(decoded, source, frame_rate)

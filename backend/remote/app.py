@@ -19,6 +19,7 @@ from starlette.responses import Response as StarletteResponse
 
 from _routes._errors import HTTPError, build_http_error_response
 from _routes.assets import phone_assets_router
+from _routes.assistant import phone_assistant_router
 from _routes.feature_flags import router as feature_flags_router
 from _routes.generation_seed import phone_generation_seed_router
 from _routes.stats import phone_stats_router
@@ -33,6 +34,7 @@ from remote.net import lan_ip, remote_port
 from remote.pairing import ExchangeRequest, PairingError, RemotePairing
 from remote.prompt_enhancement import router as prompt_enhancement_router
 from remote.redact import RedactingJSONResponse
+from security_headers import install_security_headers
 from state import get_state_service
 
 _BYTES_PATH = re.compile(r"^/api/assets/([^/]+)/(?:thumbnail/)?bytes$")
@@ -210,7 +212,8 @@ def create_remote_app(
         request.state.paired_device = device
         return await call_next(request)
 
-    install_http_exception_handlers(app)
+    install_http_exception_handlers(app, expose_unhandled_details=False)
+    install_security_headers(app)
 
     @app.get("/health", response_model=_RemoteHealthResponse)
     def route_health() -> _RemoteHealthResponse:  # pyright: ignore[reportUnusedFunction]
@@ -244,6 +247,7 @@ def create_remote_app(
     app.include_router(hf_auth_router)
     app.include_router(feature_flags_router)
     app.include_router(prompt_enhancement_router)
+    app.include_router(phone_assistant_router)
 
     if client_dir is not None and client_dir.is_dir() and (client_dir / "index.html").is_file():
         app.mount("/", SpaStaticFiles(directory=str(client_dir), html=True), name="remote-client")

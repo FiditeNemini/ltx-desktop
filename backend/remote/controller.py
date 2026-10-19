@@ -199,6 +199,8 @@ class RemoteExposureController:
             log_level="info",
             access_log=False,
             log_config=log_config,
+            # Long-lived assistant streams would otherwise keep Remote serving after it is turned off.
+            timeout_graceful_shutdown=2,
         )
         server = uvicorn.Server(config)
         thread = threading.Thread(

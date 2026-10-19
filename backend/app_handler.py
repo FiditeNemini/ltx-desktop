@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +37,12 @@ from handlers import (
 from handlers.dashboard_handler import DashboardHandler
 from handlers.queued_generation_handler import QueuedGenerationHandler
 from runtime_config.offerings import OFFERING_IDS, resolve_offering_local_model_id
+from handlers.assistant_handler import AssistantHandler
+from services.assistant_provider import AssistantProvider, DesktopAssistantProvider
+from services.assistant_models import LocalAssistantModels, FileAssistantModels
+from services.llama_runtime import LlamaRuntime
+from handlers.base import resolve_models_dir
+from handlers.assistant_models_handler import AssistantModelsHandler
 from runtime_config.runtime_config import RuntimeConfig
 from services.interfaces import (
     A2VPipeline,
@@ -68,6 +76,7 @@ from services.features.video import (
     FEATURE as TEXT_TO_VIDEO_FEATURE,
     IMAGE_TO_VIDEO_FEATURE,
     RETAKE_FEATURE,
+    SYNTHESIZED_IC_LORA_EXECUTORS,
     AudioToVideoExecutor,
     IcLoraRecipeExecutor,
     ExtendExecutor,
@@ -117,6 +126,8 @@ class AppHandler:
         prompt_enhancer_pipeline_class: type[PromptEnhancerPipeline],
         store: Store,
         generation_executors: Mapping[str, GenerationExecutor] | None = None,
+        assistant_provider: AssistantProvider | None = None,
+        assistant_models: LocalAssistantModels | None = None,
     ) -> None:
         self.config = config
 
@@ -159,6 +170,10 @@ class AppHandler:
         # Handlers (wired in dependency order)
         # ============================================================
 
+        self.assistant_runtime = LlamaRuntime(config.app_data_dir)
+        local_assistant_models = assistant_models or FileAssistantModels(
+            lambda: resolve_models_dir(self.state, config), model_downloader, self.assistant_runtime,
+        )
         self.settings = SettingsHandler(
             state=self.state,
             lock=self._lock,
@@ -195,6 +210,8 @@ class AppHandler:
             model_downloader=model_downloader,
             task_runner=task_runner,
             config=config,
+            gpu_info=gpu_info,
+            high_res_enabled=self._high_res_video_to_video_enabled,
         )
 
         self.text = TextHandler(
@@ -215,10 +232,40 @@ class AppHandler:
             pose_processor_pipeline_class=pose_processor_pipeline_class,
             a2v_pipeline_class=a2v_pipeline_class,
             retake_pipeline_class=retake_pipeline_class,
+            high_res_enabled=self._high_res_video_to_video_enabled,
             config=config,
+            gpu_info=gpu_info,
         )
 
         self.generation = GenerationHandler(state=self.state, lock=self._lock, config=config)
+        self.assistant_models = AssistantModelsHandler(
+            state=self.state, lock=self._lock, models=local_assistant_models,
+            task_runner=task_runner, generation=self.generation,
+        )
+
+        @asynccontextmanager
+        async def assistant_gpu_session() -> AsyncIterator[None]:
+            # Waits for the running video only; queued videos start after this step.
+            with self.generation.queue_yields():
+                while not self.generation.try_reserve_generation_start(persistent=True):
+                    await asyncio.sleep(0.25)
+            try:
+                eviction = asyncio.ensure_future(asyncio.to_thread(self.pipelines.evict_resident_pipeline))
+                try:
+                    await asyncio.shield(eviction)
+                except asyncio.CancelledError:
+                    # The eviction thread cannot be cancelled; keep the GPU until it finishes.
+                    await asyncio.gather(eviction, return_exceptions=True)
+                    raise
+                yield
+            finally:
+                self.generation.release_generation_start_reservation()
+
+        self._assistant_provider = assistant_provider or DesktopAssistantProvider(
+            self.assistant_runtime, local_assistant_models.path,
+            projector_path=local_assistant_models.projector_path,
+            reserve_generation=assistant_gpu_session,
+        )
 
         # Before video generation: local text encoding has no server-side rewrite step, so the
         # generation path runs this enhancer itself.
@@ -243,6 +290,7 @@ class AppHandler:
             prompt_enhancement_handler=self.prompt_enhancement,
             ltx_api_client=ltx_api_client,
             config=config,
+            gpu_info=gpu_info,
         )
 
         self._lora_catalog_provider = lora_catalog_provider
@@ -256,6 +304,8 @@ class AppHandler:
             video_processor=video_processor,
             lora_catalog=lora_catalog_provider,
             config=config,
+            gpu_info=gpu_info,
+            high_res_enabled=self._high_res_video_to_video_enabled,
         )
         self._queued_asset_resolver: RebindableAssetResolver | None = None
         if generation_executors is None:
@@ -300,6 +350,7 @@ class AppHandler:
                 lambda: self.video_generation.models_dir,
                 config.default_negative_prompt,
                 self.generation,
+                self.prompt_enhancement,
             )
             executors[EXTEND_FEATURE] = ExtendExecutor(
                 self.pipelines,
@@ -308,14 +359,25 @@ class AppHandler:
                 lambda: self.video_generation.models_dir,
                 config.default_negative_prompt,
                 self.generation,
+                self.prompt_enhancement,
             )
             for recipe in queued_ic_lora_recipes():
+                if recipe.kind != "video":
+                    executors[recipe.recipe_id] = SYNTHESIZED_IC_LORA_EXECUTORS[recipe.kind](
+                        self.ic_lora,
+                        self._queued_asset_resolver,
+                        lambda: self.video_generation.models_dir,
+                        recipe=recipe,
+                    )
+                    continue
                 executors[recipe.recipe_id] = IcLoraRecipeExecutor(
                     self.ic_lora,
                     self._queued_asset_resolver,
                     lambda: self.video_generation.models_dir,
                     catalog_id=recipe.catalog_id,
                     cutout=recipe.cutout,
+                    upscales_to_cell=recipe.upscales_to_cell,
+                    high_res_enabled=self._high_res_video_to_video_enabled,
                 )
             self.executor_registry = ExecutorRegistry(executors)
         else:
@@ -376,6 +438,9 @@ class AppHandler:
     def load_persistent_state(self, default_settings: AppSettings) -> None:
         """Load persisted state from disk (settings, HF auth token, etc.)."""
         self.settings.load_settings(default_settings)
+        self.generation_queue.set_checkpoint_drive_type(
+            self.settings.refresh_checkpoint_drive_type()
+        )
         self.hf_auth.load_token()
         try:
             self.queued_generations.recover_on_boot()
@@ -407,7 +472,11 @@ class AppHandler:
             local_enhancer_available=(
                 self.text.resolve_prompt_enhancer_root_if_downloaded(model_id) is not None
             ),
+            gemini_video_enhance=self.prompt_enhancement.gemini_video_enhance_enabled(),
         )
+
+    def _high_res_video_to_video_enabled(self) -> bool:
+        return self.feature_flags.get_flags().highResVideoToVideo
 
     def _bind_store(self, store: Store) -> None:
         if self._queued_asset_resolver is not None:
@@ -418,6 +487,8 @@ class AppHandler:
             executors=self.executor_registry,
             analytics=self.analytics,
             enhancement_policy=self._queued_enhancement_policy,
+            gpu_info=self.gpu_info,
+            checkpoint_drive_type=self.config.checkpoint_drive_type,
         )
         self.assets = AssetHandler(
             store=store,
@@ -432,11 +503,29 @@ class AppHandler:
             lora_catalog_provider=self._lora_catalog_provider,
             state=self.state,
             lock=self._lock,
+            preflight_queued_fast=self.video_generation.preflight_queued_fast_job,
+            preflight_queued_a2v=self.video_generation.preflight_queued_a2v_job,
+            preflight_queued_edit=self.pipelines.preflight_queued_edit_job,
+            preflight_edit_matrix=self.pipelines.preflight_edit_matrix,
+            preflight_queued_ic_lora_recipe=self.ic_lora.preflight_queued_recipe_job,
+            preflight_queued_synthesized_ic_lora=self.ic_lora.preflight_queued_synthesized_job,
+            high_res_enabled=self._high_res_video_to_video_enabled,
         )
-        self.generation_queue.set_finished_listener(
-            self.queued_generations.remember_finished
+        self.assistant = AssistantHandler(
+            state=self.state, lock=self._lock, provider=self._assistant_provider, store=store,
+            generations=self.queued_generations, model_specs=self.video_generation.get_model_specs,
+            assets=self.assets, loras=self.catalog.list_loras, ic_loras=self.catalog.list_ic_loras,
+            local_supported=self.config.local_generations_mode != "unsupported",
+            require_local_model=self.assistant_models.require_installed,
+            save_settings=self.settings.save_settings,
         )
         self.dashboard = DashboardHandler(store, self._lora_catalog_provider)
+
+        def generation_finished(generation_id: str) -> None:
+            self.queued_generations.remember_finished(generation_id)
+            self.assistant.generation_finished(generation_id)
+
+        self.generation_queue.set_finished_listener(generation_finished)
 
 
 @dataclass
@@ -461,6 +550,8 @@ class ServiceBundle:
     prompt_enhancer_pipeline_class: type[PromptEnhancerPipeline]
     store: Store
     generation_executors: Mapping[str, GenerationExecutor] | None = None
+    assistant_provider: AssistantProvider | None = None
+    assistant_models: LocalAssistantModels | None = None
 
 
 def build_default_service_bundle(config: RuntimeConfig) -> ServiceBundle:
@@ -557,4 +648,6 @@ def build_initial_state(
         prompt_enhancer_pipeline_class=bundle.prompt_enhancer_pipeline_class,
         store=bundle.store,
         generation_executors=bundle.generation_executors,
+        assistant_provider=bundle.assistant_provider,
+        assistant_models=bundle.assistant_models,
     )

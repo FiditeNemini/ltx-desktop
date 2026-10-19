@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Protocol
 
@@ -18,6 +18,8 @@ from services.features.video.job_common import (
     model_from_spec,
     require_existing_asset,
     resolve_job_local_model_id,
+    spec_risk_allowance,
+    spec_unmeasured_bet,
 )
 from services.features.video.text_to_video import (
     ReservedVideoGenerator,
@@ -27,8 +29,9 @@ from services.features.video.text_to_video import (
     require_supported_contract_version,
 )
 from runtime_config.model_download_specs import local_aspect_ratios
+from services.aspect_ratio import find_closest_aspect_ratio_option
 from services.generation_interrupt import GenerationCancelledError, is_cancel_exception
-from services.generation_queue.types import OutputAllocation, OutputPlan
+from services.generation_queue.types import ExecutionOutcome, OutputAllocation, OutputPlan
 from services.records import AssetRecord, GenerationRecord
 
 FEATURE = "image-to-video"
@@ -82,7 +85,7 @@ class ImageToVideoExecutor:
         self,
         generation: GenerationRecord,
         outputs: tuple[OutputAllocation, ...],
-    ) -> None:
+    ) -> ExecutionOutcome:
         self.validate_params(
             generation.spec, contract_version=generation.contract_version
         )
@@ -115,6 +118,8 @@ class ImageToVideoExecutor:
                 local_model_id=resolve_job_local_model_id(
                     self._video_generation.models_dir, offering
                 ),
+                risk_allowance=spec_risk_allowance(generation.spec),
+                unmeasured_bet=spec_unmeasured_bet(generation.spec),
             )
         except Exception as exc:
             if is_cancel_exception(exc):
@@ -126,6 +131,7 @@ class ImageToVideoExecutor:
             raise
         if isinstance(result, GenerateVideoCancelledResponse):
             raise GenerationCancelledError()
+        return ExecutionOutcome(load_mode=result.load_mode, offload_mode=result.offload_mode)
 
     def _params_from_spec(
         self, spec: Mapping[str, object]
@@ -141,41 +147,6 @@ class ImageToVideoExecutor:
             media_kind="image",
             unavailable=f"{slot} image is no longer available",
         )
-
-
-def find_closest_aspect_ratio_option(
-    width: int, height: int, options: Sequence[str]
-) -> str:
-    if height <= 0:
-        raise ValueError("startFrame height must be greater than 0")
-    target = width / height
-    closest: str | None = None
-    closest_diff = float("inf")
-    for option in options:
-        ratio = parse_aspect_ratio(option)
-        if ratio is None:
-            continue
-        diff = abs(ratio - target)
-        if diff < closest_diff:
-            closest_diff = diff
-            closest = option
-    if closest is None:
-        raise ValueError("no valid aspect ratio options")
-    return closest
-
-
-def parse_aspect_ratio(option: str) -> float | None:
-    parts = option.split(":")
-    if len(parts) != 2:
-        return None
-    try:
-        option_width = float(parts[0])
-        option_height = float(parts[1])
-    except ValueError:
-        return None
-    if option_width <= 0 or option_height <= 0:
-        return None
-    return option_width / option_height
 
 
 def _resolve_aspect_ratio(

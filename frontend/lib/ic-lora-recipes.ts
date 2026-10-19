@@ -8,6 +8,7 @@ import {
   RESTORE_IMAGE_SEED_FILENAME,
   RESTORE_IMAGE_SEED_PREVIOUS_FILENAMES,
   RESTORE_IMAGE_SEED_REVISION,
+  VIDEO_GUIDE_IMAGE_SEED,
 } from "../../shared/explore-seed-filenames.ts";
 
 type SeedIdOf<Kind> = Kind extends `${infer Id}-video` ? Id : never;
@@ -25,8 +26,17 @@ function icLoraSeed<const Id extends IcLoraSeedId>(id: Id, revision = 1) {
   };
 }
 
+/** The most images an image-list recipe takes. The catalog `input.max_count` is the same number. */
+export const IC_LORA_SHEET_MAX_IMAGES = 10;
+
 /** The Home section that lists a recipe. A row without a valid section fails typecheck. */
-export type IcLoraRecipeSection = "post-production" | "vfx";
+export type IcLoraRecipeSection = "post-production" | "vfx" | "marketing";
+
+/**
+ * What a recipe takes as input: one clip (`video`), a list of images that join into one
+ * sheet (`sheet`), or one image with a path drawn on it (`track`).
+ */
+export type IcLoraRecipeKind = "video" | "sheet" | "track";
 
 /** Form controls a recipe fixes to its catalog defaults instead of showing. */
 export type IcLoraRecipeHiddenField = "prompt" | "audioMode" | "loraStrength";
@@ -36,13 +46,15 @@ export type IcLoraRecipeHiddenField = "prompt" | "audioMode" | "loraStrength";
  * `referenceImage` adds an image input. Whether the image is required comes from the
  * catalog `reference_image_required`, not from this table. `seed` is the packaged
  * default image, or null when the form starts with no image (an optional image has none).
- * shared/ic-lora-recipes.json pins id and catalogId. This table adds the copy,
+ * shared/ic-lora-recipes.json pins id, catalogId and kind. This table adds the copy,
  * the packaged reference clip, and the details listing. Style strength and
- * audio mode stay in the catalog default_settings.
+ * audio mode stay in the catalog default_settings. A sheet or track row sets its own
+ * Home defaults (`homeDefaults`), so GenSpace keeps the catalog value.
  */
 export const IC_LORA_RECIPES = [
   {
     id: "day-to-night",
+    kind: "video",
     catalogId: "day-to-night",
     path: paths.dayToNight,
     title: "Day to Night",
@@ -65,6 +77,7 @@ export const IC_LORA_RECIPES = [
   },
   {
     id: "alpha-gen",
+    kind: "video",
     catalogId: "alpha-gen",
     path: paths.alphaGen,
     title: "AlphaGen",
@@ -89,6 +102,7 @@ export const IC_LORA_RECIPES = [
   },
   {
     id: "deblur",
+    kind: "video",
     catalogId: "deblur",
     path: paths.deblur,
     title: "Deblur",
@@ -111,6 +125,7 @@ export const IC_LORA_RECIPES = [
   },
   {
     id: "colorization",
+    kind: "video",
     catalogId: "colorization",
     path: paths.colorization,
     title: "Colorization",
@@ -133,6 +148,7 @@ export const IC_LORA_RECIPES = [
   },
   {
     id: "clean-plate",
+    kind: "video",
     catalogId: "clean-plate",
     path: paths.cleanPlate,
     title: "Clean Plate",
@@ -155,6 +171,7 @@ export const IC_LORA_RECIPES = [
   },
   {
     id: "decompression",
+    kind: "video",
     catalogId: "decompression",
     path: paths.decompression,
     title: "Decompression",
@@ -177,6 +194,7 @@ export const IC_LORA_RECIPES = [
   },
   {
     id: "water-simulation",
+    kind: "video",
     catalogId: "water-simulation",
     path: paths.waterSimulation,
     title: "Water Simulation",
@@ -199,6 +217,7 @@ export const IC_LORA_RECIPES = [
   },
   {
     id: "layout-to-render",
+    kind: "video",
     catalogId: "layout-to-render",
     path: paths.layoutToRender,
     title: "Layout to Render",
@@ -232,6 +251,7 @@ export const IC_LORA_RECIPES = [
   },
   {
     id: "restore",
+    kind: "video",
     catalogId: "restore",
     path: paths.restore,
     title: "Restore",
@@ -268,12 +288,136 @@ export const IC_LORA_RECIPES = [
         "https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Restore",
     },
   },
+  {
+    id: "ingredients",
+    // The input is a list of images, not a clip. The backend joins them into one sheet.
+    kind: "sheet",
+    catalogId: "ingredients",
+    path: paths.ingredients,
+    title: "Ingredients",
+    description: `Combine up to ${IC_LORA_SHEET_MAX_IMAGES} images into one video.`,
+    // The catalog prompt template: panels first, then the action. It describes the packaged sheet.
+    demoPrompt:
+      "Reference sheet: Top Row Left (Character): A 3D animated orange fox with white fur on its snout, belly, and tail tip, large expressive brown eyes, and dark paws. It wears a small green neckerchief and is shown from multiple turnaround angles including front close-up, front full body, side, and back views. Top Row Right (Prop): A fishing rod with a cork handle, a spinning reel, a thin green fiberglass pole with metal eyelets, and a fishing line ending in a metal hook. Bottom Row Left (Setting): A serene outdoor park with a calm lake, a small wooden dock, lush green grass, leafy trees, and lily pads under a bright sunny sky with soft clouds. Bottom Row Right (Prop): A glossy bright red rain boot with pull loops at the top and a thick black grooved rubber sole, with water droplets scattered on its surface. Generated video: A bright, high-quality 3D animated scene set beside a serene, sunlit lake in a lush park. The camera frames a steady medium shot of the orange fox standing on the grassy bank near the water's edge, wearing its small green neckerchief and the bright red rain boot on one foot while holding the fishing rod with both paws. The fox stands facing the calm lake, holding the cork handle of the fishing rod, intently watching the water's surface as the fishing line dips near some lily pads. Suddenly, the fox's eyes widen in surprise as the rod bends sharply, indicating a heavy catch. With an eager and determined expression, the fox pulls the fishing rod upward with all its might, straining slightly. Breaking the surface of the water, it hoists up the glossy bright red rain boot attached to the hook, water droplets splashing around it. The fox blinks in sheer disbelief, staring at the boot dangling from the line. A playful, mischievous grin spreads across the fox's face, and it tosses its head back, opening its mouth wide in a burst of hearty, joyous laughter. The warm afternoon sunlight casts soft shadows across the grassy landscape, highlighting the shimmering ripples on the lake and the vibrant colors of the scene.",
+    placeholder: "Describe the scene that uses your images...",
+    hiddenFields: [],
+    cutout: false,
+    // The Home defaults. The split is on purpose: the shared catalog default (1) is the GenSpace
+    // value and stays. The Home form always sends this strength as `scale`. A direct API call
+    // without `scale` gets the catalog value. 5 s at 24 fps is 121 frames, the trained length.
+    homeDefaults: { loraStrength: 1.35, fps: 24, seconds: 5 },
+    section: "marketing",
+    listing: {
+      // The ltx.io info dialog text.
+      blurb:
+        `Upload up to ${IC_LORA_SHEET_MAX_IMAGES} reference images (characters, props, locations). At generate time they are stitched into an Ingredients sheet that drives a short clip.`,
+      categories: "Marketing",
+      typeLabel: "Image to Video",
+      huggingfaceUrl:
+        "https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Ingredients",
+    },
+  },
+  {
+    id: "refine-details",
+    kind: "video",
+    catalogId: "refine-details",
+    path: paths.refineDetails,
+    title: "Refine Details",
+    description: "Rebuild fine detail in a soft or upscaled clip.",
+    // The first example prompt of the model card. It describes the rendering, not the subject.
+    demoPrompt:
+      "Locked-off wide shot of a clear mountain stream running over mossy granite boulders under a beech forest canopy, thousands of individual leaves, sunlight dappled evenly across the scene, water sparkling with fine ripples, ferns and lichen in the foreground, deep focus, tack sharp everywhere, nature documentary, photoreal, 8K, sharp photographic detail, crisp faces and clothing texture, natural grain, high resolution footage",
+    placeholder: "Describe the sharpness, texture and light...",
+    hiddenFields: [],
+    cutout: false,
+    // The clip is scaled up to the cell with Lanczos. The clip size and the sizes above it are offered.
+    upscalesSource: "source-and-above",
+    // No local run has been measured. The recipe is offered only with `highResVideoToVideo`.
+    requiresHighRes: true,
+    section: "post-production",
+    seed: icLoraSeed("refine-details"),
+    listing: {
+      blurb:
+        "Add fine detail to a soft, compressed or upscaled clip. Texture, edges and grain come back, and the framing, the exposure and the colour stay the same. Raise the size up to 4K in one pass, for example from 1080p web video.",
+      categories: "Post production",
+      typeLabel: "Refine Details",
+      huggingfaceUrl:
+        "https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Refine-Details",
+    },
+  },
+  {
+    id: "motion-track",
+    // The input is one image and a path drawn on it. The backend draws the control clip.
+    kind: "track",
+    catalogId: "motion-track",
+    path: paths.motionTrack,
+    title: "Motion Track Control",
+    description:
+      "Draw paths on a reference image to guide how objects and the camera move through the scene.",
+    // The ltx.io seed. The backend wraps it with the camera lock, so it names the scene only.
+    demoPrompt:
+      "The conductor frog smoothly but forcefully moves his baton-holding arm and hand along the provided motion track, precisely following the path from point to point. The shoulder, elbow, wrist, hand, and baton move together naturally in a powerful, commanding conducting gesture. He maintains a firm grip on the baton throughout. Sharp, energetic movements with controlled acceleration and natural joint articulation. The frog's body reacts subtly to the intensity of the conducting. The orchestra remains visually stable. Audio: violent, aggressive orchestral music with pounding percussion",
+    placeholder: "Describe the scene — object motion follows the tracks and trajectories you set.",
+    hiddenFields: [],
+    cutout: false,
+    // The Home defaults. 5 s at 24 fps, as the ltx.io form starts.
+    homeDefaults: { loraStrength: 1, fps: 24, seconds: 5 },
+    section: "vfx",
+    listing: {
+      blurb:
+        "Draw paths on a reference image to guide how objects and the camera move through the scene.",
+      categories: "VFX, Animation",
+      typeLabel: "IC-LoRA",
+      baseModel: "ltx-2.3",
+      // Only the LTX-2.3 file is published. It also runs on LTX-2.5, as on ltx.io.
+      huggingfaceUrl:
+        "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control",
+    },
+  },
+  {
+    id: "video-guide",
+    kind: "video",
+    catalogId: "video-guide",
+    path: paths.videoGuide,
+    title: "Video Guide",
+    description:
+      "Direct your generation with visual guide video like pose, depth, or canny, and a start frame.",
+    // ltx.io has no seed prompt for Video Guide. This text describes the start frame and the
+    // packaged pose clip, in the order of the catalog prompt template (scene, action, camera).
+    demoPrompt:
+      "A 3D animated lioness in a plush purple fur coat sits at a wooden table in a cozy cafe, with a purple textured wall, a framed picture, a tall palm plant and two iced drinks behind her. She rests her chin on her gloved hand and glances to the side with a gentle smile. Then she sits up, turns to the camera and speaks with lively, expressive hand gestures, her ears and eyes animated. The camera holds a steady medium shot at eye level.",
+    placeholder: "Describe your scene based on your image and reference video.",
+    hiddenFields: [],
+    cutout: false,
+    // The form picks how the guide clip is read: pose, depth or Canny edges.
+    controlMode: true,
+    // An optional start frame. The form opens with the start frame.
+    referenceImage: { label: "Start Frame", seed: VIDEO_GUIDE_IMAGE_SEED },
+    section: "vfx",
+    seed: icLoraSeed("video-guide", 2),
+    listing: {
+      blurb:
+        "Direct your generation with visual guides. Combine pose, depth, and edge references in a single model to control movement and composition while keeping full creative freedom over style.",
+      categories: "VFX, Animation",
+      typeLabel: "IC-LoRA",
+      baseModel: "ltx-2.3",
+      // Only the LTX-2.3 file is published. It also runs on LTX-2.5, as on ltx.io.
+      huggingfaceUrl:
+        "https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control",
+    },
+  },
 ] as const satisfies readonly {
+  readonly kind: IcLoraRecipeKind;
   readonly section: IcLoraRecipeSection;
   readonly [key: string]: unknown;
 }[];
 
 export type IcLoraRecipeId = (typeof IC_LORA_RECIPES)[number]["id"];
+/** The recipes with an image list as input. The other recipes take one clip. */
+export type IcLoraSheetRecipeId = IcLoraSheetRecipe["id"];
+/** The recipes with an image and a path as input. */
+export type IcLoraTrackRecipeId = IcLoraTrackRecipe["id"];
+export type IcLoraVideoRecipeId = Exclude<IcLoraRecipeId, IcLoraSheetRecipeId | IcLoraTrackRecipeId>;
 /** An image input of a recipe. A row without one omits `referenceImage`. */
 export interface IcLoraReferenceImage {
   readonly label: string;
@@ -287,14 +431,39 @@ export interface IcLoraReferenceImage {
   } | null;
 }
 
-export type IcLoraRecipe = (typeof IC_LORA_RECIPES)[number] & {
+export type IcLoraSheetRecipe = Extract<
+  (typeof IC_LORA_RECIPES)[number],
+  { readonly kind: "sheet" }
+>;
+
+export type IcLoraTrackRecipe = Extract<
+  (typeof IC_LORA_RECIPES)[number],
+  { readonly kind: "track" }
+>;
+
+export type IcLoraRecipe = Exclude<
+  (typeof IC_LORA_RECIPES)[number],
+  { readonly kind: "sheet" | "track" }
+> & {
   readonly referenceImage?: IcLoraReferenceImage;
+  /**
+   * The form has a Control mode field, and puts the start frame above the video.
+   * The catalog entry declares the `control_type` control.
+   */
+  readonly controlMode?: boolean;
   /**
    * The recipe runs one tiled stage and upscales a small source. The resolution control
    * then offers every cell, not only the cells the source can fill. A row without it
-   * keeps the source-size limit.
+   * keeps the source-size limit. `"source-and-above"` lists the Original cell and every
+   * higher cell, 1440p and 2160p included. The backend then scales the clip up to
+   * the cell (`upscales_to_cell` in ic_lora_recipes.py).
    */
-  readonly upscalesSource?: boolean;
+  readonly upscalesSource?: boolean | "source-and-above";
+  /**
+   * The recipe needs the `highResVideoToVideo` flag, in every cell. Home hides it without the
+   * flag. shared/ic-lora-recipes.json pins it, and a backend test pins the same set.
+   */
+  readonly requiresHighRes?: boolean;
 };
 
 /**
@@ -349,10 +518,51 @@ export function isIcLoraRecipeId(value: string | undefined): value is IcLoraReci
   return IC_LORA_RECIPES.some((recipe) => recipe.id === value);
 }
 
-export function getIcLoraRecipe(id: IcLoraRecipeId): IcLoraRecipe {
+export function isIcLoraVideoRecipeId(value: string | undefined): value is IcLoraVideoRecipeId {
+  return IC_LORA_RECIPES.some((recipe) => recipe.id === value && recipe.kind === "video");
+}
+
+export function isIcLoraSheetRecipeId(value: string | undefined): value is IcLoraSheetRecipeId {
+  return IC_LORA_RECIPES.some((recipe) => recipe.id === value && recipe.kind === "sheet");
+}
+
+export function isIcLoraTrackRecipeId(value: string | undefined): value is IcLoraTrackRecipeId {
+  return IC_LORA_RECIPES.some((recipe) => recipe.id === value && recipe.kind === "track");
+}
+
+function findRecipeRow(id: IcLoraRecipeId): (typeof IC_LORA_RECIPES)[number] {
   const recipe = IC_LORA_RECIPES.find((candidate) => candidate.id === id);
   if (!recipe) {
     throw new Error(`Unknown IC-LoRA recipe: ${id}`);
+  }
+  return recipe;
+}
+
+export function getIcLoraRecipe(id: IcLoraVideoRecipeId): IcLoraRecipe {
+  const recipe = findRecipeRow(id);
+  if (recipe.kind !== "video") {
+    throw new Error(`Not a video IC-LoRA recipe: ${id}`);
+  }
+  return recipe;
+}
+
+/** The catalog entry of any recipe. */
+export function icLoraCatalogId(id: IcLoraRecipeId): string {
+  return findRecipeRow(id).catalogId;
+}
+
+export function getIcLoraSheetRecipe(id: IcLoraSheetRecipeId): IcLoraSheetRecipe {
+  const recipe = findRecipeRow(id);
+  if (recipe.kind !== "sheet") {
+    throw new Error(`Not an image-list IC-LoRA recipe: ${id}`);
+  }
+  return recipe;
+}
+
+export function getIcLoraTrackRecipe(id: IcLoraTrackRecipeId): IcLoraTrackRecipe {
+  const recipe = findRecipeRow(id);
+  if (recipe.kind !== "track") {
+    throw new Error(`Not an image-and-path IC-LoRA recipe: ${id}`);
   }
   return recipe;
 }

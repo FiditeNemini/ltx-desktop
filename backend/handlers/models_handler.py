@@ -462,6 +462,8 @@ class ModelsHandler(StateHandlerBase):
         if not supports(local_caps(model_id), "ic_lora") or spec.ic_loras_spec is None:
             return LtxIcLoraRecommendationResponse(cps_to_download=[], supported=False)
         required_cp_ids: set[ModelCheckpointID] = set(get_ic_loras_cp_ids(spec.ic_loras_spec))
+        # GenSpace only. Home Video Guide fetches the Depth model through `requires_checkpoints`.
+        # Remove this line when GenSpace is removed (see `DEPTH_PROCESSOR_CP_ID`).
         required_cp_ids.add(DEPTH_PROCESSOR_CP_ID)
         cp_ids = self._get_missing_cp_ids(required_cp_ids)
         return LtxIcLoraRecommendationResponse(

@@ -4,6 +4,11 @@ import {
   withDefaultOffering,
   type OfferingId,
 } from "../../../../lib/video-generation-model-specs.ts";
+import {
+  findPreflightCell,
+  preflightFallbackMessage,
+  preflightStatus,
+} from "../../../lib/editPreflight.ts";
 import { roundDurationSeconds } from "../../../lib/roundDuration.ts";
 import { readGenerationParams } from "../../../lib/resultsFeedModel.ts";
 import {
@@ -18,6 +23,7 @@ import {
 } from "../types.ts";
 import {
   capabilityModelOptions,
+  editPreflightIssues,
   editResolutionFieldOptions,
   editResolutionSize,
   editResolutionKeyFromParams,
@@ -27,6 +33,7 @@ import {
   readPrompt,
   readVideoGenerationInput,
   resolveCapableModel,
+  resolvePreflightResolution,
   type VideoInputContext,
   videoLengthUnknownIssue,
   videoRequiredIssue,
@@ -37,6 +44,7 @@ type ExtendMode = components["schemas"]["ExtendParams"]["mode"];
 
 export const EXTEND_DURATION_PRESETS = [4, 6, 8, 10, 12] as const;
 export type ExtendDuration = (typeof EXTEND_DURATION_PRESETS)[number];
+const EXTEND_MIN_DURATION_SECONDS = EXTEND_DURATION_PRESETS[0];
 
 export type ExtendSchema = {
   video: { kind: "video-asset"; value: AssetRef | null };
@@ -135,6 +143,22 @@ function videoLengthIssue(
   return null;
 }
 
+function preflightIssues(
+  values: ExtendValues,
+  context: ExtendContext,
+): ValidationIssue[] {
+  return editPreflightIssues({
+    video: values.video,
+    preflight: context.preflight,
+    resolution: values.resolution,
+    duration: values.duration,
+    minDuration: EXTEND_MIN_DURATION_SECONDS,
+    resolutionIssueId: "extend-resolution-too-large",
+    durationIssueId: "extend-duration-too-long",
+    durationFieldId: "duration",
+  });
+}
+
 export function validateExtend(
   values: ExtendValues,
   context: ExtendContext,
@@ -146,6 +170,7 @@ export function validateExtend(
     const lengthIssue = videoLengthIssue(values, context);
     if (lengthIssue) issues.push(lengthIssue);
   }
+  issues.push(...preflightIssues(values, context));
   return issues;
 }
 
@@ -191,14 +216,28 @@ function editResolutionParam(
 }
 
 export function buildExtendForm(
-  _values: ExtendValues,
+  values: ExtendValues,
   context: ExtendContext,
 ): FeatureFormModel<ExtendSchema> {
   const resolutionOptions = editResolutionFieldOptions(
     context.videoWidth,
     context.videoHeight,
     context.specs?.low_performance_machine,
+    { state: context.preflight, minDuration: EXTEND_MIN_DURATION_SECONDS },
+    context.highResVideoToVideo,
   );
+  const durationOptions = DURATION_OPTIONS.map((option) => {
+    const status = preflightStatus(
+      context.preflight,
+      findPreflightCell(context.preflight, values.resolution, option.value),
+    );
+    if (status.status !== "blocked") return option;
+    return {
+      ...option,
+      disabledReason: preflightFallbackMessage(status),
+      ...(status.readout ? { budget: status.readout } : {}),
+    };
+  });
   return {
     fields: [
       {
@@ -219,7 +258,7 @@ export function buildExtendForm(
         id: "duration",
         label: "Duration",
         dataKey: "duration",
-        options: DURATION_OPTIONS,
+        options: durationOptions,
       },
       {
         kind: "options",
@@ -259,18 +298,51 @@ export function applyExtendChange(
   return applyFeatureFieldChange(values, change);
 }
 
+function resolvePreflightDuration(
+  current: ExtendDuration,
+  resolution: ExtendValues["resolution"],
+  context: ExtendContext,
+): ExtendDuration {
+  if (context.preflight == null) return current;
+  const currentStatus = preflightStatus(
+    context.preflight,
+    findPreflightCell(context.preflight, resolution, current),
+  );
+  if (currentStatus.status !== "blocked") return current;
+  const passing = EXTEND_DURATION_PRESETS.filter((preset) => {
+    const candidate = preflightStatus(
+      context.preflight,
+      findPreflightCell(context.preflight, resolution, preset),
+    );
+    return candidate.status !== "blocked";
+  });
+  return passing.length > 0 ? passing[passing.length - 1] : current;
+}
+
 export function normalizeExtend(
   values: ExtendValues,
   context: ExtendContext,
 ): ExtendValues {
   const model = resolveExtendModel(values.model, context);
-  const resolution = normalizeEditResolution(
-    values.resolution,
-    context.videoWidth,
-    context.videoHeight,
+  const resolution = resolvePreflightResolution(
+    normalizeEditResolution(
+      values.resolution,
+      context.videoWidth,
+      context.videoHeight,
+      context.highResVideoToVideo,
+    ),
+    context,
+    EXTEND_MIN_DURATION_SECONDS,
   );
-  if (model === values.model && resolution === values.resolution) return values;
-  return { ...values, model, resolution };
+  const duration = resolvePreflightDuration(values.duration, resolution, context);
+  if (
+    model === values.model &&
+    resolution === values.resolution &&
+    duration === values.duration
+  ) {
+    return values;
+  }
+  return { ...values, model, resolution, duration };
 }
 
 export function seedExtendValues(context: ExtendContext): ExtendValues {
@@ -304,7 +376,10 @@ export const extendDefinition: FeatureDefinition<
   isReady: (values, context) => {
     if (values.video == null) return false;
     if (context.videoDurationPending) return false;
-    return videoLengthIssue(values, context) == null;
+    if (videoLengthIssue(values, context) != null) return false;
+    return preflightIssues(values, context).every(
+      (issue) => issue.blocksGenerate === false,
+    );
   },
   isUnavailable: (_values, context) => !hasAdvertisedExtend(context.specs),
 };

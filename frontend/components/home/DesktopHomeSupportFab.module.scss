@@ -10,6 +10,11 @@
   }
 }
 
+// .panel width in DesktopAssistantPanel.module.scss, docked or overlaid.
+.root[data-beside-panel] {
+  right: calc(400px + var(--spacing-xl));
+}
+
 .fab.fab {
   width: 36px;
   height: 36px;

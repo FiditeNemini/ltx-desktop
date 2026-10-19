@@ -39,7 +39,19 @@ export function isStillFocusingResult(
   return resultId != null && resultId !== settledResultId;
 }
 
-/** A Done click keeps ?result= set. Chasing the newest card would undo that scroll. */
+/**
+ * A ?result= card is missing only after the list finished loading and refetching.
+ * A cached list can lag behind the Queue, so an earlier check can fail by mistake.
+ */
+export function isResultMissing(input: {
+  resultId: string | null;
+  found: boolean;
+  listSettled: boolean;
+}): boolean {
+  return input.resultId != null && !input.found && input.listSettled;
+}
+
+/** A Queue click keeps ?result= set. Chasing the newest card would undo that scroll. */
 export function shouldFollowNewestResult(input: {
   generationStarted: boolean;
   pinnedToNewest: boolean;

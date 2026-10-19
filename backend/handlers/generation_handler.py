@@ -15,8 +15,10 @@ from api_types import (
     CancelNoActiveGenerationResponse,
     CancelResponse,
     GenerationProgressResponse,
+    WallTimeEstimateResponse,
 )
 from handlers.base import StateHandlerBase, with_state_lock
+from runtime_config.eta import WallTimeEstimate
 from services import generation_interrupt
 from services.generation_interrupt import GenerationCancelledError
 from services.generation_queue.control import GenerationSlotWaitAborted
@@ -49,6 +51,7 @@ class GenerationHandler(StateHandlerBase):
     def __init__(self, state: AppState, lock: RLock, config: RuntimeConfig) -> None:
         super().__init__(state, lock, config)
         self._generation_slot = Condition(self._lock)
+        self._queue_yields = 0
         from services.denoising_progress import configure_sink
 
         configure_sink(self._on_denoise_step)
@@ -78,7 +81,7 @@ class GenerationHandler(StateHandlerBase):
         return None
 
     @with_state_lock
-    def try_reserve_generation_start(self) -> bool:
+    def try_reserve_generation_start(self, *, persistent: bool = False) -> bool:
         """Atomically claim the right to start a generation, before any slow pre-work.
 
         Shared across every generation kind (video/image/retake/extend/ic-lora all hold a
@@ -94,7 +97,7 @@ class GenerationHandler(StateHandlerBase):
             logger.info("Generation start reservation denied: %s", reason)
             return False
         self.state.generation_in_flight = True
-        self.state.generation_starting_since = time.monotonic()
+        self.state.generation_starting_since = None if persistent else time.monotonic()
         return True
 
     @with_state_lock
@@ -120,7 +123,8 @@ class GenerationHandler(StateHandlerBase):
                     if shutdown.is_set():
                         break
                     if (
-                        self._generation_start_block_reason() is None
+                        self._queue_yields == 0
+                        and self._generation_start_block_reason() is None
                         and self.try_reserve_generation_start()
                     ):
                         reserved = True
@@ -134,7 +138,23 @@ class GenerationHandler(StateHandlerBase):
                 self.release_generation_start_reservation()
 
     @contextmanager
-    def reserved_generation_start(self) -> Iterator[None]:
+    def queue_yields(self) -> Iterator[None]:
+        """Hold wait_for_generation_slot() waiters at the next job boundary.
+
+        The running generation is not interrupted. A caller polling try_reserve_generation_start()
+        inside this context cannot be starved by the queue re-claiming the slot between jobs.
+        """
+        with self._generation_slot:
+            self._queue_yields += 1
+        try:
+            yield
+        finally:
+            with self._generation_slot:
+                self._queue_yields -= 1
+                self._generation_slot.notify_all()
+
+    @contextmanager
+    def reserved_generation_start(self, *, persistent: bool = False) -> Iterator[None]:
         """Guarantees the reservation is released on ANY exit — a normal return, a validation
         HTTPError raised before start_generation() is ever reached, or an unexpected exception —
         not just the paths a handler remembers to route through fail_generation(). Wrap a
@@ -145,7 +165,7 @@ class GenerationHandler(StateHandlerBase):
         (locking around the whole thing, including the caller's yielded body, would serialize
         unrelated state reads/writes for the entire generation instead of just these two).
         """
-        if not self.try_reserve_generation_start():
+        if not self.try_reserve_generation_start(persistent=persistent):
             raise HTTPError(409, "Generation already in progress")
         try:
             yield
@@ -153,7 +173,9 @@ class GenerationHandler(StateHandlerBase):
             self.release_generation_start_reservation()
 
     @with_state_lock
-    def start_generation(self, generation_id: str) -> None:
+    def start_generation(
+        self, generation_id: str, *, estimated: WallTimeEstimate | None = None
+    ) -> None:
         if self.is_generation_running():
             raise RuntimeError("Generation already in progress")
         if self.state.gpu_slot is None:
@@ -185,6 +207,7 @@ class GenerationHandler(StateHandlerBase):
             state=GenerationRunning(
                 id=generation_id,
                 progress=GenerationProgress(phase="", progress=0, current_step=0, total_steps=0),
+                estimated=estimated,
             )
         )
         logger.info("Generation %s started (gpu)", generation_id)
@@ -419,7 +442,9 @@ class GenerationHandler(StateHandlerBase):
         gpu_cancellable = self._local_gpu_slot_occupied()
 
         match gen:
-            case GenerationRunning(id=generation_id, progress=progress):
+            case GenerationRunning(
+                id=generation_id, progress=progress, estimated=estimated
+            ):
                 return GenerationProgressResponse(
                     status="running",
                     phase=progress.phase,
@@ -428,6 +453,13 @@ class GenerationHandler(StateHandlerBase):
                     totalSteps=progress.total_steps,
                     id=generation_id,
                     cancellable=gpu_cancellable,
+                    estimate=WallTimeEstimateResponse(
+                        seconds=estimated.seconds,
+                        basis=estimated.basis,
+                        t2vReuse=estimated.t2v_reuse,
+                    )
+                    if estimated
+                    else None,
                 )
             case GenerationComplete(id=generation_id, result=result):
                 return GenerationProgressResponse(

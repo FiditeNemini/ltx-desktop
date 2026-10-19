@@ -46,6 +46,11 @@ def route_post_settings(
     if "use_conv_vae" in changed_roots:
         handler.pipelines.unload_gpu_pipeline()
 
+    if "models_dir" in changed_roots:
+        handler.generation_queue.set_checkpoint_drive_type(
+            handler.settings.refresh_checkpoint_drive_type()
+        )
+
     if "remote_exposure" in changed_roots:
         controller = remote_controller_from_app(request.app)
         if controller is not None:

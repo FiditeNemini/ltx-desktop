@@ -14,6 +14,7 @@ from api_types import (
     PromptTemplateSpec,
 )
 from runtime_config.model_download_specs import resolve_model_path
+from services import generation_interrupt
 from services.gemini_text_client import DEFAULT_GEMINI_MODEL
 from services.prompt_enhancement import build_audio_visual_caption_system_prompt
 from tests.fakes import FakeResponse
@@ -1102,3 +1103,85 @@ class TestImageMediaType:
         assert r.json()["enhancedPrompt"] == "a shiny red sedan"
         system_instruction = test_state.http.calls[-1].json_payload["systemInstruction"]["parts"][0]["text"]
         assert "Z-Image-Turbo" in system_instruction
+
+
+class TestGeminiEnhanceBesideARunningGeneration:
+    """Gemini is an HTTP call, so it needs no GPU slot. Local Gemma keeps its 409 above."""
+
+    def _start_running_generation(self, test_state, create_fake_model_files) -> None:
+        create_fake_model_files(model_id=_LOCAL_ENHANCER_MODEL_ID)
+        test_state.pipelines.load_gpu_pipeline("fast")
+        test_state.generation.start_generation("gen-1")
+
+    def test_gemini_enhance_succeeds_while_a_generation_is_running(
+        self, client, test_state, create_fake_model_files
+    ):
+        test_state.state.app_settings.gemini_api_key = "key"
+        test_state.http.queue("post", _gemini_ok("a cat, enhanced"))
+        self._start_running_generation(test_state, create_fake_model_files)
+
+        r = client.post("/api/enhance-prompt", json={"prompt": "a cat", "provider": "api"})
+
+        assert r.status_code == 200
+        assert r.json()["enhancedPrompt"] == "a cat, enhanced"
+
+    def test_gemini_enhance_leaves_the_running_generation_and_its_stop_request_alone(
+        self, client, test_state, create_fake_model_files
+    ):
+        test_state.state.app_settings.gemini_api_key = "key"
+        test_state.http.queue("post", _gemini_ok("a cat, enhanced"))
+        self._start_running_generation(test_state, create_fake_model_files)
+        generation_interrupt.request()
+        try:
+            r = client.post("/api/enhance-prompt", json={"prompt": "a cat", "provider": "api"})
+
+            progress = test_state.generation.get_generation_progress()
+            assert r.status_code == 200
+            assert (progress.status, progress.id) == ("running", "gen-1")
+            assert generation_interrupt.is_requested()
+        finally:
+            generation_interrupt.clear()
+
+    def test_gemini_enhance_without_a_key_is_still_a_400_while_a_generation_is_running(
+        self, client, test_state, create_fake_model_files
+    ):
+        self._start_running_generation(test_state, create_fake_model_files)
+
+        r = client.post("/api/enhance-prompt", json={"prompt": "a cat", "provider": "api"})
+
+        assert_http_error(r, status_code=400, code="GEMINI_API_KEY_MISSING")
+
+
+class TestGeminiOneAtATime:
+    def test_a_second_gemini_enhance_during_the_first_is_a_409(self, client, test_state):
+        test_state.state.app_settings.gemini_api_key = "key"
+        slot = test_state.prompt_enhancement._gemini_enhance_slot
+        slot.acquire()
+        try:
+            r = client.post("/api/enhance-prompt", json={"prompt": "a cat", "provider": "api"})
+        finally:
+            slot.release()
+
+        assert r.status_code == 409
+        assert test_state.http.calls == []
+
+    def test_a_gemini_enhance_after_a_finished_one_succeeds(self, client, test_state):
+        test_state.state.app_settings.gemini_api_key = "key"
+        test_state.http.queue("post", _gemini_ok("first"), _gemini_ok("second"))
+
+        first = client.post("/api/enhance-prompt", json={"prompt": "a cat", "provider": "api"})
+        second = client.post("/api/enhance-prompt", json={"prompt": "a cat", "provider": "api"})
+
+        assert (first.status_code, second.status_code) == (200, 200)
+
+    def test_a_failed_gemini_enhance_frees_the_slot(self, client, test_state):
+        test_state.state.app_settings.gemini_api_key = "key"
+        test_state.http.queue(
+            "post", FakeResponse(status_code=500, text="down"), _gemini_ok("recovered")
+        )
+
+        failed = client.post("/api/enhance-prompt", json={"prompt": "a cat", "provider": "api"})
+        after = client.post("/api/enhance-prompt", json={"prompt": "a cat", "provider": "api"})
+
+        assert failed.status_code != 200
+        assert after.status_code == 200

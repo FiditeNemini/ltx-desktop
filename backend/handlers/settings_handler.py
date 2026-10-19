@@ -24,12 +24,14 @@ from services.gemini_text_client import (
     normalize_gemini_model_id,
     resolve_gemini_model,
 )
+from services.storage_info.storage_info_impl import StorageInfoImpl
 from services.api_key_validation import validate_fal_api_key, validate_gemini_api_key
 from services.interfaces import HTTPClient
 from state.app_state_types import AppState
 
 if TYPE_CHECKING:
     from runtime_config.runtime_config import RuntimeConfig
+    from services.storage_info.storage_info import DriveType
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,9 @@ class SettingsHandler(StateHandlerBase):
     def __init__(self, state: AppState, lock: RLock, config: RuntimeConfig, http: HTTPClient) -> None:
         super().__init__(state, lock, config)
         self._http = http
+        # Startup probe of the app-data tree, before settings load. The default
+        # models dir lives on that tree, so it never needs re-probing.
+        self._startup_drive_type: DriveType | None = config.checkpoint_drive_type
 
     @with_state_lock
     def load_settings(self, default_settings: AppSettings) -> AppSettings:
@@ -60,6 +65,23 @@ class SettingsHandler(StateHandlerBase):
 
         self.state.app_settings = default_settings.model_copy(deep=True)
         return self.state.app_settings
+
+    def refresh_checkpoint_drive_type(self) -> DriveType | None:
+        """Re-probe the checkpoint volume class for the effective models dir.
+
+        The startup probe covers the default tree; only a custom models dir
+        (possibly another drive class) pays for a fresh probe. Restores the
+        startup value when custom is cleared. Call after settings load and
+        whenever models_dir changes. Returns the value for callers that
+        snapshot it (queue telemetry). Lock-free: plain assignment, read
+        under handler locks or best-effort.
+        """
+        if not self.state.app_settings.models_dir:
+            self.config.checkpoint_drive_type = self._startup_drive_type
+            return self._startup_drive_type
+        drive_type = StorageInfoImpl(self.models_dir).get_drive_type()
+        self.config.checkpoint_drive_type = drive_type
+        return drive_type
 
     def save_settings(self) -> None:
         try:

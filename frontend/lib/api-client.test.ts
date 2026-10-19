@@ -18,6 +18,30 @@ const uploadedAsset = {
 }
 
 describe('createApiClient', () => {
+  it('loads a generation by ID regardless of its Explore feature', async () => {
+    const calls: string[] = []
+    const client = createApiClient(async (path) => {
+      calls.push(path)
+      return new Response(JSON.stringify({ id: 'job', feature: 'claymation', status: 'succeeded' }), { status: 200 })
+    })
+    await client.getGeneration('job/1')
+    assert.deepEqual(calls, ['/api/generations/job%2F1'])
+  })
+
+  it('puts assistant run IDs in the continue and stop paths, not the body', async () => {
+    const calls: Array<{ path: string; method: string | undefined; body: unknown }> = []
+    const client = createApiClient(async (path, init) => {
+      calls.push({ path, method: init?.method, body: init?.body })
+      return new Response(JSON.stringify({ text: 'Done', status: 'complete' }), { status: 200 })
+    })
+    await client.continueAssistant('run/1')
+    await client.stopAssistant('run/1')
+    assert.deepEqual(calls, [
+      { path: '/api/assistant/runs/run%2F1/continue', method: 'POST', body: undefined },
+      { path: '/api/assistant/runs/run%2F1/stop', method: 'POST', body: undefined },
+    ])
+  })
+
   it('keeps two clients on independent fetch implementations', async () => {
     const callsA: Array<{ path: string; method: string | undefined }> = []
     const callsB: Array<{ path: string; method: string | undefined }> = []

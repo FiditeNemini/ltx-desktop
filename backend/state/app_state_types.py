@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NewType, Protocol
+from typing import TYPE_CHECKING, NewType, Protocol, Union
 
-from api_types import LTXLocalModelId, ModelCheckpointID
+from api_types import AssistantModelDownloadProgress, LTXLocalModelId, ModelCheckpointID
+from runtime_config.eta import WallTimeEstimate
 from runtime_config.ic_lora_tiling import IcLoraTiling
 from runtime_config.runtime_policy import LocalGenerationMode
 from state.conditioning_cache import ConditioningCache
@@ -207,6 +208,9 @@ class GenerationProgress:
 class GenerationRunning:
     id: str
     progress: GenerationProgress
+    # Whole-run wall-time estimate fixed at start (ETA v1: local Fast video on
+    # measured hardware only). None means unknown, not zero.
+    estimated: WallTimeEstimate | None = None
 
 
 @dataclass
@@ -248,10 +252,17 @@ ActiveGeneration = GpuGeneration | ApiGeneration
 # Device slots
 # ============================================================
 
+# What a GPU slot can hold. The image pipeline rides bare (no state wrapper).
+# ImageGenerationPipeline is TYPE_CHECKING-only here, so it rides a forward
+# ref; pipelines_handler bounds its loader generic over this alias.
+GpuSlotContent = Union[
+    VideoPipelineState, ICLoraState, A2VPipelineState, RetakePipelineState, "ImageGenerationPipeline"
+]
+
 
 @dataclass
 class GpuSlot:
-    active_pipeline: VideoPipelineState | ICLoraState | A2VPipelineState | RetakePipelineState | ImageGenerationPipeline
+    active_pipeline: GpuSlotContent
 
 
 @dataclass
@@ -306,6 +317,7 @@ class AppState:
         default_factory=_default_completed_ic_lora_download_sessions
     )
     lora_download_session: CatalogDownloadSession | None = None
+    assistant_model_download: AssistantModelDownloadProgress | None = None
     completed_lora_download_sessions: dict[DownloadSessionId, DownloadSessionResult] = field(
         default_factory=_default_completed_lora_download_sessions
     )

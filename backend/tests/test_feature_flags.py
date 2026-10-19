@@ -9,7 +9,7 @@ from starlette.testclient import TestClient
 from api_types import FeatureFlags, FeatureFlagsPatch
 from remote.app import create_remote_app
 
-DEFAULTS = {"customIcLora": False, "advancedIcLoraControls": False}
+DEFAULTS = {"customIcLora": False, "advancedIcLoraControls": False, "highResVideoToVideo": False}
 AUTH = {"Authorization": "Bearer pair-token"}
 
 
@@ -24,7 +24,7 @@ def test_patch_merges_and_persists_to_file(client, test_state):
     first = client.request("PATCH", "/api/feature-flags", json={"customIcLora": True})
     second = client.request("PATCH", "/api/feature-flags", json={"advancedIcLoraControls": True})
 
-    expected = {"customIcLora": True, "advancedIcLoraControls": True}
+    expected = {**DEFAULTS, "customIcLora": True, "advancedIcLoraControls": True}
     assert first.json() == {**DEFAULTS, "customIcLora": True}
     assert second.json() == expected
     assert client.get("/api/feature-flags").json() == expected

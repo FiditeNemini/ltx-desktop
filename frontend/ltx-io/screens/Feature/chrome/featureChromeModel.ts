@@ -74,6 +74,10 @@ function typeRow(value: string): FeatureDetailsRow {
   return { id: "type", label: "Type", value, href: null };
 }
 
+function baseModelRow(value: string): FeatureDetailsRow {
+  return { id: "base-model", label: "Base Model", value, href: null };
+}
+
 function firstClassListing(
   feature: HomeFeatureDefinition,
 ): HomeFeatureListing {
@@ -87,12 +91,7 @@ function recipeRows(listing: LoraRecipeListing): readonly FeatureDetailsRow[] {
   return [
     categoriesRow(listing.categories),
     typeRow(listing.typeLabel),
-    {
-      id: "base-model",
-      label: "Base Model",
-      value: listing.baseModel,
-      href: null,
-    },
+    baseModelRow(listing.baseModel),
     {
       id: "license",
       label: "License",
@@ -129,7 +128,11 @@ export function buildFeatureDetails(featureId: HomeFeatureId): FeatureDetails {
     title: feature.title,
     blurb: listing.blurb,
     credit: { name: "LTX Team", affiliation: "ltx" },
-    rows: [categoriesRow(listing.categories), typeRow(listing.typeLabel)],
+    rows: [
+      categoriesRow(listing.categories),
+      typeRow(listing.typeLabel),
+      ...(listing.baseModel ? [baseModelRow(listing.baseModel)] : []),
+    ],
     externalLink: listing.huggingfaceUrl
       ? { label: "Hugging Face", url: listing.huggingfaceUrl }
       : null,

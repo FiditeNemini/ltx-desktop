@@ -19,6 +19,7 @@ const desktopAppRoutes = createDesktopAppRoutes({
   appShell: <AppShell />,
   desktopHomeLayout: <DesktopHomeLayout />,
   homeLayoutPages: {
+    assistant: null, // The shell keeps the shared chat mounted across routes.
     home: <Home />,
     assets: <AssetsLibraryScreen />,
     dashboard: <DashboardScreen />,

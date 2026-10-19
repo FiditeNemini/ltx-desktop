@@ -15,6 +15,7 @@ import {
   isSupportedDroppedImage,
   UNSUPPORTED_IMAGE_MESSAGE,
 } from "./imageAssetInput";
+import dropStyles from "./ImageDropzone.module.scss";
 import styles from "./ImageAssetField.module.scss";
 import { useMediaAssetField } from "./useMediaAssetField";
 
@@ -52,7 +53,7 @@ export function ImageAssetField({
         {field.label}
       </Text>
       <div
-        className={clsx(styles.dropzone, media.isDragOver && styles.dragOver)}
+        className={clsx(dropStyles.dropzone, media.isDragOver && dropStyles.dragOver)}
         onDragEnter={media.dragHandlers.handleDragEnter}
         onDragOver={media.dragHandlers.handleDragOver}
         onDragLeave={media.dragHandlers.handleDragLeave}
@@ -70,7 +71,7 @@ export function ImageAssetField({
       >
         <input
           ref={media.fileInputRef}
-          className={styles.hiddenInput}
+          className={dropStyles.hiddenInput}
           type="file"
           accept={media.accept}
         />
@@ -84,8 +85,8 @@ export function ImageAssetField({
             alt=""
           />
         ) : (
-          <div className={styles.empty}>
-            <PhotoIcon className={styles.emptyIcon} />
+          <div className={dropStyles.empty}>
+            <PhotoIcon className={dropStyles.emptyIcon} />
             <Text as="span" variant="body" size="md">
               Drop an image or browse
             </Text>

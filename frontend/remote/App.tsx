@@ -17,6 +17,7 @@ import { api, pairDevice } from "./api";
 import { PairingMessage, PairingStatus, type PairingHealth } from "./PairingMessage";
 import { createRemoteExploreRuntime } from "./remote-explore-runtime";
 import { createRemoteAppRoutes } from "./remote-routes";
+import { RemoteAssistantPage } from "./RemoteAssistantPage";
 import { RemotePairingPage } from "./RemotePairingPage";
 import { RemoteShell } from "./RemoteShell";
 import styles from "./RemoteShell.module.scss";
@@ -115,6 +116,7 @@ const remoteRouter = createBrowserRouter(
     pairedLayout: <PairedSessionLayout />,
     homeLayoutPages: {
       home: <Home />,
+      assistant: <RemoteAssistantPage />,
       assets: <AssetsLibraryScreen />,
       dashboard: <DashboardScreen />,
     },

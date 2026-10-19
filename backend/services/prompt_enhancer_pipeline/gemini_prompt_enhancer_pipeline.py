@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+from collections.abc import Sequence
 
 from PIL import Image
 
@@ -14,9 +15,13 @@ from services.interfaces import HTTPClient, JSONValue
 from services.prompt_enhancement import (
     build_default_free_rewrite_system_prompt,
     build_i2v_user_prompt_text,
+    build_video_user_prompt_text,
     resolve_i2v_frames,
+    resolve_video_frames,
+    video_role_max_output_tokens,
+    with_video_role_rules,
 )
-from services.prompt_enhancement.i2v_frames import KeyframeStill
+from services.prompt_enhancement.i2v_frames import KeyframeStill, SceneFrame, VideoRole
 
 # Gemini's inlineData only takes these formats (also HEIC/HEIF, which never reach here — this
 # app's own image validation doesn't accept them as input in the first place).
@@ -26,6 +31,8 @@ _GEMINI_MAX_INLINE_BYTES = 20 * 1024 * 1024
 # Match local Gemma's vision long-edge. A 4K frame does not help the rewrite and burns tokens.
 _ENHANCE_IMAGE_LONG_EDGE = 896
 _JPEG_QUALITY = 85
+# Matches local Gemma's default output cap when thinking is off.
+_DEFAULT_MAX_OUTPUT_TOKENS = 512
 
 
 class GeminiPromptEnhancerPipeline:
@@ -57,19 +64,7 @@ class GeminiPromptEnhancerPipeline:
         fps: int | None = None,
     ) -> str:
         frames = resolve_i2v_frames(image_path, last_image_path, keyframes, fps=fps)
-        image_parts: list[tuple[str | None, JSONValue]] = []
-        total_size = 0
-        for path, label in frames:
-            image_part, image_size = self._inline_image_part(path)
-            total_size += image_size
-            image_parts.append((label, image_part))
-        if total_size > _GEMINI_MAX_INLINE_BYTES:
-            raise HTTPError(
-                400,
-                "Image is too large for the Gemini API provider (20MB request limit) — "
-                "use Local, or a smaller image",
-                code="GEMINI_IMAGE_TOO_LARGE",
-            )
+        image_parts = self._inline_image_parts(frames)
 
         keyframe_count = len(keyframes) if keyframes else 0
         if keyframe_count > 0:
@@ -99,6 +94,62 @@ class GeminiPromptEnhancerPipeline:
         contents: list[JSONValue] = [{"role": "user", "parts": parts}]
         return self._call(contents, system_prompt, seed, api_key, model)
 
+    def enhance_with_video_frames(
+        self,
+        prompt: str,
+        frames: Sequence[SceneFrame],
+        system_prompt: str | None,
+        seed: int,
+        role: VideoRole,
+        *,
+        api_key: str,
+        model: str,
+    ) -> str:
+        # Each still is preceded by its label, then the typed prompt closes the turn.
+        parts: list[JSONValue] = []
+        for label, image_part in self._inline_image_parts(resolve_video_frames(frames)):
+            parts.append({"text": label})
+            parts.append(image_part)
+        has_look_reference = any(frame.is_reference for frame in frames)
+        parts.append(
+            {
+                "text": build_video_user_prompt_text(
+                    prompt, role=role, has_look_reference=has_look_reference
+                )
+            }
+        )
+        contents: list[JSONValue] = [{"role": "user", "parts": parts}]
+        # Gemini has no default of its own, so resolve one here before the rules ride on it.
+        resolved_system_prompt = with_video_role_rules(
+            system_prompt or build_default_free_rewrite_system_prompt(), role
+        )
+        return self._call(
+            contents,
+            resolved_system_prompt,
+            seed,
+            api_key,
+            model,
+            max_output_tokens=video_role_max_output_tokens(role) or _DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+
+    def _inline_image_parts(
+        self, frames: Sequence[tuple[str, str | None]]
+    ) -> list[tuple[str | None, JSONValue]]:
+        image_parts: list[tuple[str | None, JSONValue]] = []
+        total_size = 0
+        for path, label in frames:
+            image_part, image_size = self._inline_image_part(path)
+            total_size += image_size
+            image_parts.append((label, image_part))
+        if total_size > _GEMINI_MAX_INLINE_BYTES:
+            raise HTTPError(
+                400,
+                "Image is too large for the Gemini API provider (20MB request limit) — "
+                "use Local, or a smaller image",
+                code="GEMINI_IMAGE_TOO_LARGE",
+            )
+        return image_parts
+
     def _inline_image_part(self, image_path: str) -> tuple[JSONValue, int]:
         # Our own validate_image_file() allows more (GIF/BMP/TIFF, up to 50MB) than Gemini's
         # inlineData accepts — without this, those pass our gate and only fail once they bounce
@@ -125,7 +176,14 @@ class GeminiPromptEnhancerPipeline:
         return part, len(raw)
 
     def _call(
-        self, contents: list[JSONValue], system_prompt: str | None, seed: int, api_key: str, model: str
+        self,
+        contents: list[JSONValue],
+        system_prompt: str | None,
+        seed: int,
+        api_key: str,
+        model: str,
+        *,
+        max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
     ) -> str:
         # Unlike the local Gemma pipeline, Gemini has no implicit default system prompt of its
         # own — omitting systemInstruction entirely gets a chatty, markdown-formatted essay
@@ -137,11 +195,11 @@ class GeminiPromptEnhancerPipeline:
             model=model,
             contents=contents,
             system_instruction=resolved_system_prompt,
-            # maxOutputTokens 512 matches local Gemma when thinking is off. Thinking models
-            # get a higher cap in apply_gemini_thinking_config so the rewrite is not truncated.
+            # Thinking models get a higher cap in apply_gemini_thinking_config so the rewrite
+            # is not truncated.
             generation_config=apply_gemini_thinking_config(
                 model,
-                {"seed": seed, "maxOutputTokens": 512},
+                {"seed": seed, "maxOutputTokens": max_output_tokens},
             ),
             timeout=30,
         )

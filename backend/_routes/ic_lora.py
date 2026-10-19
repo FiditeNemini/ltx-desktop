@@ -14,12 +14,22 @@ from api_types import (
     IcLoraExtractResponse,
     IcLoraGenerateRequest,
     IcLoraGenerateResponse,
+    IcLoraPreflightRequest,
+    IcLoraPreflightResponse,
 )
 from services.services_utils import JSONValue
 from state import get_state_service
 from app_handler import AppHandler
 
 router = APIRouter(prefix="/api/ic-lora", tags=["ic-lora"])
+
+
+@router.post("/preflight", response_model=IcLoraPreflightResponse)
+def route_ic_lora_preflight(
+    req: IcLoraPreflightRequest,
+    handler: AppHandler = Depends(get_state_service),
+) -> IcLoraPreflightResponse:
+    return handler.ic_lora.preflight(req)
 
 
 @router.post("/extract-conditioning", response_model=IcLoraExtractResponse)

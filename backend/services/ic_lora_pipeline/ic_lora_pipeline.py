@@ -9,6 +9,7 @@ from runtime_config.ic_lora_tiling import IcLoraTiling
 
 if TYPE_CHECKING:
     import torch
+    from ltx_pipelines.utils.types import OffloadMode
 
 
 class IcLoraPipeline(Protocol):
@@ -22,6 +23,7 @@ class IcLoraPipeline(Protocol):
         streaming_prefetch_count: int | None,
         lora_strength: float = 1.0,
         *,
+        offload_mode: OffloadMode,
         video_vae_path: str | None = None,
         audio_vae_path: str | None = None,
         duration_head_path: str | None = None,

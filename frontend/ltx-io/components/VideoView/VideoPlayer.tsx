@@ -113,6 +113,14 @@ export function VideoPlayer({
       void document.exitFullscreen().catch(() => {});
       return;
     }
+    if (typeof frame.requestFullscreen !== "function") {
+      // iPhone Safari can only make a <video> itself fullscreen, with its native controls.
+      const video = frameRef.current?.querySelector("video") as
+        | (HTMLVideoElement & { webkitEnterFullscreen?: () => void })
+        | null;
+      video?.webkitEnterFullscreen?.();
+      return;
+    }
     void frame.requestFullscreen().catch(() => {});
   }, [fullscreenTargetRef]);
 

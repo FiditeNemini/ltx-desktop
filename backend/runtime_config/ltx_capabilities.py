@@ -65,10 +65,14 @@ class ApiOfferingCapabilities(LtxOfferingCapabilities):
 
 # Real two-pass canvases. Splitting 540p (2.3 960×544 vs 2.5 1024×576) made a
 # model switch fail assert_resolution, so 2.3 and 2.5 share this grid.
-_TWO_PASS_PIXELS_16_9: dict[LTXVideoGenResolution, tuple[int, int]] = {
+TWO_PASS_PIXELS_16_9: dict[LTXVideoGenResolution, tuple[int, int]] = {
     "540p": (1024, 576),
     "720p": (1280, 704),
     "1080p": (1920, 1088),
+    # Stage 1 is half the canvas and sits on a 32 px grid, so the canvas sits on a 64 px
+    # grid. 1440 is not a multiple of 64 and 2160 is not either, so both round up.
+    "1440p": (2560, 1472),
+    "2160p": (3840, 2176),
 }
 
 # Text and image labels that denoise the parent canvas and return the first pass.
@@ -85,9 +89,9 @@ _A2V_TWO_PASS_PIXELS_16_9: dict[LTXVideoGenResolution, tuple[int, int]] = {
 
 
 def _local_pixel_map() -> dict[LTXVideoGenResolution, tuple[int, int]]:
-    pixels = dict(_TWO_PASS_PIXELS_16_9)
+    pixels = dict(TWO_PASS_PIXELS_16_9)
     for label, parent in _STAGE1_PARENT.items():
-        pixels[label] = _TWO_PASS_PIXELS_16_9[parent]
+        pixels[label] = TWO_PASS_PIXELS_16_9[parent]
     return pixels
 
 
@@ -361,6 +365,30 @@ def budget_pixels(
     if mode == "video" and resolution in _STAGE1_PARENT:
         return width // 2, height // 2
     return width, height
+
+
+def budget_shape(
+    caps: LtxOfferingCapabilities,
+    resolution: LTXVideoGenResolution,
+    aspect: LtxAspectRatio,
+    *,
+    mode: CanvasMode,
+) -> tuple[int, int]:
+    """Denoised shape: the 16:9 anchor widened to the selected ratio.
+
+    The shared duration/picker lists are the anchor; only a wider frame can
+    exceed it. Single source for every budget call site (generate, estimate,
+    queue preflights, specs). Unsnapped by design: the 64-grid snap prices
+    display pixels, and every call site prices this same anchor so verdicts
+    agree with each other. The unsnapped-vs-snapped delta (up to ~0.6 GiB on
+    legacy 270p/360p at 48-50 fps) applies identically on both sides of every
+    create/execute comparison, so it cannot skew them.
+    """
+    anchor_width, anchor_height = budget_size(local_canvas(resolution, mode=mode))
+    selected_width, selected_height = budget_pixels(caps, resolution, aspect, mode=mode)
+    if selected_width * selected_height > anchor_width * anchor_height:
+        return selected_width, selected_height
+    return anchor_width, anchor_height
 
 
 def pixels_for(

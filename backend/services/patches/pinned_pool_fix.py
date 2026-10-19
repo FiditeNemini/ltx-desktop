@@ -64,7 +64,14 @@ def _clear_cuda_sticky_error() -> None:
         logger.debug("pinned_pool_fix: failed to clear CUDA last error", exc_info=True)
 
 
-def _is_cuda_oom(exc: BaseException) -> bool:
+def is_cuda_oom_error(exc: BaseException) -> bool:
+    """Whether an exception is a CUDA out-of-memory, by message.
+
+    Public: the queue runner classifies failures with the same definition.
+    torch surfaces OOMs as ``OutOfMemoryError`` but also as plain
+    ``RuntimeError`` with the message, so the type alone under-counts.
+    Deliberately message-tight — telemetry must not over-label.
+    """
     msg = str(exc).lower()
     return "out of memory" in msg or "cudaerrormemoryallocation" in msg
 
@@ -100,7 +107,7 @@ def _patched_alloc_buffer(nbytes: int, device: torch.device | None, pin_memory: 
         try:
             return torch.empty(nbytes, dtype=torch.uint8, device=device, pin_memory=True)
         except Exception as exc:
-            if not _is_cuda_oom(exc):
+            if not is_cuda_oom_error(exc):
                 raise
             _clear_cuda_sticky_error()
             logger.warning(

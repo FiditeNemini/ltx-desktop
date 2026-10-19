@@ -97,6 +97,16 @@ const SEED_CASES: readonly {
     suffix: /restore-first-frame\.jpg$/,
     header: { offset: 0, bytes: JPEG_HEADER },
   },
+  {
+    kind: "ingredients-sheet",
+    suffix: /ingredients-sheet\.jpg$/,
+    header: { offset: 0, bytes: JPEG_HEADER },
+  },
+  {
+    kind: "motion-track-image",
+    suffix: /motion-track-input\.jpg$/,
+    header: { offset: 0, bytes: JPEG_HEADER },
+  },
 ];
 
 describe("packaged seed IPC", () => {

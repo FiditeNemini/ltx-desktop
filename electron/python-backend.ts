@@ -6,6 +6,7 @@ import { sendAnalyticsEvent } from './analytics'
 import { startAnalyticsSink, type AnalyticsSink } from './analytics-sink'
 import { getAppDataDir } from './app-paths'
 import { getCurrentDir, isDev } from './config'
+import { clearHeartbeatFile, decideThresholdTick, readHeartbeatState } from './liveness-grace'
 import { logger, writeLog } from './logger'
 import { getCurrentLogFilename } from './logging-management'
 import { getPythonDir } from './python-setup'
@@ -34,8 +35,17 @@ const STARTUP_PROBE_TIMEOUT_MS = 30_000
 const STARTUP_PROBE_INTERVAL_MS = 500
 const LIVENESS_POLL_INTERVAL_MS = 10_000
 const LIVENESS_FAILURE_THRESHOLD = 5
+// Kill-grace from the backend's generation proof-of-life file: a GIL-saturated
+// backend can't serve /health but is still progressing, so a fresh heartbeat
+// (refreshed every 15s while any local generation executes) skips the kill.
+// 3 minutes covers the worst observed stall (~70s of MPS model build) with
+// margin. The grace itself is capped: a backend deadlocked with a live writer
+// thread still fails closed to the kill, just late.
+const LIVENESS_GRACE_MAX_HEARTBEAT_AGE_MS = 180_000
+const LIVENESS_GRACE_CAP_MS = 10 * 60_000
 let livenessMonitorTimer: NodeJS.Timeout | null = null
 let livenessFailureCount = 0
+let livenessGraceSince: number | null = null
 
 // A local generation can hold the Python process's GIL for long, uninterrupted stretches (MPS
 // PyTorch ops release it far less eagerly than CUDA), which starves the asyncio event loop that
@@ -174,27 +184,54 @@ function stopLivenessMonitor(): void {
     livenessMonitorTimer = null
   }
   livenessFailureCount = 0
+  livenessGraceSince = null
 }
 
 function startLivenessMonitor(): void {
   stopLivenessMonitor()
+  // A crashed backend's leftover file must not grace this instance (the pid
+  // check would reject it anyway; this is hygiene for pid reuse).
+  clearHeartbeatFile(getAppDataDir())
   livenessMonitorTimer = setInterval(() => {
     void (async () => {
       if (!pythonProcess || backendOwnership !== 'managed' || isIntentionalShutdown) {
         return
       }
       if (isLivenessSuppressed()) {
+        // Suppression means the renderer attests liveness, so the grace cap
+        // clock must not accrue across it — otherwise a long suppressed run
+        // could exhaust the cap before the first grace check ever runs.
+        livenessGraceSince = null
         return
       }
       const healthy = await probeBackendHealth(2000)
       if (healthy) {
         livenessFailureCount = 0
+        livenessGraceSince = null
         return
       }
       livenessFailureCount += 1
       logger.warn(`Backend liveness probe failed (${livenessFailureCount}/${LIVENESS_FAILURE_THRESHOLD})`)
       if (livenessFailureCount >= LIVENESS_FAILURE_THRESHOLD) {
-        logger.error('Backend liveness probe failed repeatedly — killing process to trigger restart')
+        const outcome = decideThresholdTick({
+          graceSinceMs: livenessGraceSince,
+          heartbeat: readHeartbeatState(getAppDataDir()),
+          backendPid: pythonProcess?.pid,
+          nowMs: Date.now(),
+          graceMaxHeartbeatAgeMs: LIVENESS_GRACE_MAX_HEARTBEAT_AGE_MS,
+          graceCapMs: LIVENESS_GRACE_CAP_MS,
+        })
+        if (outcome.action === 'grace') {
+          livenessGraceSince = outcome.graceSinceMs
+          logger.warn('Backend liveness probe failing but generation heartbeat is fresh — giving it more time')
+          livenessFailureCount = 0
+          return
+        }
+        if (outcome.reason === 'grace-cap-exceeded') {
+          logger.error('Backend liveness probe failing past grace cap despite fresh heartbeat — killing process to trigger restart')
+        } else {
+          logger.error('Backend liveness probe failed repeatedly — killing process to trigger restart')
+        }
         stopLivenessMonitor()
         try {
           pythonProcess?.kill('SIGTERM')
@@ -386,7 +423,9 @@ export async function startPythonBackend(): Promise<void> {
         LTX_ANALYTICS_TOKEN: sink?.token ?? '',
         // Explore UI is gated on local_viable; designers on low-RAM Macs still need
         // to iterate in pnpm dev without closing every other app first.
-        ...(isDev ? { LTX_DEV_FORCE_LOCAL_VIABLE: '1' } : {}),
+        // Honor an explicit parent value: LTX_DEV_FORCE_LOCAL_VIABLE=0 turns the
+        // override off, so a developer can see the real "unsupported" state.
+        ...(isDev ? { LTX_DEV_FORCE_LOCAL_VIABLE: process.env.LTX_DEV_FORCE_LOCAL_VIABLE ?? '1' } : {}),
         // Bundled prebuilt mps-sdpa zero-copy extension cache (macOS). Lives inside
         // python-embed (→ resources/python) so it rides the CI python-embed cache. The
         // backend direct-imports the .so from here (mps_prebuilt_ext.py), no copy step;

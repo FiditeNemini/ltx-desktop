@@ -19,6 +19,9 @@
 }
 
 .main {
+  &[hidden] {
+    display: none;
+  }
   --shell-page-inset: var(--spacing-lg);
 
   display: flex;
@@ -87,6 +90,9 @@
 // The pin control lives on #home-sidebar. The compact drawer never sets
 // data-pinned, so this does not indent the stacked layout.
 .layout:has(:global(#home-sidebar[data-pinned="false"])) {
+  // The full-page assistant sits outside .main, so it reads its own inset.
+  --assistant-header-inset-start: var(--collapsed-sidebar-chrome-width);
+
   .main {
     --page-header-padding-inline-start: var(--collapsed-sidebar-chrome-width);
   }
@@ -108,6 +114,16 @@
 
 .main[data-settings-page] {
   background-color: var(--semantic-bg-primary);
+}
+
+.main[data-assistant-open] {
+  container: assistant-workspace / inline-size;
+}
+
+.headerActions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
 }
 
 @media (max-width: shell.$shell-compact-breakpoint) {

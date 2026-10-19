@@ -1,5 +1,5 @@
 import { type ReactNode } from "react";
-import { Radio, Search, Settings } from "lucide-react";
+import { MessageSquare, Radio, Search, Settings } from "lucide-react";
 import { useLocation } from "react-router";
 import { Button } from "@/ds/Button/Button";
 import { Text } from "@/ds/Text/Text";
@@ -75,6 +75,8 @@ function iconForNavItem(id: HomeSidebarNavItemId): ReactNode {
       return <HomeIcon />;
     case "assets":
       return <AssetsIcon />;
+    case "assistant":
+      return <MessageSquare className="h-3.5 w-3.5" />;
     case "remote":
       return <Radio className="h-3.5 w-3.5" />;
     case "projects":

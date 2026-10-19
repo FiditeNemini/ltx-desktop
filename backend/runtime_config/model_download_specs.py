@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import assert_never, cast, get_args
@@ -47,6 +47,9 @@ class ModelCheckpointSpec:
     repo_filename: str | None = None
     # Repo requires an accepted HF license + auth token; downloading signed out 401s.
     gated: bool = False
+    # A Hugging Face commit. A repo that is not ours is pinned, because the loader runs the
+    # file (TorchScript) and the repo owner can change it.
+    revision: str | None = None
 
     @property
     def name(self) -> str:
@@ -145,14 +148,23 @@ def _local_resolution_spec(
 
 
 IMG_GEN_MODEL_CP_ID: ModelCheckpointID = "z-image-turbo"
+# GenSpace (depth conditioning and `get_ltx_ic_lora_recommendation`) and Home Video Guide in Depth
+# mode both read this model. Delete of Video Guide must not remove it. Delete also keeps the
+# Pose models below, which only Video Guide uses today, so the entry is never half installed.
+# When GenSpace is removed: remove the Depth line in `get_ltx_ic_lora_recommendation`
+# (`models_handler.py`). Then decide if Delete of Video Guide must also remove the three
+# processor models. Until then a Home-only user keeps about 850 MB of them after Delete.
 DEPTH_PROCESSOR_CP_ID: ModelCheckpointID = "dpt-hybrid-midas"
 PERSON_DETECTOR_CP_ID: ModelCheckpointID = "yolox-l-torchscript"
 POSE_PROCESSOR_CP_ID: ModelCheckpointID = "dw-ll-ucoco-384-bs5"
 
 # Static Fast ceiling. List-time hiding uses decide_video_job so CUDA 16 GB does
 # not advertise 720p/20s or 1080p/10s; a 5090 that streams those cells still sees
-# them. Darwin keeps this ceiling (no CUDA stream-curve compare). 1080p/20s is
-# never in this table. Every duration list is listed at 24, 25, 48, and 50.
+# them. Darwin keeps this ceiling (no CUDA stream-curve compare). 1080p carries
+# the full sibling envelope (including 20s): the budget — not this table —
+# decides each cell, so an over-budget cell is refused with its measured copy
+# (dropped_cells) instead of silently absent from every picker list.
+# Every duration list is listed at 24, 25, 48, and 50.
 _LOCAL_FPS: tuple[LTXVideoGenFps, ...] = (24, 25, 48, 50)
 
 
@@ -161,6 +173,11 @@ def _local_fps_durations(
 ) -> dict[LTXVideoGenFps, tuple[LTXVideoGenDuration, ...]]:
     return {fps: durations for fps in _LOCAL_FPS}
 
+
+# 21:9 at 4K is a 5056x2176 canvas, 30% larger than 16:9. It is not offered.
+_HIGH_RES_ASPECT_RATIOS: tuple[LTXVideoGenAspectRatio, ...] = tuple(
+    ratio for ratio in _LOCAL_ASPECT_RATIOS if ratio != "21:9"
+)
 
 _FAST_540P_DURATIONS = _local_resolution_spec(
     fps_to_durations=_local_fps_durations((2, 3, 4, 5, 6, 8, 10, 20)),
@@ -175,7 +192,16 @@ _FAST_LOCAL_RESOLUTIONS_DURATIONS: dict[LTXVideoGenResolution, LTXVideoGeneratio
         fps_to_durations=_local_fps_durations((2, 3, 4, 5, 6, 8, 10, 20)),
     ),
     "1080p": _local_resolution_spec(
-        fps_to_durations=_local_fps_durations((2, 3, 4, 5, 10)),
+        fps_to_durations=_local_fps_durations((2, 3, 4, 5, 6, 8, 10, 20)),
+    ),
+    # 1440p and 4K run long clips in overlapping windows (fast_chunking.py), so the
+    # budget prices a window, not the clip.
+    "1440p": _local_resolution_spec(
+        fps_to_durations=_local_fps_durations((2, 3, 4, 5, 6, 8, 10, 20)),
+    ),
+    "2160p": _local_resolution_spec(
+        fps_to_durations=_local_fps_durations((2, 3, 4, 5, 6, 8, 10)),
+        aspect_ratios=_HIGH_RES_ASPECT_RATIOS,
     ),
 }
 # A2V keeps the previous durations. 270p/360p are smaller two-pass canvases,
@@ -194,7 +220,14 @@ _A2V_LOCAL_RESOLUTIONS_DURATIONS: dict[LTXVideoGenResolution, LTXVideoGeneration
         fps_to_durations=_local_fps_durations((5, 6, 8, 10, 20)),
     ),
     "1080p": _local_resolution_spec(
-        fps_to_durations=_local_fps_durations((5, 10)),
+        fps_to_durations=_local_fps_durations((5, 6, 8, 10, 20)),
+    ),
+    "1440p": _local_resolution_spec(
+        fps_to_durations=_local_fps_durations((5, 6, 8, 10, 20)),
+    ),
+    "2160p": _local_resolution_spec(
+        fps_to_durations=_local_fps_durations((5, 6, 8, 10)),
+        aspect_ratios=_HIGH_RES_ASPECT_RATIOS,
     ),
 }
 
@@ -271,6 +304,11 @@ def get_model_cp_spec(cp_id: ModelCheckpointID) -> ModelCheckpointSpec:
                 description="2x upscaler",
             )
         case "ltx-2.3-22b-ic-lora-union-control-ref0.5":
+            # GenSpace reads this file. The Home Video Guide entry has its own copy of the same
+            # weights in `ic-loras/video-guide/`, so neither feature deletes or changes the file
+            # of the other. A user who has both stores 654 MB twice.
+            # When GenSpace is removed: delete this spec and the GenSpace code that reads it.
+            # The `video-guide` entry in `lora_catalog.json` is then the only definition.
             return ModelCheckpointSpec(
                 relative_path=Path("ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"),
                 expected_size_bytes=654_465_352,
@@ -344,6 +382,7 @@ def get_model_cp_spec(cp_id: ModelCheckpointID) -> ModelCheckpointSpec:
                 expected_size_bytes=500_000_000,
                 is_folder=True,
                 repo_id="Intel/dpt-hybrid-midas",
+                revision="11eaf7a1cf4bd70740697dbc216f98980c0aeb03",
                 description="DPT-Hybrid MiDaS depth processor",
             )
         case "yolox-l-torchscript":
@@ -352,6 +391,7 @@ def get_model_cp_spec(cp_id: ModelCheckpointID) -> ModelCheckpointSpec:
                 expected_size_bytes=217_697_649,
                 is_folder=False,
                 repo_id="hr16/yolox-onnx",
+                revision="a124b32c3b7c5cebda1c7cd96178f0f9d2050125",
                 description="YOLOX person detector for pose preprocessing",
             )
         case "dw-ll-ucoco-384-bs5":
@@ -360,6 +400,7 @@ def get_model_cp_spec(cp_id: ModelCheckpointID) -> ModelCheckpointSpec:
                 expected_size_bytes=135_059_124,
                 is_folder=False,
                 repo_id="hr16/DWPose-TorchScript-BatchSize5",
+                revision="359d662a9b33b73f6d0f21732baf8845f17bb4be",
                 description="DW Pose TorchScript processor",
             )
         case "gemma-3-12b-it-qat-q4_0-unquantized":
@@ -609,20 +650,40 @@ def resolve_downloading_dir(models_dir: Path) -> Path:
     return models_dir / ".downloading"
 
 
+def resolve_catalog_staging_root(models_dir: Path) -> Path:
+    return models_dir / ".catalog-downloading"
+
+
+def resolve_catalog_staging_dir(models_dir: Path, session_id: str) -> Path:
+    """The staging folder of one catalog download. It is separate from the model download folder.
+
+    The model download removes its whole folder when it starts and when it ends. A catalog
+    download that staged there would lose its files.
+    """
+    return resolve_catalog_staging_root(models_dir) / _safe_segment(session_id, "session_id")
+
+
+def staged_target_path(staging_dir: Path, cp_id: ModelCheckpointID) -> Path:
+    return staging_dir / _normalized_relative_path(cp_id)
+
+
+def staged_download_dir(staging_dir: Path, cp_id: ModelCheckpointID) -> Path:
+    spec = get_model_cp_spec(cp_id)
+    relative_path = _normalized_relative_path(cp_id)
+    if spec.is_folder:
+        return staging_dir / relative_path
+    parent = relative_path.parent
+    if parent == Path("."):
+        return staging_dir
+    return staging_dir / parent
+
+
 def resolve_downloading_target_path(models_dir: Path, cp_id: ModelCheckpointID) -> Path:
-    return resolve_downloading_dir(models_dir) / _normalized_relative_path(cp_id)
+    return staged_target_path(resolve_downloading_dir(models_dir), cp_id)
 
 
 def resolve_downloading_path(models_dir: Path, cp_id: ModelCheckpointID) -> Path:
-    spec = get_model_cp_spec(cp_id)
-    relative_path = _normalized_relative_path(cp_id)
-    downloading_dir = resolve_downloading_dir(models_dir)
-    if spec.is_folder:
-        return downloading_dir / relative_path
-    parent = relative_path.parent
-    if parent == Path("."):
-        return downloading_dir
-    return downloading_dir / parent
+    return staged_download_dir(resolve_downloading_dir(models_dir), cp_id)
 
 
 def is_cp_downloaded(models_dir: Path, cp_id: ModelCheckpointID) -> bool:
@@ -631,6 +692,13 @@ def is_cp_downloaded(models_dir: Path, cp_id: ModelCheckpointID) -> bool:
         return True
     fallback = _legacy_root_fallback_path(models_dir, cp_id)
     return fallback is not None and _cp_on_disk(fallback, spec)
+
+
+def missing_checkpoints(
+    models_dir: Path, cp_ids: Sequence[ModelCheckpointID]
+) -> list[ModelCheckpointID]:
+    """The checkpoints of `cp_ids` that are not on disk."""
+    return [cp_id for cp_id in cp_ids if not is_cp_downloaded(models_dir, cp_id)]
 
 
 def is_duration_head_ready(models_dir: Path, model_id: LTXLocalModelId) -> bool:
@@ -814,23 +882,52 @@ def _downloaded_variant_ids(
     ]
 
 
-def is_ic_lora_downloaded(models_dir: Path, ic_lora_id: str, filename: str) -> bool:
-    return resolve_ic_lora_path(models_dir, ic_lora_id, filename).exists()
+def is_ic_lora_downloaded(
+    models_dir: Path,
+    ic_lora_id: str,
+    filename: str,
+    requires_checkpoints: Sequence[ModelCheckpointID] = (),
+) -> bool:
+    """True when the weights file and every checkpoint the entry reads are on disk."""
+    return find_installed_ic_lora_path(models_dir, ic_lora_id, [filename], requires_checkpoints) is not None
 
 
-def find_installed_ic_lora_path(models_dir: Path, ic_lora_id: str, filenames: list[str]) -> Path | None:
-    """Return the first existing weights path among ``filenames`` (preferred order)."""
+def find_installed_ic_lora_path(
+    models_dir: Path,
+    ic_lora_id: str,
+    filenames: list[str],
+    requires_checkpoints: Sequence[ModelCheckpointID] = (),
+) -> Path | None:
+    """Return the first existing weights path among ``filenames`` (preferred order).
+
+    The answer is None while a checkpoint the entry reads is missing: the file alone cannot run.
+    """
+    if missing_checkpoints(models_dir, requires_checkpoints):
+        return None
     return _find_installed(models_dir, ic_lora_id, filenames, resolve_ic_lora_path)
 
 
-def is_any_ic_lora_variant_downloaded(models_dir: Path, ic_lora_id: str, filenames: list[str]) -> bool:
-    return find_installed_ic_lora_path(models_dir, ic_lora_id, filenames) is not None
+def is_any_ic_lora_variant_downloaded(
+    models_dir: Path,
+    ic_lora_id: str,
+    filenames: list[str],
+    requires_checkpoints: Sequence[ModelCheckpointID] = (),
+) -> bool:
+    return find_installed_ic_lora_path(models_dir, ic_lora_id, filenames, requires_checkpoints) is not None
 
 
 def downloaded_ic_lora_variant_ids(
-    models_dir: Path, ic_lora_id: str, variants: list[tuple[str, str]]
+    models_dir: Path,
+    ic_lora_id: str,
+    variants: list[tuple[str, str]],
+    requires_checkpoints: Sequence[ModelCheckpointID] = (),
 ) -> list[str]:
-    """Return variant ids whose weights file exists. ``variants`` is ``(id, filename)``."""
+    """Return variant ids whose weights file exists. ``variants`` is ``(id, filename)``.
+
+    The list is empty while a checkpoint the entry reads is missing: the file alone cannot run.
+    """
+    if missing_checkpoints(models_dir, requires_checkpoints):
+        return []
     return _downloaded_variant_ids(models_dir, ic_lora_id, variants, resolve_ic_lora_path)
 
 

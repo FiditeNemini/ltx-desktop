@@ -24,6 +24,14 @@ _ORIENTATION = 0x0112
 _JPEG_QUALITY = 95
 
 
+def oriented_image_size(path: str | Path) -> tuple[int, int]:
+    """The ``(width, height)`` of the image as displayed, read from the header without decoding pixels."""
+    with Image.open(path) as raw:
+        width, height = raw.size
+        sideways = raw.getexif().get(_ORIENTATION) in (5, 6, 7, 8)
+    return (height, width) if sideways else (width, height)
+
+
 def open_oriented_image(path: str | Path) -> Image.Image:
     """Return a loaded image whose pixels match the EXIF display orientation.
 

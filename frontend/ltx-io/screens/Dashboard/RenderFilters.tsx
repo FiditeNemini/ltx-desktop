@@ -9,16 +9,19 @@ export function FilterMultiSelect({
   options,
   selected,
   onChange,
+  formatOption = (value) => value,
 }: {
   label: string;
   options: string[];
   selected: string[];
   onChange: (selected: string[]) => void;
+  /** Display text of a value. The value itself stays the filter key. */
+  formatOption?: (value: string) => string;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const summary = selectionLabel(selected);
+  const summary = selectionLabel(selected, formatOption);
   // A saved value this range lacks stays listed, so it can still be unchecked.
   const listed = [...options, ...selected.filter((value) => !options.includes(value))];
 
@@ -71,7 +74,7 @@ export function FilterMultiSelect({
                   onChange={() => onChange(toggleValue(selected, option))}
                 />
                 <Text as="span" variant="body" size="md">
-                  {option}
+                  {formatOption(option)}
                 </Text>
               </label>
             ))}
@@ -82,9 +85,9 @@ export function FilterMultiSelect({
   );
 }
 
-function selectionLabel(selected: string[]): string {
+function selectionLabel(selected: string[], format: (value: string) => string): string {
   if (selected.length === 0) return "Any";
-  return selected.join(", ");
+  return selected.map(format).join(", ");
 }
 
 function toggleValue(selected: string[], value: string): string[] {

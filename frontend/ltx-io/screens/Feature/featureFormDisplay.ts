@@ -3,6 +3,8 @@ import type {
   FeatureFieldSchema,
   FeatureFormField,
   ImageAssetFieldDef,
+  ImageAssetsFieldDef,
+  MotionPathFieldDef,
   OptionsFieldDef,
   SliderFieldDef,
   TextareaFieldDef,
@@ -12,9 +14,11 @@ import type {
 export type FeatureFormDisplayGroup<TSchema extends FeatureFieldSchema> =
   | { kind: "textarea"; field: TextareaFieldDef<TSchema> }
   | { kind: "image-asset"; field: ImageAssetFieldDef<TSchema> }
+  | { kind: "image-assets"; field: ImageAssetsFieldDef<TSchema> }
   | { kind: "slider"; field: SliderFieldDef<TSchema> }
   | { kind: "audio-asset"; field: AudioAssetFieldDef<TSchema> }
   | { kind: "video-asset"; field: VideoAssetFieldDef<TSchema> }
+  | { kind: "motion-path"; field: MotionPathFieldDef<TSchema> }
   | { kind: "options"; fields: OptionsFieldDef<TSchema>[] };
 
 function assertNever(value: never): never {
@@ -56,9 +60,11 @@ export function applyOptionFieldOrder<TSchema extends FeatureFieldSchema>(
     switch (field.kind) {
       case "textarea":
       case "image-asset":
+      case "image-assets":
       case "slider":
       case "audio-asset":
       case "video-asset":
+      case "motion-path":
         return field;
       case "options":
         return orderedOptions[optionIndex++] ?? field;
@@ -80,6 +86,9 @@ export function groupConsecutiveOptionFields<TSchema extends FeatureFieldSchema>
       case "image-asset":
         groups.push({ kind: "image-asset", field });
         break;
+      case "image-assets":
+        groups.push({ kind: "image-assets", field });
+        break;
       case "slider":
         groups.push({ kind: "slider", field });
         break;
@@ -88,6 +97,9 @@ export function groupConsecutiveOptionFields<TSchema extends FeatureFieldSchema>
         break;
       case "video-asset":
         groups.push({ kind: "video-asset", field });
+        break;
+      case "motion-path":
+        groups.push({ kind: "motion-path", field });
         break;
       case "options": {
         const last = groups.at(-1);

@@ -6,6 +6,7 @@ import { LoraSettingsSection } from './LoraSettingsSection'
 import { ModelsCatalogSearch } from './ModelsCatalogSearch'
 import { ModelsCatalogSearchEmpty } from './ModelsCatalogSearchEmpty'
 import { EncodingEnhanceModelsSection } from './EncodingEnhanceModelsSection'
+import { AssistantModelsSection } from './AssistantModelsSection'
 import { ModelsManagementSection } from './ModelsManagementSection'
 import { SettingsAnchorSection } from './SettingsAnchorSection'
 import styles from './SettingsPageLayout.module.scss'
@@ -20,6 +21,7 @@ export function ModelsSettingsSection({
   const [loraHasMatches, setLoraHasMatches] = useState(true)
   const [imageHasMatches, setImageHasMatches] = useState(true)
   const [encodingHasMatches, setEncodingHasMatches] = useState(true)
+  const [assistantHasMatches, setAssistantHasMatches] = useState(true)
   const normalizedSearch = searchQuery.trim().toLowerCase()
   const isSearching = normalizedSearch.length > 0
   const anySearchMatches =
@@ -27,7 +29,8 @@ export function ModelsSettingsSection({
     baseHasMatches ||
     loraHasMatches ||
     imageHasMatches ||
-    encodingHasMatches
+    encodingHasMatches ||
+    assistantHasMatches
 
   const handleSearchChange = (value: string) => {
     setSearchQuery(value)
@@ -35,6 +38,7 @@ export function ModelsSettingsSection({
     setLoraHasMatches(true)
     setImageHasMatches(true)
     setEncodingHasMatches(true)
+    setAssistantHasMatches(true)
   }
 
   return (
@@ -63,6 +67,11 @@ export function ModelsSettingsSection({
           active={sectionActive}
           searchQuery={normalizedSearch}
           onSearchHasMatches={setEncodingHasMatches}
+        />
+        <AssistantModelsSection
+          active={sectionActive}
+          searchQuery={normalizedSearch}
+          onSearchHasMatches={setAssistantHasMatches}
         />
       </div>
       {isSearching && !anySearchMatches ? (

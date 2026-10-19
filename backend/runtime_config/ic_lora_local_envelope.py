@@ -1,6 +1,6 @@
 """Measured IC-LoRA spatial envelope (LTX-2 1.3.0).
 
-NOT re-measured on 1.4.0. 1.4 moved the reference encode into the chunk flow, so re-run the
+NOT re-measured on 1.4.1. 1.4 moved the reference encode into the chunk flow, so re-run the
 bump gate's IC-LoRA scenarios (``iclora_stage2_on``, ``iclora_day_to_night``) on CUDA and
 confirm these limits still hold before tightening or loosening them.
 
@@ -18,10 +18,13 @@ has no token ceiling yet.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 from api_types import TargetResolution
-from runtime_config.grid_fit import fit_in_box
+from runtime_config.grid_fit import fit_in_box, grows_into_box
+from runtime_config.ic_lora_tiling import IcLoraTiling
 
 IC_LORA_SOURCE_TOO_LARGE = "IC_LORA_SOURCE_TOO_LARGE"
 IC_LORA_V1_ENVELOPE_MESSAGE = (
@@ -29,7 +32,7 @@ IC_LORA_V1_ENVELOPE_MESSAGE = (
     "(max 1080p). Lower the resolution."
 )
 
-# Local 1080p grid (ltx_capabilities._TWO_PASS_PIXELS_16_9).
+# Local 1080p grid (ltx_capabilities.TWO_PASS_PIXELS_16_9).
 _MAX_SHORT_EDGE = 1088
 _MAX_LONG_EDGE = 1920
 
@@ -45,14 +48,22 @@ def stage1_size(canvas_width: int, canvas_height: int) -> tuple[int, int]:
     return canvas_width // 2, canvas_height // 2
 
 
-def over_spatial_cap(width: int, height: int) -> bool:
-    """True when a frame is larger than the 1920x1088 cell, turned either way.
+def spatial_cap(tiling: IcLoraTiling | None = None) -> tuple[int, int]:
+    """(long, short) edge cap of the output. A tiling can raise it (``output_cap``)."""
+    raised = None if tiling is None else tiling.output_cap()
+    return raised if raised is not None else (_MAX_LONG_EDGE, _MAX_SHORT_EDGE)
+
+
+def over_spatial_cap(width: int, height: int, tiling: IcLoraTiling | None = None) -> bool:
+    """True when a frame is larger than the cell (1920x1088), turned either way.
 
     Pass the OUTPUT size: stage 1 for a single-stage job, the stage-2 canvas for a
-    two-stage job (``heavy_pass_size``). The job budget uses the same rule.
+    two-stage job (``heavy_pass_size``). The job budget uses the same rule. A tiling
+    can raise the cell for its LoRA.
     """
-    too_wide = max(width, height) > _MAX_LONG_EDGE
-    too_tall = min(width, height) > _MAX_SHORT_EDGE
+    max_long, max_short = spatial_cap(tiling)
+    too_wide = max(width, height) > max_long
+    too_tall = min(width, height) > max_short
     return too_tall or too_wide
 
 
@@ -80,6 +91,12 @@ _VAE_SPATIAL_STRIDE = 32
 _STAGE_2_IC_LORA_GRID = 2 * _VAE_SPATIAL_STRIDE
 _DEFAULT_GRID = 128
 
+# How far a requested resolution may exceed the source, for a recipe that keeps the IC-LoRA
+# on stage 2. Stage 1 runs at half the canvas, so a 2x canvas runs stage 1 at the source size
+# and stage 2 adds the other 2x. Shared with the Home resolution control.
+_STAGE_2_UPSCALE_PATH = Path(__file__).resolve().parents[2] / "shared" / "ic-lora-stage-2-upscale.json"
+STAGE_2_MAX_SCALE = float(json.loads(_STAGE_2_UPSCALE_PATH.read_text(encoding="utf-8"))["maxScale"])
+
 
 def _cap_box(width: int, height: int) -> tuple[int, int]:
     """The 1920x1088 cell, turned the same way as the source."""
@@ -102,14 +119,27 @@ def _two_stage_output_size(
 
     With the IC-LoRA on stage 2, the canvas fits the source into the requested
     resolution (or the 1920x1088 cell) on a 64 grid, close to the source aspect
-    (``fit_in_box``). Every other recipe snaps each edge down to a multiple of 128,
-    which mirrors the t2v two-stage landing size.
+    (``fit_in_box``). A source too small to fill the requested resolution may grow up to
+    ``STAGE_2_MAX_SCALE`` times its size and never past the cell, so stage 2 upscales a
+    small clip. A source that already fills it keeps its own size, as does a job with no
+    requested resolution. The canvas is the stage-2 size, so the heavy pass and the cap
+    are those of a source of that size. Every other recipe snaps each edge down to a
+    multiple of 128, which mirrors the t2v two-stage landing size.
     """
     if stage_2_ic_lora:
         box_w, box_h = _cap_box(input_width, input_height)
-        if resolution is not None:
-            box_w, box_h = min(box_w, resolution.width), min(box_h, resolution.height)
-        return fit_in_box(input_width, input_height, box_w, box_h, _STAGE_2_IC_LORA_GRID)
+        if resolution is None:
+            return fit_in_box(input_width, input_height, box_w, box_h, _STAGE_2_IC_LORA_GRID)
+        box_w, box_h = min(box_w, resolution.width), min(box_h, resolution.height)
+        grows = grows_into_box(input_width, input_height, box_w, box_h, _STAGE_2_IC_LORA_GRID)
+        return fit_in_box(
+            input_width,
+            input_height,
+            box_w,
+            box_h,
+            _STAGE_2_IC_LORA_GRID,
+            max_scale=STAGE_2_MAX_SCALE if grows else 1.0,
+        )
     target_w = resolution.width if resolution else input_width
     target_h = resolution.height if resolution else input_height
     width = min(target_w, input_width)
@@ -120,7 +150,9 @@ def _two_stage_output_size(
     )
 
 
-def fit_ic_lora_stage1(width: int, height: int) -> tuple[int, int]:
+def fit_ic_lora_stage1(
+    width: int, height: int, tiling: IcLoraTiling | None = None
+) -> tuple[int, int]:
     """Stage-1 size the skip-stage-2 pipeline will actually emit, inside the cap.
 
     The pipeline rounds the 2× canvas onto a 128 grid, so a 270p/360p target
@@ -130,16 +162,17 @@ def fit_ic_lora_stage1(width: int, height: int) -> tuple[int, int]:
     canvas_w = max(128, round(width * 2 / 128) * 128)
     canvas_h = max(128, round(height * 2 / 128) * 128)
     stage_w, stage_h = canvas_w // 2, canvas_h // 2
-    if not over_spatial_cap(stage_w, stage_h):
+    if not over_spatial_cap(stage_w, stage_h, tiling):
         return stage_w, stage_h
+    max_long, max_short = spatial_cap(tiling)
     long_is_width = stage_w >= stage_h
     long_edge = stage_w if long_is_width else stage_h
     short_edge = stage_h if long_is_width else stage_w
-    scale = min(_MAX_LONG_EDGE / long_edge, _MAX_SHORT_EDGE / short_edge)
+    scale = min(max_long / long_edge, max_short / short_edge)
     short = max(64, int(short_edge * scale) // 64 * 64)
     ratio = long_edge / short_edge
     long = max(64, round(short * ratio) // 64 * 64)
-    while short > 64 and (long > _MAX_LONG_EDGE or short > _MAX_SHORT_EDGE):
+    while short > 64 and (long > max_long or short > max_short):
         short -= 64
         long = max(64, round(short * ratio) // 64 * 64)
     if long_is_width:
@@ -155,6 +188,7 @@ def ic_lora_output_canvas(
     input_height: int,
     resolution: TargetResolution | None,
     stage_2_ic_lora: bool = False,
+    tiling: IcLoraTiling | None = None,
 ) -> tuple[int, int, float]:
     """Canvas + factor for catalog and built-in (canny/depth) generate paths.
 
@@ -172,7 +206,7 @@ def ic_lora_output_canvas(
         )
         return width, height, 1.0
     if resolution is not None:
-        stage_w, stage_h = fit_ic_lora_stage1(resolution.width, resolution.height)
+        stage_w, stage_h = fit_ic_lora_stage1(resolution.width, resolution.height, tiling)
         return stage_w * 2, stage_h * 2, 1.0
     if resolution_factor == 0:
         return max(128, 2 * input_width), max(128, 2 * input_height), 1.0

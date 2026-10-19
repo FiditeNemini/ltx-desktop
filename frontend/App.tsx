@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
-import { Loader2, AlertCircle } from 'lucide-react'
+import { Loader2 } from 'lucide-react'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { RouterProvider } from 'react-router'
 import { ApiClient } from './lib/api-client'
@@ -17,7 +17,7 @@ import { logger } from './lib/logger'
 import { LaunchGate } from './components/FirstRunSetup'
 import { usePythonSetup } from './hooks/use-python-setup'
 import { AppShellLayoutProvider } from './components/AppShell'
-import { LogViewer } from './components/LogViewer'
+import { BackendCrashedScreen } from './components/BackendCrashedScreen'
 import { StartupLoader } from './components/startup-loader/StartupLoader'
 import { Button } from './components/ui/button'
 import { ThemeProvider } from '@/ds/styles/themes/useTheme'
@@ -312,23 +312,7 @@ function AppContent() {
       )
       break
     case 'backend-dead':
-      earlyView = (
-        <div className="h-screen bg-background flex items-center justify-center p-6">
-          <div className="w-full max-w-5xl rounded-xl border border-zinc-700 bg-zinc-900/80 p-6 shadow-2xl">
-            <div className="text-center">
-              <AlertCircle className="h-12 w-12 text-red-500 mx-auto mb-4" />
-              <h2 className="text-xl font-semibold text-foreground mb-2">The backend process crashed and could not be restarted</h2>
-              <p className="text-muted-foreground mb-4">Review the logs below and restart the application.</p>
-            </div>
-            <div className="h-[50vh]">
-              <LogViewer isOpen={true} onClose={() => {}} embedded={true} />
-            </div>
-            <div className="mt-4 flex justify-center">
-              <Button onClick={() => window.location.reload()}>Restart Application</Button>
-            </div>
-          </div>
-        </div>
-      )
+      earlyView = <BackendCrashedScreen />
       break
     case 'splash':
       // Still loading beneath the splash: render nothing until ready.

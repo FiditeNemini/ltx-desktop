@@ -38,6 +38,21 @@ def timeout_for_source_duration(duration_seconds: float) -> float:
     return min(STITCH_TIMEOUT_CAP_SECONDS, max(FFMPEG_TIMEOUT_SECONDS, scaled))
 
 
+# Slowest encode of a frame that we plan for (VP9 with alpha or a lossless guide on a
+# CPU with 8 cores ran about 70 Mpx/s at 8K). The timeout is a ceiling, not a target.
+_PIXELS_PER_SECOND = 10_000_000
+PIXEL_TIMEOUT_CAP_SECONDS = 3600.0
+
+
+def timeout_for_pixels(width: int, height: int, frames: int) -> float:
+    """How long an encode of this many pixels may run. Never below the shared timeout.
+
+    A 1080p clip of 10 s stays at the shared timeout. An 8K clip needs minutes.
+    """
+    scaled = max(0, width) * max(0, height) * max(0, frames) / _PIXELS_PER_SECOND
+    return min(PIXEL_TIMEOUT_CAP_SECONDS, max(FFMPEG_TIMEOUT_SECONDS, scaled))
+
+
 def ffmpeg_seconds(value: float) -> str:
     """``str(1e-05)`` is scientific notation, which ``-ss``/``-t`` reject."""
     return f"{value:.6f}"

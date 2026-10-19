@@ -10,7 +10,7 @@ import {
 import type { Asset, TimelineClip, LetterboxSettings, TextOverlayStyle, TransitionType } from '../../types/project-model' // EFFECTS HIDDEN: removed EffectMask
 import { DEFAULT_COLOR_CORRECTION, DEFAULT_LETTERBOX } from '../../types/project-model' // EFFECTS HIDDEN: removed EFFECT_DEFINITIONS, DEFAULT_EFFECT_MASK
 import { TEXT_PRESETS } from '../../types/project'
-import { namedResolutionTier } from '../../lib/video-resolution'
+import { namedResolutionTier, videoGenerationResolutionLabel } from '../../lib/video-resolution'
 import { formatTime } from './video-editor-utils'
 import { Tooltip } from '../../components/ui/tooltip'
 import {
@@ -286,7 +286,7 @@ export function ClipPropertiesPanel(props: ClipPropertiesPanelProps) {
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-xs text-fg-secondary">Gen Resolution</span>
-                    <span className="text-xs text-fg-primary">{genParams.resolution}</span>
+                    <span className="text-xs text-fg-primary">{genParams.resolution ? videoGenerationResolutionLabel(genParams.resolution) : genParams.resolution}</span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-xs text-fg-secondary">FPS</span>

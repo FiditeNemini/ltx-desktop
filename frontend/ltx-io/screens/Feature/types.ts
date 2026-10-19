@@ -1,12 +1,24 @@
+import type { BudgetReadout } from "@/lib/budget-figure";
 import type { HomeFeatureId } from "../../../lib/home-features";
+import type { MotionPath } from "../../lib/motionPathSampler";
 
 export type FieldOption<TValue extends string | number = string | number> = {
   value: TValue;
   label: string;
-  /** Soft caveat shown on hover, e.g. untrained aspect ratios. */
+  /** Soft caveat or budget-risk line shown on hover. */
   warning?: string;
+  /** Gray quality caveat, or yellow budget risk. Omitted means caveat. */
+  warningTone?: "caveat" | "risk";
   /** The option is listed but cannot be picked. The text says why. */
   disabledReason?: string;
+  /** A line under the label in the picker list. `disabledReason` replaces it. */
+  caption?: string;
+  /** A picture next to the label, in the list and in the picker box. */
+  thumbnail?: string;
+  /** Structured need/have pair. Present only for a budget limit. */
+  budget?: BudgetReadout | null;
+  /** A caveat the budget badge carries in its tooltip, because the badge replaces the warning icon. */
+  budgetNote?: string;
 };
 
 export type AssetRef = {
@@ -21,17 +33,22 @@ export type FeatureFieldKind =
   | "textarea"
   | "options"
   | "image-asset"
+  | "image-assets"
   | "slider"
   | "audio-asset"
-  | "video-asset";
+  | "video-asset"
+  | "motion-path";
 
 export type FeatureFieldSpec =
   | { kind: "textarea"; value?: never }
   | { kind: "options"; value: string | number | null }
   | { kind: "image-asset"; value: AssetRef | null }
+  | { kind: "image-assets"; value: AssetRef[] }
   | { kind: "slider"; value: number }
   | { kind: "audio-asset"; value: AssetRef | null }
-  | { kind: "video-asset"; value: AssetRef | null };
+  | { kind: "video-asset"; value: AssetRef | null }
+  /** The tracks of a path field. The list is empty until the user draws one. */
+  | { kind: "motion-path"; value: MotionPath[] };
 
 export type FeatureFieldSchema = Record<string, FeatureFieldSpec>;
 
@@ -65,6 +82,9 @@ export type OptionsFieldKey<TSchema extends FeatureFieldSchema> =
 export type ImageAssetFieldKey<TSchema extends FeatureFieldSchema> =
   FieldKeyOfKind<TSchema, "image-asset">;
 
+export type ImageAssetsFieldKey<TSchema extends FeatureFieldSchema> =
+  FieldKeyOfKind<TSchema, "image-assets">;
+
 export type SliderFieldKey<TSchema extends FeatureFieldSchema> =
   FieldKeyOfKind<TSchema, "slider">;
 
@@ -73,6 +93,9 @@ export type AudioAssetFieldKey<TSchema extends FeatureFieldSchema> =
 
 export type VideoAssetFieldKey<TSchema extends FeatureFieldSchema> =
   FieldKeyOfKind<TSchema, "video-asset">;
+
+export type MotionPathFieldKey<TSchema extends FeatureFieldSchema> =
+  FieldKeyOfKind<TSchema, "motion-path">;
 
 type FeatureFieldBase<TKey extends string> = {
   id: string;
@@ -125,6 +148,24 @@ export type ImageAssetFieldDef<TSchema extends FeatureFieldSchema> = {
   >;
 }[ImageAssetFieldKey<TSchema>];
 
+export type ImageAssetsFieldDefForKey<
+  TSchema extends FeatureFieldSchema,
+  TKey extends ImageAssetsFieldKey<TSchema>,
+> = FeatureFieldBase<TKey> & {
+  kind: "image-assets";
+  /** The most images the field takes. */
+  maxCount: number;
+  /** One line under the label, shown while the list is empty and after it fills. */
+  hint?: string;
+};
+
+export type ImageAssetsFieldDef<TSchema extends FeatureFieldSchema> = {
+  [TKey in ImageAssetsFieldKey<TSchema>]: ImageAssetsFieldDefForKey<
+    TSchema,
+    TKey
+  >;
+}[ImageAssetsFieldKey<TSchema>];
+
 export type SliderFieldDefForKey<
   TSchema extends FeatureFieldSchema,
   TKey extends SliderFieldKey<TSchema>,
@@ -169,13 +210,39 @@ export type VideoAssetFieldDef<TSchema extends FeatureFieldSchema> = {
   >;
 }[VideoAssetFieldKey<TSchema>];
 
+export type MotionPathFieldDefForKey<
+  TSchema extends FeatureFieldSchema,
+  TKey extends MotionPathFieldKey<TSchema>,
+> = FeatureFieldBase<TKey> & {
+  kind: "motion-path";
+  /**
+   * The one field kind that writes other fields. The tile holds the image and the editor
+   * holds the clip length, so a `MotionPathFieldEdit` can change `imageKey` or `durationKey`
+   * as well as this field.
+   */
+  imageKey: ImageAssetFieldKey<TSchema>;
+  durationKey: OptionsFieldKey<TSchema>;
+  durationOptions: FieldOption<number>[];
+};
+
+/** What the path tile reports: a new image, or the accepted tracks with their clip length. */
+export type MotionPathFieldEdit =
+  | { image: AssetRef | null }
+  | { paths: MotionPath[]; duration: number };
+
+export type MotionPathFieldDef<TSchema extends FeatureFieldSchema> = {
+  [TKey in MotionPathFieldKey<TSchema>]: MotionPathFieldDefForKey<TSchema, TKey>;
+}[MotionPathFieldKey<TSchema>];
+
 export type FeatureFormField<TSchema extends FeatureFieldSchema> =
   | TextareaFieldDef<TSchema>
   | OptionsFieldDef<TSchema>
   | ImageAssetFieldDef<TSchema>
+  | ImageAssetsFieldDef<TSchema>
   | SliderFieldDef<TSchema>
   | AudioAssetFieldDef<TSchema>
-  | VideoAssetFieldDef<TSchema>;
+  | VideoAssetFieldDef<TSchema>
+  | MotionPathFieldDef<TSchema>;
 
 export type FeatureFormModel<TSchema extends FeatureFieldSchema> = {
   fields: FeatureFormField<TSchema>[];
@@ -219,6 +286,15 @@ export function createFeatureFieldChange<
 }): FeatureFieldChange<TSchema>;
 export function createFeatureFieldChange<
   TSchema extends FeatureFieldSchema,
+  TKey extends ImageAssetsFieldKey<TSchema>,
+>(change: {
+  kind: "image-assets";
+  fieldId: string;
+  dataKey: TKey;
+  value: AssetRef[];
+}): FeatureFieldChange<TSchema>;
+export function createFeatureFieldChange<
+  TSchema extends FeatureFieldSchema,
   TKey extends SliderFieldKey<TSchema>,
 >(change: {
   kind: "slider";
@@ -243,6 +319,15 @@ export function createFeatureFieldChange<
   fieldId: string;
   dataKey: TKey;
   value: TSchema[TKey]["value"];
+}): FeatureFieldChange<TSchema>;
+export function createFeatureFieldChange<
+  TSchema extends FeatureFieldSchema,
+  TKey extends MotionPathFieldKey<TSchema>,
+>(change: {
+  kind: "motion-path";
+  fieldId: string;
+  dataKey: TKey;
+  value: MotionPath[];
 }): FeatureFieldChange<TSchema>;
 export function createFeatureFieldChange<
   TSchema extends FeatureFieldSchema,
@@ -294,6 +379,13 @@ export function readImageAssetFieldValue<
   );
 }
 
+export function readImageAssetsFieldValue<
+  TSchema extends FeatureFieldSchema,
+  TKey extends ImageAssetsFieldKey<TSchema>,
+>(values: FeatureValues<TSchema>, dataKey: TKey): AssetRef[] {
+  return readConstrainedFieldValue<TSchema, TKey, AssetRef[]>(values, dataKey);
+}
+
 export function readSliderFieldValue<
   TSchema extends FeatureFieldSchema,
   TKey extends SliderFieldKey<TSchema>,
@@ -319,6 +411,13 @@ export function readVideoAssetFieldValue<
     values,
     dataKey,
   );
+}
+
+export function readMotionPathFieldValue<
+  TSchema extends FeatureFieldSchema,
+  TKey extends MotionPathFieldKey<TSchema>,
+>(values: FeatureValues<TSchema>, dataKey: TKey): MotionPath[] {
+  return readConstrainedFieldValue<TSchema, TKey, MotionPath[]>(values, dataKey);
 }
 
 export function applyFeatureFieldChange<TSchema extends FeatureFieldSchema>(

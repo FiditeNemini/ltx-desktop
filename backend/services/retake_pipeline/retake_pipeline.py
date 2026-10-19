@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ltx_core.components.guiders import MultiModalGuiderParams
     from ltx_core.loader import LoraPathStrengthAndSDOps
     from ltx_core.quantization import QuantizationPolicy
+    from ltx_pipelines.utils.types import OffloadMode
 
 
 class RetakePipeline(Protocol):
@@ -21,6 +22,7 @@ class RetakePipeline(Protocol):
         device: "torch.device",
         streaming_prefetch_count: int | None,
         *,
+        offload_mode: OffloadMode,
         loras: list["LoraPathStrengthAndSDOps"] | None = None,
         quantization: "QuantizationPolicy | None" = None,
         video_vae_path: str | None = None,

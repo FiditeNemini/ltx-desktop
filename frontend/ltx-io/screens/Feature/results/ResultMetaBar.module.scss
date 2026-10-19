@@ -1,5 +1,6 @@
 /* The left side stays on one row and scrolls sideways when it does not fit (phones); the time stays put on the right. */
 .container {
+  gap: var(--spacing-lg);
   width: 100%;
   padding: var(--spacing-xs) 0;
   position: relative;
@@ -68,4 +69,30 @@
   flex: 0 0 auto;
   color: var(--semantic-fg-secondary);
   white-space: nowrap;
+}
+
+@container assistant-result (max-width: 400px) {
+  .container {
+    flex-wrap: wrap;
+    gap: var(--spacing-sm);
+  }
+
+  .left,
+  .promptGroup {
+    width: 100%;
+  }
+
+  .promptGroup {
+    flex-wrap: wrap;
+  }
+
+  .prompt {
+    max-width: 100%;
+    width: 100%;
+  }
+
+  .badges {
+    flex-wrap: wrap;
+    white-space: nowrap;
+  }
 }

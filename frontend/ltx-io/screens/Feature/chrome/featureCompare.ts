@@ -1,10 +1,11 @@
-import { getIcLoraRecipe, isIcLoraRecipeId } from "@/lib/ic-lora-recipes";
+import { getIcLoraRecipe, isIcLoraVideoRecipeId } from "@/lib/ic-lora-recipes";
 import type { HomeFeatureId } from "@/lib/home-features";
 
 import {
   PACKAGED_EXPLORE_EXAMPLES,
   PACKAGED_EXPLORE_SEEDS,
 } from "../../../assets/packaged-explore-assets";
+import motionTrackSourceUrl from "../../../assets/motion-track/example-input.webm";
 import { IC_LORA_RECIPE_EXAMPLE_MEDIA } from "../icLoraRecipeExampleMedia";
 import { LORA_RECIPE_EXAMPLE_MEDIA } from "../loraRecipeExampleMedia";
 
@@ -66,7 +67,7 @@ function packagedExampleResult(
 export function resolveFeatureCompare(
   featureId: HomeFeatureId,
 ): FeatureCompare | null {
-  if (isIcLoraRecipeId(featureId)) {
+  if (isIcLoraVideoRecipeId(featureId)) {
     return {
       mode: "curtain",
       sourceVideoUrl: seedUrl(getIcLoraRecipe(featureId).seed.kind),
@@ -75,6 +76,12 @@ export function resolveFeatureCompare(
   }
 
   switch (featureId) {
+    // The input is the reference sheet. The result is the clip it drives.
+    case "ingredients":
+      return startFrameToggle(
+        seedUrl("ingredients-sheet"),
+        IC_LORA_RECIPE_EXAMPLE_MEDIA.ingredients,
+      );
     case "retake": {
       const result = packagedExampleResult(
         "retake-example-video",
@@ -97,6 +104,13 @@ export function resolveFeatureCompare(
         result,
       };
     }
+    // The source clip shows the image with the drawn path. The result follows it.
+    case "motion-track":
+      return {
+        mode: "toggle",
+        source: { videoUrl: motionTrackSourceUrl },
+        result: IC_LORA_RECIPE_EXAMPLE_MEDIA["motion-track"],
+      };
     case "image-to-video":
       return startFrameToggle(
         seedUrl("image-to-video-start-frame"),

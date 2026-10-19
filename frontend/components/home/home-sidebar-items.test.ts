@@ -51,6 +51,7 @@ describe("planHomeSidebarNavItems", () => {
       })),
       [
         { id: "home", path: paths.home },
+        { id: "assistant", path: paths.assistant },
         { id: "assets", path: paths.assets },
         { id: "remote", path: paths.remote },
         { id: "projects", path: paths.projects },
@@ -62,12 +63,12 @@ describe("planHomeSidebarNavItems", () => {
     );
   });
 
-  it("keeps Home, Assets, and features — without Projects or Remote — on the remote-app sidebar", () => {
+  it("keeps Home, Assistant, Assets, and features — without Projects or Remote — on the remote-app sidebar", () => {
     const plan = planHomeSidebarItems({ host: "remote", localViable: true });
     const items = planHomeSidebarNavItems(plan);
     assert.deepEqual(
       items.map((item) => item.id),
-      ["home", "assets", ...HOME_SIDEBAR_FEATURED_FEATURES.map((feature) => feature.id)],
+      ["home", "assistant", "assets", ...HOME_SIDEBAR_FEATURED_FEATURES.map((feature) => feature.id)],
     );
     for (const item of items) {
       assert.equal(item.path.includes("?"), false);
@@ -79,7 +80,7 @@ describe("planHomeSidebarNavItems", () => {
     const plan = planHomeSidebarItems({ host: "desktop", localViable: false });
     assert.deepEqual(
       planHomeSidebarNavItems(plan).map((item) => item.id),
-      ["home", "assets", "projects"],
+      ["home", "assistant", "assets", "projects"],
     );
   });
 
@@ -114,6 +115,7 @@ describe("planHomeSidebarNavItems", () => {
     );
     assert.deepEqual(kinds, [
       "home",
+      "assistant",
       "assets",
       "remote",
       "projects",
@@ -142,6 +144,7 @@ describe("planHomeSidebarNavItems", () => {
     );
     assert.deepEqual(kinds, [
       "home",
+      "assistant",
       "assets",
       "remote",
       "projects",
@@ -151,6 +154,8 @@ describe("planHomeSidebarNavItems", () => {
       "image-to-video",
       "audio-to-video",
       "extend",
+      "alpha-gen",
+      "cinemagraph",
     ]);
   });
 
@@ -162,6 +167,7 @@ describe("planHomeSidebarNavItems", () => {
     ]).map((entry) => (entry.kind === "item" ? entry.item.id : entry.id));
     assert.deepEqual(kinds, [
       "home",
+      "assistant",
       "assets",
       "remote",
       "projects",
@@ -172,15 +178,17 @@ describe("planHomeSidebarNavItems", () => {
       "image-to-video",
       "audio-to-video",
       "extend",
+      "alpha-gen",
+      "cinemagraph",
     ]);
   });
 });
 
 describe("sidebar Featured list", () => {
-  it("lists Image to Video, Audio to Video, and Extend in that order, but not Day to Night or the hidden AlphaGen", () => {
+  it("lists Image to Video, Audio to Video, Extend, AlphaGen, and Cinemagraph in that order, but not Day to Night", () => {
     assert.deepEqual(
       HOME_SIDEBAR_FEATURED_FEATURES.map((feature) => feature.id),
-      ["image-to-video", "audio-to-video", "extend"],
+      ["image-to-video", "audio-to-video", "extend", "alpha-gen", "cinemagraph"],
     );
   });
 
@@ -229,6 +237,7 @@ describe("selectHomeSidebarNavItem", () => {
     }
     assert.deepEqual(calls, [
       { path: paths.home, clearActiveProject: true },
+      { path: paths.assistant, clearActiveProject: false },
       { path: paths.assets, clearActiveProject: false },
       { path: paths.remote, clearActiveProject: true },
       { path: paths.projects, clearActiveProject: true },
@@ -239,7 +248,7 @@ describe("selectHomeSidebarNavItem", () => {
     ]);
   });
 
-  it("navigates Home, Assets, and features on Remote without project routes", () => {
+  it("navigates Home, Assistant, Assets, and features on Remote without project routes", () => {
     const calls: Array<{ path: string; clearActiveProject: boolean }> = [];
     const actions = recordActions("remote", calls);
     const plan = planHomeSidebarItems({ host: "remote", localViable: true });
@@ -248,6 +257,7 @@ describe("selectHomeSidebarNavItem", () => {
     }
     assert.deepEqual(calls, [
       { path: paths.home, clearActiveProject: true },
+      { path: paths.assistant, clearActiveProject: false },
       { path: paths.assets, clearActiveProject: false },
       ...HOME_SIDEBAR_FEATURED_FEATURES.map((feature) => ({
         path: feature.path,

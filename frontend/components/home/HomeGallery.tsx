@@ -2,9 +2,10 @@ import { useCallback, useRef, useState } from 'react'
 import { Text } from '@/ds/Text/Text'
 import {
   getHomeFeature,
-  HOME_FEATURE_SECTIONS,
+  offeredHomeFeatureSections,
   type HomeFeatureDefinition,
 } from '../../lib/home-features.ts'
+import { useHighResVideoToVideoEnabled } from '../../ltx-io/hooks/useHighResVideoToVideoEnabled.ts'
 import { HOME_LORA_GALLERY_SECTIONS } from '../../lib/home-lora-gallery.ts'
 import { HOME_FEATURE_MEDIA, type HomeFeatureMedia } from './home-media'
 import {
@@ -28,9 +29,10 @@ function gallerySectionHeadingId(heading: string): string {
 }
 
 export function HomeGallery({ onOpen }: HomeGalleryProps) {
+  const highResVideoToVideo = useHighResVideoToVideoEnabled()
   return (
     <div className={styles.gallery}>
-      {HOME_FEATURE_SECTIONS.map((section) => (
+      {offeredHomeFeatureSections(highResVideoToVideo).map((section) => (
         <GallerySection
           key={section.id}
           heading={section.heading}

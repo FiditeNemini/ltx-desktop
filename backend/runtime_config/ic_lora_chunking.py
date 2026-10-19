@@ -5,22 +5,31 @@ follows the window, not the clip. The rule sizes the heaviest pass that carries 
 IC-LoRA reference: stage 1 for a single-stage job, the stage-2 canvas for a recipe that
 keeps the IC-LoRA on stage 2. A two-stage job without the IC-LoRA on stage 2 never
 chunks. The rule fires only above the former 1024x576 size and past the largest
-one-window token count with a measured pass. A chunked run is not measured yet.
+one-window token count with a measured pass. A chunked job prices one window:
+windows run flat with no growth, so one window is the whole ask.
 
 The job budget (``decide_ic_lora_job``) also chunks a job that may chunk but does not fit
 unchunked. It is the one place that decides. The pipeline receives the window it returns.
 """
 
+
 from __future__ import annotations
 
 from frame_math import snap_to_frame_grid
 from runtime_config.ic_lora_stage_mode import IcLoraStageMode, heavy_pass_size
-from runtime_config.ic_lora_tiling import IcLoraTiling, transformer_pass_size
+from runtime_config.ic_lora_tiling import DEFAULT_CARRY_FRAMES, IcLoraTiling, transformer_pass_size
 from runtime_config.video_job_budget import video_tokens
 
 # ltx-pipelines default layout: 97-frame windows, 25-frame carry.
 IC_LORA_CHUNK_PIXEL_FRAMES = 97
-IC_LORA_CHUNK_CARRY_FRAMES = 25
+IC_LORA_CHUNK_CARRY_FRAMES = DEFAULT_CARRY_FRAMES
+
+
+def ic_lora_carry_frames(tiling: IcLoraTiling | None) -> int:
+    """The carry an IC-LoRA run chunks with: the LoRA's own, else the pipeline default."""
+    if tiling is not None and tiling.carry_frames is not None:
+        return tiling.carry_frames
+    return IC_LORA_CHUNK_CARRY_FRAMES
 
 _FORMER_CAP_PIXELS = 1024 * 576
 IC_LORA_MAX_SINGLE_WINDOW_TOKENS = 32_940

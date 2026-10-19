@@ -32,10 +32,10 @@ from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio, SpatioTemporalScaleFactors
 from ltx_pipelines.distilled import should_use_ancestral_sampler
 from ltx_pipelines.utils.media_io import encode_video, get_videostream_metadata
-from ltx_pipelines.utils.types import ModalitySpec, VideoAudio
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, VideoAudio
 
 from api_types import ExtendMode
-from services.ltx_pipeline_common import build_model_paths, offload_mode_for_prefetch_count, resolve_tiling_config
+from services.ltx_pipeline_common import build_model_paths, resolve_tiling_config
 from services.services_utils import TilingConfigType
 from services.retake_pipeline.frame_rate import restamp_to_source_rate
 from services.retake_pipeline.retake_pipeline import RetakePipeline
@@ -58,6 +58,7 @@ class LTXRetakePipeline:
         device: torch.device,
         streaming_prefetch_count: int | None,
         *,
+        offload_mode: OffloadMode,
         loras: list[LoraPathStrengthAndSDOps] | None = None,
         quantization: QuantizationPolicy | None = None,
         video_vae_path: str | None = None,
@@ -69,6 +70,7 @@ class LTXRetakePipeline:
             gemma_root=gemma_root,
             device=device,
             streaming_prefetch_count=streaming_prefetch_count,
+            offload_mode=offload_mode,
             loras=loras or [],
             quantization=quantization,
             video_vae_path=video_vae_path,
@@ -83,6 +85,7 @@ class LTXRetakePipeline:
         device: torch.device,
         streaming_prefetch_count: int | None,
         *,
+        offload_mode: OffloadMode,
         loras: list[LoraPathStrengthAndSDOps],
         quantization: QuantizationPolicy | None,
         video_vae_path: str | None = None,
@@ -100,7 +103,6 @@ class LTXRetakePipeline:
 
         self.device = device
         self.dtype = torch.bfloat16
-        offload_mode = offload_mode_for_prefetch_count(streaming_prefetch_count, device)
         model_paths = build_model_paths(
             checkpoint_path,
             gemma_root,

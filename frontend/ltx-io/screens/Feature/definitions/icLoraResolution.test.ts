@@ -11,6 +11,7 @@ const FHD = { videoWidth: 1920, videoHeight: 1080 };
 const HD = { videoWidth: 1280, videoHeight: 720 };
 const SMALL = { videoWidth: 320, videoHeight: 240 };
 const UNKNOWN = { videoWidth: null, videoHeight: null };
+const SD = { videoWidth: 960, videoHeight: 540 };
 
 describe("icLoraResolutionFor", () => {
   it("keeps the chosen cell when the source offers it", () => {
@@ -86,5 +87,32 @@ describe("icLoraResolutionOptions", () => {
     assert.equal(original(253), undefined);
     assert.equal(original(704), "720p");
     assert.equal(original(703), "540p");
+  });
+});
+
+describe("a two-stage recipe", () => {
+  const values = (options: ReturnType<typeof icLoraResolutionOptions>) =>
+    options.map((option) => option.value);
+
+  it("offers 1080p for a 540p source, which a single-stage recipe hides", () => {
+    assert.equal(icLoraResolutionOffered("1080p", { ...SD, twoStage: true }), true);
+    assert.equal(icLoraResolutionOffered("1080p", SD), false);
+  });
+
+  it("hides a cell above twice the source", () => {
+    assert.equal(icLoraResolutionOffered("1080p", { videoWidth: 640, videoHeight: 360, twoStage: true }), false);
+    assert.equal(icLoraResolutionOffered("720p", { videoWidth: 640, videoHeight: 360, twoStage: true }), true);
+  });
+
+  it("never offers 1440p or 2160p, even when the flag lists them", () => {
+    const context = { ...FHD, twoStage: true, highResCells: ["1440p", "2160p"] as const, specs: null };
+    assert.deepEqual(values(icLoraResolutionOptions(context)), [
+      "270p",
+      "360p",
+      "540p",
+      "720p",
+      "1080p",
+    ]);
+    assert.equal(icLoraResolutionOffered("2160p", context), false);
   });
 });

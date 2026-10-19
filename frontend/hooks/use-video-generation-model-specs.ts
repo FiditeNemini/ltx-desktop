@@ -12,7 +12,7 @@ interface VideoGenerationModelSpecsState {
 export function useVideoGenerationModelSpecs(): VideoGenerationModelSpecsState {
   // Local specs describe the *active* LTX version, so they go stale as soon as the user
   // downloads, deletes, or activates a version — refetch on the models-changed signal.
-  const { modelsVersion } = useAppSettings()
+  const { modelsVersion, settings } = useAppSettings()
   const [state, setState] = useState<VideoGenerationModelSpecsState>({
     modelSpecs: null,
     isLoading: true,
@@ -49,7 +49,7 @@ export function useVideoGenerationModelSpecs(): VideoGenerationModelSpecsState {
       isActive = false
       abortController.abort()
     }
-  }, [modelsVersion])
+  }, [settings.budgetMode, modelsVersion])
 
   return state
 }

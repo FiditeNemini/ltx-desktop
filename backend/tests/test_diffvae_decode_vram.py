@@ -39,6 +39,15 @@ class _FakeDecoder:
         return self._checkpoint_path
 
 
+_CARD_BYTES = 32 * 1024**3
+_HEADROOM_BYTES = int(patch._DECODE_HEADROOM_FRACTION * _CARD_BYTES)
+
+
+@pytest.fixture(autouse=True)
+def _card_total(monkeypatch) -> None:
+    monkeypatch.setattr(patch, "_device_total_bytes", lambda _device: _CARD_BYTES)
+
+
 @pytest.fixture(autouse=True)
 def _reset_cache_state() -> None:
     dsc.set_enabled(True)
@@ -116,11 +125,11 @@ def test_cuda_diffvae_reresolves_tiling_after_evict(monkeypatch) -> None:
     assert rec["height"] == 576
     assert rec["width"] == 1024
     assert rec["num_frames"] == 481
-    assert rec["free_bytes"] == 6 * 1024**3
+    assert rec["free_bytes"] == 6 * 1024**3 - _HEADROOM_BYTES
     assert rec["device"] == decoder._device
 
 
-def test_cuda_diffvae_forwards_29gib_budget_to_recommend(monkeypatch) -> None:
+def test_cuda_diffvae_forwards_29gib_budget_minus_headroom_to_recommend(monkeypatch) -> None:
     captured: dict[str, object] = {}
     measured = int(29.5 * 1024**3)
     monkeypatch.setattr(patch, "is_diffusion_video_vae", lambda _path: True)
@@ -137,10 +146,83 @@ def test_cuda_diffvae_forwards_29gib_budget_to_recommend(monkeypatch) -> None:
         torch.zeros(1, 128, 61, 18, 32),
         object(),
     )
-    assert captured["free_bytes"] == measured
+    assert captured["free_bytes"] == measured - _HEADROOM_BYTES
     assert captured["width"] == 1024
     assert captured["height"] == 576
     assert captured["num_frames"] == 481
+
+
+@pytest.mark.parametrize(
+    ("env", "expect_headroom_plan", "expected_gib"),
+    [(None, True, 0.0), ("24", False, 24.0), ("40", False, 27.1), ("bogus", True, 0.0), ("0", True, 0.0)],
+)
+def test_cuda_diffvae_decode_budget_cap_env(
+    monkeypatch, env: str | None, expect_headroom_plan: bool, expected_gib: float
+) -> None:
+    captured: dict[str, object] = {}
+    measured = int(27.1 * 1024**3)
+    expected = measured - _HEADROOM_BYTES if expect_headroom_plan else int(expected_gib * 1024**3)
+    if env is None:
+        monkeypatch.delenv(patch._DECODE_BUDGET_CAP_ENV, raising=False)
+    else:
+        monkeypatch.setenv(patch._DECODE_BUDGET_CAP_ENV, env)
+    monkeypatch.setattr(patch, "is_diffusion_video_vae", lambda _path: True)
+    monkeypatch.setattr(patch, "cuda_activation_budget_bytes", lambda _device: measured)
+    monkeypatch.setattr(
+        patch,
+        "tiling_config_for_vae",
+        lambda _checkpoint, **kwargs: captured.update(kwargs) or _tiles(frames=80, height=448, width=512),
+    )
+    monkeypatch.setattr(patch, "_orig_video_decoder_call", lambda *_args, **_kwargs: "ok")
+
+    patch._patched_video_decoder_call(
+        _FakeDecoder(torch.device("cuda")),
+        torch.zeros(1, 128, 13, 66, 120),
+        object(),
+    )
+    assert captured["free_bytes"] == expected
+
+
+def test_decode_dumps_latent_for_replay_when_dir_is_set(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(patch._DUMP_LATENT_DIR_ENV, str(tmp_path / "dumps"))
+    monkeypatch.setattr(patch, "_orig_video_decoder_call", lambda *_args, **_kwargs: "ok")
+    latent = torch.randn(1, 128, 3, 4, 5)
+    tiling = _tiles(frames=80, height=448, width=512)
+
+    patch._patched_video_decoder_call(_FakeDecoder(torch.device("cpu")), latent, tiling)
+
+    (dump_path,) = (tmp_path / "dumps").glob("diffvae_latent_*_1x128x3x4x5.pt")
+    dump = torch.load(dump_path, map_location="cpu", weights_only=True)
+    assert torch.equal(dump["latent"], latent)
+    assert dump["checkpoint_path"] == "ltx-2.5-video-vae-bf16.safetensors"
+    assert dump["tiling"] == {
+        "frames": {"tile_size": 80, "overlap": 40},
+        "height": {"tile_size": 448, "overlap": 160},
+        "width": {"tile_size": 512, "overlap": 160},
+    }
+
+
+def test_decode_does_not_dump_latent_by_default(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv(patch._DUMP_LATENT_DIR_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(patch, "_orig_video_decoder_call", lambda *_args, **_kwargs: "ok")
+
+    patch._patched_video_decoder_call(_FakeDecoder(torch.device("cpu")), torch.zeros(1, 128, 3, 4, 5), object())
+
+    assert list(tmp_path.rglob("diffvae_latent_*.pt")) == []
+
+
+def test_latent_dump_failure_does_not_fail_the_decode(monkeypatch, tmp_path) -> None:
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setenv(patch._DUMP_LATENT_DIR_ENV, str(blocker / "sub"))
+    monkeypatch.setattr(patch, "_orig_video_decoder_call", lambda *_args, **_kwargs: "ok")
+
+    result = patch._patched_video_decoder_call(
+        _FakeDecoder(torch.device("cpu")), torch.zeros(1, 128, 3, 4, 5), object()
+    )
+
+    assert result == "ok"
 
 
 def test_clamp_splits_full_frame_540p_20s() -> None:

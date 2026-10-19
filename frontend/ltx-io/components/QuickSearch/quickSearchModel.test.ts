@@ -31,7 +31,7 @@ describe("quickSearchModel", () => {
   });
 
   it("includes workflows and LoRA gallery sections in browse", () => {
-    const sections = buildQuickSearchBrowseSections([]);
+    const sections = buildQuickSearchBrowseSections([], true);
     const ids = sections.map((section) => section.id);
     assert.ok(ids.includes("workflows"));
     assert.ok(ids.includes("styles"));
@@ -47,19 +47,22 @@ describe("quickSearchModel", () => {
       ["retake", "extend", ...IC_LORA_RECIPES.filter((recipe) => recipe.section === "post-production").map((recipe) => recipe.id)],
     );
     const vfx = sections.find((section) => section.id === "vfx");
-    assert.deepEqual(vfx?.features.map((feature) => feature.id), ["layout-to-render", "restore"]);
+    assert.deepEqual(
+      vfx?.features.map((feature) => feature.id),
+      IC_LORA_RECIPES.filter((recipe) => recipe.section === "vfx").map((recipe) => recipe.id),
+    );
     const styles = sections.find((section) => section.id === "styles");
     assert.ok(styles?.features.some((feature) => feature.id === "cozy-felt"));
   });
 
   it("keeps a recent post-production tool in Post production and out of Featured", () => {
-    const sections = buildQuickSearchBrowseSections(["day-to-night", "extend"]);
+    const sections = buildQuickSearchBrowseSections(["day-to-night", "extend"], true);
     const idsOf = (id: string) =>
       sections.find((section) => section.id === id)?.features.map((f) => f.id);
     assert.deepEqual(idsOf("recent"), ["day-to-night", "extend"]);
-    assert.deepEqual(idsOf("featured"), ["image-to-video", "audio-to-video"]);
+    assert.deepEqual(idsOf("featured"), ["image-to-video", "audio-to-video", "alpha-gen", "cinemagraph"]);
     assert.deepEqual(idsOf("post-production"), ["retake", "extend", ...IC_LORA_RECIPES.filter((recipe) => recipe.section === "post-production").map((recipe) => recipe.id)]);
-    assert.deepEqual(idsOf("vfx"), ["layout-to-render", "restore"]);
+    assert.deepEqual(idsOf("vfx"), IC_LORA_RECIPES.filter((recipe) => recipe.section === "vfx").map((recipe) => recipe.id));
   });
 
   it("finds LoRA recipes by lora alias and title", () => {

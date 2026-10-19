@@ -1,9 +1,12 @@
 import { randomUUID } from 'crypto';
 import { app } from 'electron';
+import fs from 'fs';
 import os from 'os';
 import {
   buildAnalyticsPayload,
   mergeAnalyticsDetails,
+  normalizeOsVersion,
+  parseOsRelease,
   shouldDeliverAnalytics,
   type AnalyticsEventName,
   type AnalyticsHardware,
@@ -109,9 +112,23 @@ function currentHardware(): Promise<AnalyticsHardware> {
   return hardwarePromise
 }
 
+function readLinuxDistro(): string | undefined {
+  for (const file of ['/etc/os-release', '/usr/lib/os-release']) {
+    try {
+      return parseOsRelease(fs.readFileSync(file, 'utf8'))
+    } catch {
+      // Try the next location.
+    }
+  }
+  return undefined
+}
+
 async function loadHardware(): Promise<AnalyticsHardware> {
   const hardware: AnalyticsHardware = {
     ramGb: Math.round(os.totalmem() / 1024 ** 3),
+    // Electron returns the product version on macOS and Windows, and the kernel release on Linux.
+    osVersion: normalizeOsVersion(process.getSystemVersion()),
+    osDistro: process.platform === 'linux' ? readLinuxDistro() : undefined,
   }
   try {
     hardware.gpuName = readGpuName(await app.getGPUInfo('basic'))

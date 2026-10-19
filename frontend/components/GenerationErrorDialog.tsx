@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { AlertCircle, ChevronDown, ChevronRight, X } from 'lucide-react'
-import { IC_LORA_SOURCE_TOO_LARGE, LOCAL_GENERATION_UNSUPPORTED, LTX_API_KEY_MISSING, LTX_INVALID_API_KEY, VIDEO_JOB_TOO_LARGE, type GenerationError } from '../lib/generation-errors'
+import { LOCAL_GENERATION_RAM_SHORTFALL, LOCAL_GENERATION_UNSUPPORTED, LTX_API_KEY_MISSING, LTX_INVALID_API_KEY, isActionableLocalCode, type GenerationError } from '../lib/generation-errors'
 import { LTX_KEY_REQUIRED_SETTINGS_DETAIL } from '../lib/open-ltx-api-key-settings'
 
 interface GenerationErrorDialogProps {
@@ -88,18 +88,18 @@ function getDialogModel(error: GenerationError): {
           },
         }
       }
-      if (
-        error.error.code === IC_LORA_SOURCE_TOO_LARGE ||
-        error.error.code === VIDEO_JOB_TOO_LARGE ||
-        error.error.code === LOCAL_GENERATION_UNSUPPORTED
-      ) {
+      if (isActionableLocalCode(error.error.code)) {
         return {
           humanMessage: error.error.message,
           technicalDetails: JSON.stringify(error.error, null, 2),
           // The too-large codes clear by changing resolution or duration; unsupported
-          // hardware does not, so retrying is the one thing that cannot work.
+          // hardware and RAM shortfall do not, so retrying is the one thing that
+          // cannot work.
           dismissLabel:
-            error.error.code === LOCAL_GENERATION_UNSUPPORTED ? 'Close' : DEFAULT_DISMISS_LABEL,
+            error.error.code === LOCAL_GENERATION_UNSUPPORTED ||
+            error.error.code === LOCAL_GENERATION_RAM_SHORTFALL
+              ? 'Close'
+              : DEFAULT_DISMISS_LABEL,
         }
       }
       return {

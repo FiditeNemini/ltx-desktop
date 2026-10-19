@@ -91,10 +91,12 @@ def plan_chunks(
     height: int,
     num_frames: int,
     frame_rate: float,
+    carry_frames: int = IC_LORA_CHUNK_CARRY_FRAMES,
 ) -> tuple[ChunkConfig | None, int]:
     """(chunk config, window count) for the window the job budget chose.
 
-    ``None`` means one pass. The budget decides, so the rule is not run again here."""
+    ``None`` means one pass. The budget decides, so the rule is not run again here.
+    ``carry_frames`` is the tail one window pins at the start of the next."""
     if chunk_pixel_frames is None:
         return None, 1
     from ltx_core.types import VideoPixelShape
@@ -102,7 +104,7 @@ def plan_chunks(
     from ltx_pipelines.chunks.layout import uniform_chunk_layouts
 
     config = ChunkConfig(
-        chunk_pixel_frames=chunk_pixel_frames, next_video_carry_frames=IC_LORA_CHUNK_CARRY_FRAMES
+        chunk_pixel_frames=chunk_pixel_frames, next_video_carry_frames=carry_frames
     )
     layouts = uniform_chunk_layouts(
         target_pixel_shape=VideoPixelShape(

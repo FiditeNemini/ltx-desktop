@@ -62,7 +62,7 @@ def test_fresh_db_applies_initial_schema(tmp_path: Path) -> None:
         "paired_devices",
     }
     version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-    assert version == 1
+    assert version == 2
     asset_columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(assets)").fetchall()
     }
@@ -115,7 +115,7 @@ def test_second_open_is_noop(tmp_path: Path) -> None:
     apply_migrations(conn, MIGRATIONS_DIR)
     apply_migrations(conn, MIGRATIONS_DIR)
     count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-    assert count == 1
+    assert count == 2
     conn.close()
 
 
@@ -129,7 +129,7 @@ def test_rerun_after_ddl_without_ledger_row_does_not_brick(tmp_path: Path) -> No
     conn.commit()
     apply_migrations(conn, MIGRATIONS_DIR)
     version = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-    assert version == 1
+    assert version == 2
     tables = {
         row[0]
         for row in conn.execute(
@@ -1971,6 +1971,30 @@ def test_delete_already_deleted_succeeds_without_file(tmp_path: Path) -> None:
     path.unlink(missing_ok=True)
     assert store.delete_asset(record.id) is True
     assert store.get_asset(record.id) is None
+
+
+def test_generation_identity_rejects_changed_spec_or_contract(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "app_data")
+    job = store.insert_generation("text-to-video", _spec(prompt="original"))
+    assert store.insert_generation("text-to-video", _spec(prompt="original"), generation_id=job.id) == job
+    with pytest.raises(ValueError, match="already been used"):
+        store.insert_generation("text-to-video", _spec(prompt="different"), generation_id=job.id)
+    with pytest.raises(ValueError, match="already been used"):
+        store.insert_generation("text-to-video", _spec(prompt="original"), generation_id=job.id, contract_version=2)
+
+
+def test_recent_generations_across_features_respects_limit_and_deletion(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "app_data")
+    first = store.insert_generation("text-to-video", _spec(prompt="first"))
+    second = store.insert_generation("extend", _spec(prompt="second"))
+    all_jobs = store.list_generations()
+    assert {job.id for job in all_jobs} == {first.id, second.id}
+    assert store.list_generations(limit=1) == all_jobs[:1]
+    assert store.list_generations("extend", limit=1) == [second]
+    store.delete_generation(second.id)
+    assert store.list_generations() == [first]
+    with pytest.raises(ValueError):
+        store.list_generations(limit=0)
 
 
 def test_delete_returns_true_when_canonical_unlink_fails(

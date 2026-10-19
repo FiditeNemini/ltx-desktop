@@ -2,7 +2,6 @@ import { useEffect, useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
-  isHomeFeatureEnabled,
   isHomeFeatureId,
   type HomeFeatureId,
 } from "../../lib/home-features.ts";
@@ -18,7 +17,10 @@ const RECENT_FEATURES_QUERY_KEY = generationQueryKeys.recentFeatures(
   MAX_SIDEBAR_RECENT_ITEMS,
 );
 
-/** Distinct features from the newest generations, shared by desktop and remote. */
+/**
+ * Distinct features from the newest generations, shared by desktop and remote. The backend
+ * leaves out a feature that needs the `highResVideoToVideo` flag while the flag is off.
+ */
 export function useRecentSidebarTools(): readonly HomeFeatureId[] {
   const { api } = useExploreRuntime();
   const queryClient = useQueryClient();
@@ -47,11 +49,5 @@ export function useRecentSidebarTools(): readonly HomeFeatureId[] {
   }, [queryClient]);
 
   const features = query.data;
-  return useMemo(
-    () =>
-      (features ?? []).filter(
-        (id): id is HomeFeatureId => isHomeFeatureId(id) && isHomeFeatureEnabled(id),
-      ),
-    [features],
-  );
+  return useMemo(() => (features ?? []).filter(isHomeFeatureId), [features]);
 }

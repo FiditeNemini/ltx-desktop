@@ -1,7 +1,5 @@
 import type { components } from "../../../../generated/backend-openapi";
 import {
-  resolveVariantChoice,
-  variantChoiceId,
   type CatalogSupportedModels,
   type CatalogVariantChoice,
 } from "../../../lib/catalogVariantChoice.ts";
@@ -12,7 +10,7 @@ import {
   isIcLoraImageRequirementKnown,
   missingIcLoraImage,
   type IcLoraRecipe,
-  type IcLoraRecipeId,
+  type IcLoraVideoRecipeId,
 } from "../../../../lib/ic-lora-recipes.ts";
 import {
   withDefaultOffering,
@@ -26,10 +24,14 @@ import {
   type FeatureFieldChange,
   type FeatureValues,
 } from "../types.ts";
-import { icLoraSelectedFps } from "./icLoraFps.ts";
-import { normalizeIcLoraRecipeValues } from "./icLoraNormalize.ts";
 import {
-  icLoraModelOfferingIds,
+  IC_LORA_CONTROL_TYPES,
+  isIcLoraControlType,
+  type IcLoraControlType,
+} from "../../../lib/icLoraControlType.ts";
+import { icLoraSelectedFps } from "./icLoraFps.ts";
+import { icLoraVariantId, normalizeIcLoraRecipeValues } from "./icLoraNormalize.ts";
+import {
   icLoraRecipeForm,
   IC_LORA_AUDIO_MODES,
   STRENGTH_MAX,
@@ -64,6 +66,8 @@ export type IcLoraRecipeSchema = {
   resolution: { kind: "options"; value: IcLoraRecipeResolution };
   fps: { kind: "options"; value: number | null };
   audioMode: { kind: "options"; value: IcLoraRecipeAudioMode };
+  /** How the guide clip is read. Only a recipe with `controlMode` shows and sends it. */
+  controlType: { kind: "options"; value: IcLoraControlType };
 };
 
 export type IcLoraRecipeValues = FeatureValues<IcLoraRecipeSchema>;
@@ -75,6 +79,12 @@ export type IcLoraRecipeContext = VideoInputContext & {
   imageSeed?: AssetRef | null;
   /** The catalog `reference_image_required`. Undefined until the catalog loads. */
   referenceImageRequired?: boolean;
+  /** The cells above 1080p this recipe offers. Empty without the `highResVideoToVideo` flag. */
+  highResCells?: readonly ("1440p" | "2160p")[];
+  /** The pictures of the control modes. The screen owns the assets. */
+  controlThumbnails?: Record<IcLoraControlType, string>;
+  /** The catalog entry keeps the IC-LoRA on stage 2. The form then offers cells up to 2x the source. */
+  twoStage?: boolean;
 };
 
 /** Fallback before the catalog loads. Catalog default_settings replaces it. */
@@ -98,7 +108,7 @@ export function icLoraRecipeDefaults(
   };
 }
 
-function isLoraStrength(value: unknown): value is number {
+export function isLoraStrength(value: unknown): value is number {
   return (
     typeof value === "number" &&
     Number.isFinite(value) &&
@@ -114,7 +124,7 @@ function isAudioMode(value: unknown): value is IcLoraRecipeAudioMode {
   );
 }
 
-function readStoredLora(
+export function readStoredLora(
   params: Record<string, unknown>,
   fallback: number,
 ): { scale: number; variantId: string } {
@@ -144,10 +154,13 @@ function defaultsFor(
     loraStrength: catalog.loraStrength,
     model: "ltx-2.5-fast",
     variant: "",
-    resolution: "720p",
+    // A recipe that lists no cell below the source starts at its lowest cell. The form then
+    // normalizes it to the smallest offered cell, which is the Original cell.
+    resolution: recipe.upscalesSource === "source-and-above" ? "270p" : "720p",
     // null is Original: the closest supported rate that is not above the source.
     fps: null,
     audioMode: catalog.audioMode,
+    controlType: IC_LORA_CONTROL_TYPES[0],
   };
 }
 
@@ -158,14 +171,14 @@ export function createIcLoraRecipeDefinition(
   IcLoraRecipeSchema,
   CreateIcLoraRecipeRequest,
   IcLoraRecipeContext,
-  IcLoraRecipeId
+  IcLoraVideoRecipeId
 > {
   const defaults = defaultsFor(recipe, settings);
   const promptHidden = isIcLoraFieldHidden(recipe, "prompt");
   const audioHidden = isIcLoraFieldHidden(recipe, "audioMode");
   const strengthHidden = isIcLoraFieldHidden(recipe, "loraStrength");
   const promptOptional = promptHidden || settings?.allows_empty_prompt === true;
-  const upscalesSource = recipe.upscalesSource === true;
+  const upscalesSource = recipe.upscalesSource ?? false;
 
   function seedValues(context: IcLoraRecipeContext): IcLoraRecipeValues {
     return {
@@ -201,6 +214,7 @@ export function createIcLoraRecipeDefinition(
         context.videoFps,
       ),
       audioMode: isAudioMode(params.audioMode) ? params.audioMode : defaults.audioMode,
+      controlType: isIcLoraControlType(params.controlType) ? params.controlType : defaults.controlType,
     };
   }
 
@@ -211,14 +225,7 @@ export function createIcLoraRecipeDefinition(
     if (values.video == null) {
       throw new Error("Video is required.");
     }
-    const variantId = variantChoiceId(
-      resolveVariantChoice(
-        context?.catalogVariants ?? [],
-        values.variant,
-        values.model,
-        context ? icLoraModelOfferingIds(context) : [],
-      ),
-    );
+    const variantId = icLoraVariantId(values, context);
     const image = icLoraImageValue(recipe, values.image);
     return {
       contract_version: 1,
@@ -236,6 +243,7 @@ export function createIcLoraRecipeDefinition(
         ...(values.fps != null ? { fps: values.fps } : {}),
         audioMode: audioHidden ? defaults.audioMode : values.audioMode,
         scale: strengthHidden ? defaults.loraStrength : values.loraStrength,
+        ...(recipe.controlMode ? { controlType: values.controlType } : {}),
         ...(variantId ? { variantId } : {}),
         promptProvenance: "typed",
       },
@@ -268,6 +276,6 @@ export function createIcLoraRecipeDefinition(
   };
 }
 
-export function icLoraRecipeDefinition(id: IcLoraRecipeId) {
+export function icLoraRecipeDefinition(id: IcLoraVideoRecipeId) {
   return createIcLoraRecipeDefinition(getIcLoraRecipe(id));
 }

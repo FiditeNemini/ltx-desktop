@@ -1,7 +1,7 @@
 import { type ReactNode, createContext, useContext } from "react";
 
 import type { EnhanceProvider } from "@/hooks/use-prompt-enhancer-provider";
-import type { BoundApiClient } from "@/lib/api-client";
+import type { ApiSuccessOf, BoundApiClient } from "@/lib/api-client";
 import type { ExploreAsset, ExploreListedAsset } from "@/lib/explore-contract";
 
 import type { MicrophoneAccess } from "@/ltx-io/media/microphone/types";
@@ -44,6 +44,7 @@ export type ExploreApi = Pick<
   | "createAudioToVideo"
   | "createRetake"
   | "createExtend"
+  | "preflightEdit"
   | "createIcLoraRecipe"
   | "listIcLoras"
   | "startIcLoraDownload"
@@ -70,7 +71,40 @@ export type ExploreApi = Pick<
   | "extractAudio"
   | "getPromptEnhancer"
   | "enhancePrompt"
+  | "getGeneration"
+  | "assistantTurn"
+  | "listAssistantConversations"
+  | "getAssistantConversation"
+  | "deleteAssistantConversation"
+  | "continueAssistant"
+  | "stopAssistant"
+  | "streamAssistantEvents"
+  | "getAssistantSelection"
+  | "setAssistantSelection"
+  | "enqueueAssistantMessage"
+  | "removeQueuedAssistantMessage"
+  | "releaseAssistantQueue"
+  | "listAssistantModels"
 >;
+
+export type ExploreAssistantProvider = "gemini" | "local";
+export type ExploreAssistantLocalModel = ApiSuccessOf<"getAssistantSelection">["local_model"];
+
+/**
+ * Desktop's live assistant settings. Remote omits this and reads and sets the
+ * same shared choice through /api/assistant/selection.
+ */
+export type ExploreAssistantSettings = {
+  provider: ExploreAssistantProvider;
+  localModel: ExploreAssistantLocalModel;
+  geminiModel: string;
+  hasGeminiApiKey: boolean;
+  select: (provider: ExploreAssistantProvider, localModel?: ExploreAssistantLocalModel) => Promise<void>;
+  /** A select is saving, from Settings or the composer. */
+  switching: boolean;
+  /** With a fix, opens where that fix is made; otherwise the Assistant section. */
+  openSettings: (fix?: "geminiKey" | "localModel") => void;
+};
 
 export type ExploreMediaChooseRequest = {
   title: string;
@@ -79,8 +113,16 @@ export type ExploreMediaChooseRequest = {
   fileInput: HTMLInputElement | null;
 };
 
+/** One picked file that is not ingested yet. Call it to ingest the file. */
+export type PendingImport = () => Promise<ExploreAsset>;
+
 export type ExploreMediaInput = {
   choose: (request: ExploreMediaChooseRequest) => Promise<ExploreAsset | null>;
+  /**
+   * Multi-select picker. It returns one pending import for each picked file, in pick
+   * order. The caller decides how many to ingest, so a limit wastes no upload.
+   */
+  chooseMany: (request: ExploreMediaChooseRequest) => Promise<PendingImport[]>;
   ingestDroppedFile: (file: File) => Promise<ExploreAsset>;
 };
 
@@ -116,7 +158,16 @@ export type ExploreCatalogInstall = {
 };
 
 export type ExploreRuntime = {
+  askAssistant?: (assetId: string) => void;
+  assistantSettings?: ExploreAssistantSettings;
   modelsVersion: ExploreModelsVersion;
+  /**
+   * Desktop settings value, so a mode toggle refetches specs. Remote omits it
+   * and renders whatever the specs payload echoes.
+   */
+  budgetMode?: "standard" | "reckless";
+  /** True while Desktop is saving Reckless mode. Generate stays off until it lands. */
+  budgetModeSaving?: boolean;
   api: ExploreApi;
   wsUrl: (path: string) => Promise<string>;
   mediaInput: ExploreMediaInput;

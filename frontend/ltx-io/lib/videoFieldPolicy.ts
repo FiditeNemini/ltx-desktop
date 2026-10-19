@@ -1,12 +1,19 @@
+import { readBudgetMode, type BudgetMode } from "../../lib/budget-risk.ts";
 import {
   GENSPACE_MIN_SELECTABLE_DURATION_S,
+  budgetedResolutionMap,
   getOfferingVideoGenerationModelSpecs,
+  disabledOptionsFromDroppedCells,
   offeringSpecsAsPipelineItems,
   resolveVideoGenerationOptions,
   isVideoGenerationAspectRatio,
   sanitizeVideoGenerationSettings,
+  type DisabledVideoGenerationOption,
+  type DroppedFastCell,
   type VideoGenerationAspectRatio,
   type VideoGenerationFormSettings,
+  type VideoGenerationFps,
+  type VideoGenerationResolution,
   type VideoGenerationModelSpecItem,
   type VideoGenerationModelSpecsResponse,
   type VideoGenerationSettingsShape,
@@ -42,6 +49,12 @@ function offeringPipelineSpecs(
   return offeringSpecsAsPipelineItems(getOfferingVideoGenerationModelSpecs(specs));
 }
 
+function budgetModeOf(
+  specs: VideoGenerationModelSpecsResponse | null | undefined,
+): BudgetMode {
+  return readBudgetMode(specs?.budgetMode);
+}
+
 function toSettingsShape(values: ClampedVideoFields): VideoGenerationSettingsShape {
   const aspectRatio = persistAspectRatio(values.aspectRatio);
   return {
@@ -69,6 +82,7 @@ export function clampVideoFields<T extends ClampedVideoFields>(
   const clampOptions = {
     hasAudio: false,
     minimumDuration: GENSPACE_MIN_SELECTABLE_DURATION_S,
+    budgetMode: budgetModeOf(specs),
   } as const;
 
   let mapped = toSettingsShape(values);
@@ -117,14 +131,23 @@ export function clampVideoFields<T extends ClampedVideoFields>(
     mapped.duration;
   const persistedAspect = persistAspectRatio(values.aspectRatio);
   const defaultAspect = persistAspectRatio(defaults.aspectRatio);
+  const aspectFallback = defaultAspect === "auto" ? "16:9" : defaultAspect;
+  const refusedAspects = new Set(
+    resolved.disabledAspectRatioOptions.map((option) => option.value),
+  );
+  const keptAspects = resolved.aspectRatioOptions.filter(
+    (option) => !refusedAspects.has(option),
+  );
   const aspectRatio =
     persistedAspect === "auto"
       ? "auto"
-      : (pick(
-          persistedAspect,
-          defaultAspect === "auto" ? "16:9" : defaultAspect,
-          resolved.aspectRatioOptions,
-        ) ?? persistedAspect);
+      : refusedAspects.has(persistedAspect) && keptAspects.length > 0
+        ? (pick(persistedAspect, aspectFallback, keptAspects) ?? persistedAspect)
+        : (pick(
+            persistedAspect,
+            aspectFallback,
+            resolved.aspectRatioOptions,
+          ) ?? persistedAspect);
   mapped = {
     ...mapped,
     duration,
@@ -181,13 +204,19 @@ export function isLocalVideoSelectionReady(
     modelSpecs,
     hasAudio: options.hasAudio ?? false,
     minimumDuration: GENSPACE_MIN_SELECTABLE_DURATION_S,
+    budgetMode: budgetModeOf(specs),
   });
+  // "auto" is not a shape, so it never appears in the refused list.
+  const aspectRefused = resolved.disabledAspectRatioOptions.some(
+    (option) => option.value === values.aspectRatio,
+  );
   return (
     resolved.hasCompatibleOptions &&
     resolved.selectedModel === values.model &&
     resolved.selectedResolution === values.resolution &&
     resolved.selectedFps === values.fps &&
-    resolved.selectedDuration === values.duration
+    resolved.selectedDuration === values.duration &&
+    !aspectRefused
   );
 }
 
@@ -202,6 +231,7 @@ export function localVideoHasCompatibleOptions(
     modelSpecs,
     hasAudio: options.hasAudio ?? false,
     minimumDuration: GENSPACE_MIN_SELECTABLE_DURATION_S,
+    budgetMode: budgetModeOf(specs),
   }).hasCompatibleOptions;
 }
 
@@ -213,48 +243,69 @@ function isLegalDuration(duration: number): boolean {
   return duration >= GENSPACE_MIN_SELECTABLE_DURATION_S;
 }
 
-function resolutionSpecMap(item: VideoGenerationModelSpecItem) {
-  return item.spec.supported_resolutions_durations ?? {};
+function resolutionSpecMap(
+  item: VideoGenerationModelSpecItem,
+  budgetMode: BudgetMode,
+) {
+  return budgetedResolutionMap(item, budgetMode, false) ?? {};
 }
 
 function durationsForFps(
   item: VideoGenerationModelSpecItem,
   resolution: string,
   fps: number,
+  budgetMode: BudgetMode,
 ): number[] {
   const list =
-    resolutionSpecMap(item)[resolution]?.fps_to_durations[String(fps)] ?? [];
+    resolutionSpecMap(item, budgetMode)[resolution as VideoGenerationResolution]?.fps_to_durations[
+      String(fps) as `${VideoGenerationFps}`
+    ] ?? [];
   return list.filter(isLegalDuration);
-}
-
-export function collectModelDurationOptions(
-  item: VideoGenerationModelSpecItem | undefined,
-  fallback: readonly number[] = [],
-): number[] {
-  if (!item) return uniqueSortedNumbers(fallback);
-  const durations: number[] = [];
-  for (const spec of Object.values(resolutionSpecMap(item))) {
-    for (const list of Object.values(spec.fps_to_durations ?? {})) {
-      durations.push(...list.filter(isLegalDuration));
-    }
-  }
-  const unique = uniqueSortedNumbers(durations);
-  return unique.length > 0 ? unique : uniqueSortedNumbers(fallback);
 }
 
 export function collectModelFpsOptions(
   item: VideoGenerationModelSpecItem | undefined,
   fallback: readonly number[] = [],
+  budgetMode: BudgetMode = "standard",
 ): number[] {
   if (!item) return uniqueSortedNumbers(fallback);
   const fpsValues: number[] = [];
-  for (const spec of Object.values(resolutionSpecMap(item))) {
+  for (const spec of Object.values(resolutionSpecMap(item, budgetMode))) {
     for (const [fpsKey, list] of Object.entries(spec.fps_to_durations ?? {})) {
       if (list.some(isLegalDuration)) fpsValues.push(Number(fpsKey));
     }
   }
   const unique = uniqueSortedNumbers(fpsValues);
   return unique.length > 0 ? unique : uniqueSortedNumbers(fallback);
+}
+
+function unionDisabledOptions<T extends string | number>(
+  item: VideoGenerationModelSpecItem | undefined,
+  audio: boolean,
+  key: (cell: DroppedFastCell) => T,
+  keptValues: readonly T[],
+): DisabledVideoGenerationOption<T>[] {
+  if (!item) return [];
+  const cells = (item.spec.dropped_cells ?? []).filter((candidate) => candidate.audio === audio);
+  return disabledOptionsFromDroppedCells(cells, key, keptValues, (a, b) => Number(a) - Number(b));
+}
+
+/**
+ * Union-scope disabled fps for the Home fps picker (which lists rates kept
+ * anywhere, not just at the current resolution): dropped everywhere, kept
+ * nowhere, messaged from the cheapest cell. Empty without specs.
+ */
+export function collectModelDisabledFpsOptions(
+  item: VideoGenerationModelSpecItem | undefined,
+  kept: readonly VideoGenerationFps[],
+  audio = false,
+): DisabledVideoGenerationOption<VideoGenerationFps>[] {
+  return unionDisabledOptions<VideoGenerationFps>(
+    item,
+    audio,
+    (cell) => cell.fps,
+    kept,
+  );
 }
 
 function selectedModelItem(
@@ -277,8 +328,9 @@ export function retargetVideoFields<T extends ClampedVideoFields>(
 ): T {
   const item = selectedModelItem(specs, values.model);
   if (!item) return values;
+  const budgetMode = budgetModeOf(specs);
 
-  const resolutions = Object.keys(resolutionSpecMap(item));
+  const resolutions = Object.keys(resolutionSpecMap(item, budgetMode));
   const nearbyResolutions = [
     values.resolution,
     ...resolutions.filter((resolution) => resolution !== values.resolution),
@@ -286,16 +338,16 @@ export function retargetVideoFields<T extends ClampedVideoFields>(
 
   if (preserve === "duration") {
     for (const resolution of nearbyResolutions) {
-      if (durationsForFps(item, resolution, values.fps).includes(values.duration)) {
+      if (durationsForFps(item, resolution, values.fps, budgetMode).includes(values.duration)) {
         return { ...values, resolution };
       }
     }
     for (const resolution of nearbyResolutions) {
-      const spec = resolutionSpecMap(item)[resolution];
+      const spec = resolutionSpecMap(item, budgetMode)[resolution as VideoGenerationResolution];
       if (!spec) continue;
       for (const fpsKey of Object.keys(spec.fps_to_durations ?? {})) {
         const fps = Number(fpsKey);
-        if (durationsForFps(item, resolution, fps).includes(values.duration)) {
+        if (durationsForFps(item, resolution, fps, budgetMode).includes(values.duration)) {
           return { ...values, resolution, fps };
         }
       }
@@ -304,9 +356,9 @@ export function retargetVideoFields<T extends ClampedVideoFields>(
   }
 
   for (const resolution of nearbyResolutions) {
-    const spec = resolutionSpecMap(item)[resolution];
-    if (!spec?.fps_to_durations[String(values.fps)]) continue;
-    const durations = durationsForFps(item, resolution, values.fps);
+    const spec = resolutionSpecMap(item, budgetMode)[resolution as VideoGenerationResolution];
+    if (!spec?.fps_to_durations[String(values.fps) as `${VideoGenerationFps}`]) continue;
+    const durations = durationsForFps(item, resolution, values.fps, budgetMode);
     if (durations.length === 0) continue;
     const duration = durations.includes(values.duration)
       ? values.duration
